@@ -20,7 +20,7 @@ Features
 
 
 
-**This project was also Helped with AI, therefore this project also will always stay under the MIT license so anyone can use this, this project is merely a fun project meant to share as jokes between my friend group so take it or leave it or modify it, add more names, sect names etc easily using the template system implemented.**
+**This project was also Helped with AI, therefore this project also will always stay under the MIT license so anyone can use this, this project is merely a fun project meant to share as jokes between my friend group so take it or leave it or modify it and add more names, sect names etc easily using the template system implemented.**
 
 # Disclaimer
 
