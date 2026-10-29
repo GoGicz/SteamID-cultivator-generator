@@ -1,0 +1,15 @@
+Setup:
+    pip install requests
+    Get a free API key: https://steamcommunity.com/dev/apikey
+    Set it as an environment variable (recommended):
+        Windows (cmd):   set STEAM_API_KEY=yourkey
+        Linux / macOS:   export STEAM_API_KEY=yourkey
+    or just paste it when the program asks.
+
+Run:
+    python steam_cultivator.py
+
+Your Steam profile's "Game details" must be set to Public,
+otherwise Steam will not give out the data.
+The friend story needs a public "Friends List" too; if it is private (or you
+have no friends) the story is simply skipped.
