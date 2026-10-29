@@ -14,7 +14,14 @@ fixed by your SteamID, so the same profile always gets the same result. Rarely, 
 killer is one of your own Steam friends.
 Every unlocked Steam achievement counts as one completed sect mission, and every
 mission pays 5 sect points. Steam can only be asked about achievements one game at
-a time, so the first lookup of a big library takes a little while.
+a time, so the first lookup of a big library takes a little while. The results are
+saved in a "cache" folder next to this file, so later runs only ask Steam about games
+whose playtime changed (or new ones) and report how many achievements you gained since
+your last visit. Type "refresh <profile>" (or run with --refresh) to re-check everything.
+Your Steam badges build your reputation, from "Unknown Nobody" up to "Universal
+Legend". Personalities, earned from your friends, badges, achievements and games,
+add reputation (some only by chance) and a few also change power and death risk,
+for example "Fearless" (more than 100 badges): +50 power but +0.8% death risk.
 
 Setup:
     pip install requests
@@ -33,10 +40,12 @@ The friend story needs a public "Friends List" too; if it is private (or you
 have no friends) the story is simply skipped.
 """
 
+import json
 import os
 import random
 import re
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -47,7 +56,67 @@ TIMEOUT = 15
 
 BETRAYAL_CHANCE = 0.05   # of those who die, chance the killer is one of their friends
 SECT_POINTS_PER_MISSION = 5   # 1 unlocked achievement = 1 sect mission = 5 sect points
+
+# ---------------------------------------------------------------------------
+# Reputation: every Steam badge is worth REP_PER_BADGE reputation points, and the
+# personalities below add more. Ranks are (minimum points, name), lowest to highest.
+# ---------------------------------------------------------------------------
+REP_PER_BADGE = 2
+REPUTATION_RANKS = [
+    (0,    "Unknown Nobody"),
+    (10,   "Barely Noticed"),
+    (30,   "Familiar Face"),
+    (70,   "Sect Favorite"),
+    (130,  "Regional Celebrity"),
+    (220,  "Famed Across the Provinces"),
+    (350,  "Renowned Master"),
+    (520,  "Continental Legend"),
+    (750,  "Name Spoken by the Heavens"),
+    (1000, "Universal Legend"),
+]
+
+# ---------------------------------------------------------------------------
+# Personalities. Anyone can hold several. Each one has:
+#   test        : who gets it, from (info, friend_count)
+#   power       : added to the power score
+#   death       : added to the death chance (0.008 = +0.8 percentage points)
+#   rep         : reputation points it can give
+#   rep_chance  : chance of actually getting them (1.0 = always, 0.5 = a coin flip);
+#                 the roll is fixed by the SteamID, so a profile never changes its mind
+#   roll_group  : (optional) personalities with the same group share one dice roll;
+#                 Brave and Fearless do, so Fearless is never worse off than Brave
+#   trait       : how the backstory describes it (a past-tense phrase)
+# ---------------------------------------------------------------------------
+PERSONALITIES = [
+    {"name": "Social", "rule": "more than 40 Steam friends",
+     "test": lambda info, friends: friends > 40,
+     "power": 0, "death": 0.0, "rep": 30, "rep_chance": 1.0,
+     "trait": "made friends wherever they went"},
+    {"name": "Brave", "rule": "51 to 100 badges",
+     "test": lambda info, friends: 50 < info["badges"] <= 100,
+     "power": 0, "death": 0.0, "rep": 25, "rep_chance": 0.30, "roll_group": "courage",
+     "trait": "never flinched when danger came knocking"},
+    {"name": "Fearless", "rule": "more than 100 badges",
+     "test": lambda info, friends: info["badges"] > 100,
+     "power": 50, "death": 0.008, "rep": 60, "rep_chance": 0.50, "roll_group": "courage",
+     "trait": "laughed in the face of heavenly tribulations"},
+    {"name": "Diligent", "rule": "1,000 or more achievements",
+     "test": lambda info, friends: info["achievements"] >= 1000,
+     "power": 0, "death": 0.0, "rep": 20, "rep_chance": 1.0,
+     "trait": "trained until the candles burned out"},
+    {"name": "Collector", "rule": "300 or more paid games",
+     "test": lambda info, friends: info["game_count"] >= 300,
+     "power": 0, "death": 0.0, "rep": 15, "rep_chance": 1.0,
+     "trait": "could never walk past a treasure stall without stopping"},
+]
+NO_PERSONALITY_TRAIT = "kept a quiet temperament that set off no gossip"
 ACHIEVEMENT_WORKERS = 8       # how many games are asked about at the same time
+
+# Achievement cache (see "Achievements and the achievement cache" below)
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
+CACHE_VERSION = 1
+RECHECK_AFTER_DAYS = 30       # re-check a saved game after this long even if nothing changed
+                              # (set to 0 to trust the cache until playtime changes)
 
 # ---------------------------------------------------------------------------
 # Talents, weakest to strongest. Rolled by pure luck (never by Steam stats).
@@ -251,40 +320,67 @@ MISSION_TIERS = [      # by sect missions (= achievements): {n}
             "cleared {n} sect missions, a record the {sect} carved onto a stone tablet"]),
 ]
 
+REPUTATION_TIERS = [   # by reputation rank number (0 = lowest): {sect} {rank}
+    (2,    ["Hardly anyone in the {sect} could have named them, and the world's verdict was "
+            "simply '{rank}'",
+            "Their name drew only shrugs, and the gossips filed them under '{rank}'"]),
+    (4,    ["A few disciples of the {sect} knew their name, and rumor called them '{rank}'",
+            "Their name had started to travel between the dining hall and the mission board, "
+            "earning the title '{rank}'"]),
+    (6,    ["Their name was spoken in tea houses across the region, where they were called "
+            "'{rank}'",
+            "Travelling merchants carried tales of them across the provinces, and the title "
+            "'{rank}' followed"]),
+    (8,    ["Whole sects bowed their heads at the mention of their name, and the world hailed "
+            "them as '{rank}'",
+            "Their name was carved into the tournament stones of three continents, and they "
+            "became known as '{rank}'"]),
+    (INF,  ["Every living cultivator knew their name, and even the heavens called them "
+            "'{rank}'",
+            "Their legend outlived kingdoms and sects alike, and the ages remembered them as "
+            "'{rank}'"]),
+]
+
 # Placeholders: {steam} {name} {sect} {a_title} {talent} {dao} {meditation} {treasury}
-# {missions} {treasure} {element} {technique} {game} {realm}. Add your own!
+# {missions} {personality} {reputation} {treasure} {element} {technique} {game} {realm}.
+# {personality} is a past-tense phrase ("{name} made friends wherever they went");
+# {reputation} is a full sentence without the final period. Add your own!
 BACKSTORIES = [
     "Once known on Steam as '{steam}', {name} joined the {sect} as {a_title}. Their talent "
     "test revealed {talent}. {dao}. They {meditation}, and {treasury}. Within the sect, they "
-    "{missions}. Their prized possession was {treasure}.",
+    "{missions}. {name} {personality}. {reputation}. Their prized possession was {treasure}.",
 
     "The mortal world knew {name} only as '{steam}', a stubborn wanderer who {meditation}. "
     "Eventually the {sect} accepted them as {a_title}, and the talent stone revealed {talent}. "
-    "{dao}. Over the years they {missions}, and {treasury}. At their belt always hung {treasure}.",
+    "{dao}. Over the years they {missions}, and {treasury}. {name} {personality}. "
+    "{reputation}. At their belt always hung {treasure}.",
 
     "Elders of the {sect} still argue about {name}, {a_title} who once went by '{steam}' in "
     "the mortal realm. The talent test showed {talent}. {dao}. Mission hall records say {name} "
-    "{missions}, and the vault ledger says they {treasury}. {name} {meditation}. Their prized "
-    "possession was {treasure}.",
+    "{missions}, and the vault ledger says they {treasury}. {name} {meditation}. "
+    "{reputation}. Some say {name} {personality}. Their prized possession was {treasure}.",
 
     "Some say '{steam}' was just a name {name} borrowed in the mortal realm. Whatever the truth, "
     "the {sect} took them in as {a_title}, and the elders at the talent test uncovered {talent}. "
-    "{dao}. {name} {meditation}, then {missions}. Along the way they {treasury}. Their most "
-    "precious belonging was {treasure}.",
+    "{dao}. {name} {meditation}, then {missions}. Along the way they {treasury}. Disciples "
+    "agreed that {name} {personality}. {reputation}. Their most precious belonging was "
+    "{treasure}.",
 
     "{name}, formerly '{steam}' in the mortal realm, served the {sect} as {a_title}. The talent "
     "test showed {talent}. {dao}. In their time, {name} {missions}, and {treasury}. They also "
-    "{meditation}. Of all their belongings, {treasure} was the dearest.",
+    "{meditation}. {reputation}. Friends and rivals alike agreed that {name} {personality}. "
+    "Of all their belongings, {treasure} was the dearest.",
 
     "Nobody in the {sect} could say where {name} came from, only that the mortal records listed "
     "them as '{steam}'. They joined as {a_title}, and the talent test revealed {talent}. {dao}. "
-    "Legend says {name} {meditation}, and that they {missions}. They {treasury}. Their prized "
-    "possession was {treasure}.",
+    "Legend says {name} {meditation}, and that they {missions}. They {treasury}. {reputation}. "
+    "Whenever the tale was told, it added that {name} {personality}. Their prized possession "
+    "was {treasure}.",
 
     "{name} came to the {sect} as {a_title}, carrying nothing but the mortal name '{steam}' and "
     "an affinity for {element}. The talent test revealed {talent}. {dao}. {name} {meditation}. "
     "The {technique} became their signature art. Over time they {missions}, and {treasury}. "
-    "Their prized possession was {treasure}.",
+    "It was said {name} {personality}. {reputation}. Their prized possession was {treasure}.",
 ]
 
 
@@ -341,7 +437,7 @@ def resolve_steamid(text, key):
     return resp["steamid"]
 
 
-def fetch_profile(steamid, key):
+def fetch_profile(steamid, key, refresh=False):
     summary = api_get("ISteamUser/GetPlayerSummaries/v2/", key, steamids=steamid)
     players = summary.get("players", [])
     if not players:
@@ -367,7 +463,16 @@ def fetch_profile(steamid, key):
                        include_appinfo=1, include_played_free_games=1)
     games = all_resp.get("games", [])
     top = max(games, key=lambda g: g.get("playtime_forever", 0), default=None)
-    achievements, achievements_hidden = count_achievements(steamid, key, games)
+    ach = count_achievements(steamid, key, games, refresh)
+
+    # Badges (they feed the reputation system). Steam level is built purely from badge
+    # XP, so a level above 0 with zero badges means Steam is not showing us the badges.
+    try:
+        badge_resp = api_get("IPlayerService/GetBadges/v1/", key, steamid=steamid)
+    except SteamError:
+        badge_resp = {}
+    badges = len(badge_resp.get("badges", []))
+    badges_hidden = badges == 0 and level_resp.get("player_level", 0) > 0
     return {
         "name": player.get("personaname", "Unknown"),
         "level": level_resp.get("player_level", 0),
@@ -375,13 +480,107 @@ def fetch_profile(steamid, key):
         "top_game": top.get("name", "Unknown Game") if top else None,
         "top_hours": (top.get("playtime_forever", 0) / 60) if top else 0.0,
         "total_hours": sum(g.get("playtime_forever", 0) for g in games) / 60,
-        "achievements": achievements,
-        "achievements_hidden": achievements_hidden,
+        "achievements": ach["total"],
+        "achievements_hidden": ach["hidden"],
+        "achievements_new": ach["new"],      # gained since the last complete visit, or None
+        "ach_stats": ach,
+        "badges": badges,
+        "badges_hidden": badges_hidden,
     }
 
 
+# ---------------------------------------------------------------------------
+# Achievements and the achievement cache
+#
+# Steam can only report achievements one game at a time, which is slow and eats API
+# calls. So every game's result is saved in cache/<SteamID>.json next to this script.
+# On the next visit Steam is asked about a game again only when something may have
+# changed:
+#   * the game is not in the cache yet (e.g. you started a new game),
+#   * its playtime or its "last played" time changed (achievements are unlocked by
+#     playing, so a game you did not touch cannot have new ones),
+#   * or the saved entry is older than RECHECK_AFTER_DAYS, a safety net for the rare
+#     unlock that does not show up in playtime (achievement tools, offline syncing).
+# Typing "refresh <profile>" (or starting the program with --refresh) ignores the
+# cache and checks every game again. Deleting the cache folder is always safe.
+# ---------------------------------------------------------------------------
+BLOCKED = "blocked"   # Steam refuses to show this profile's achievements
+FAILED = "failed"     # the lookup did not work (network, Steam hiccup): result unknown
+
+_cache_warned = False
+
+
+def cache_path(steamid):
+    return os.path.join(CACHE_DIR, f"{steamid}.json")
+
+
+def load_cache(steamid):
+    """Returns (cache, found). A missing, damaged or outdated file just counts as no cache."""
+    empty = {"version": CACHE_VERSION, "steamid": str(steamid), "last_total": None, "games": {}}
+    try:
+        with open(cache_path(steamid), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return empty, False
+    if (not isinstance(data, dict) or data.get("version") != CACHE_VERSION
+            or data.get("steamid") != str(steamid) or not isinstance(data.get("games"), dict)):
+        return empty, False
+    if not isinstance(data.get("last_total"), int):
+        data["last_total"] = None
+    return data, True
+
+
+def save_cache(cache):
+    """Writes the cache file; returns False (after one warning) if the folder is not writable."""
+    global _cache_warned
+    path = cache_path(cache["steamid"])
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cache, f, indent=1)
+        os.replace(tmp, path)       # all or nothing: an interrupted save never leaves half a file
+        return True
+    except OSError as e:
+        if not _cache_warned:
+            _cache_warned = True
+            print(f"\n  (Could not save the cache in '{CACHE_DIR}': {e}. Carrying on without it.)")
+        return False
+
+
+def entry_is_current(entry, game, now):
+    """True if the saved result for this game can be trusted without asking Steam again."""
+    if not isinstance(entry, dict) or not isinstance(entry.get("unlocked"), int):
+        return False
+    if entry.get("playtime") != game.get("playtime_forever", 0):
+        return False
+    if entry.get("last_played") != game.get("rtime_last_played", 0):
+        return False
+    checked = entry.get("checked_at")
+    if not isinstance(checked, (int, float)):
+        return False
+    if RECHECK_AFTER_DAYS and now - checked > RECHECK_AFTER_DAYS * 86400:
+        return False
+    return True
+
+
+def apply_results(cache, games, results, now):
+    """Stores every real number from this round in the cache (never BLOCKED or FAILED).
+    Returns True if anything was written."""
+    changed = False
+    for g in games:
+        k = str(g["appid"])
+        result = results.get(k)
+        if isinstance(result, int):
+            cache["games"][k] = {"unlocked": result, "playtime": g.get("playtime_forever", 0),
+                                 "last_played": g.get("rtime_last_played", 0), "checked_at": now}
+            changed = True
+    return changed
+
+
 def achievements_for_game(appid, steamid, key):
-    """Unlocked achievements for one game, or None if Steam refuses to show them."""
+    """Unlocked achievements for one game: a number, BLOCKED (private) or FAILED (unknown).
+    A game that has no achievements is simply 0."""
     for attempt in range(3):
         try:
             r = requests.get(f"{API}/ISteamUserStats/GetPlayerAchievements/v1/",
@@ -394,47 +593,125 @@ def achievements_for_game(appid, steamid, key):
             time.sleep(1 + attempt)          # Steam wants us to slow down; try again
             continue
         if r.status_code == 403:
-            return None                      # achievements are private
+            return BLOCKED                   # achievements are private
+        if r.status_code == 400:
+            return 0                         # Steam's answer for "this game has no achievements"
         if r.status_code != 200:
-            return 0                         # 400: this game has no achievements
+            return FAILED
         try:
             stats = r.json().get("playerstats", {})
-        except ValueError:
-            return 0
+        except (ValueError, AttributeError):
+            return FAILED
+        if "not public" in str(stats.get("error", "")).lower():
+            return BLOCKED
         return sum(1 for a in stats.get("achievements", []) if a.get("achieved") == 1)
-    return 0
+    return FAILED
 
 
-def count_achievements(steamid, key, games):
-    """Total unlocked achievements over every game you have played (free ones too).
-    Steam has no single call for this, so it asks once per game, several at a time.
-    Returns (count, hidden); hidden is True when Steam refused every single request."""
-    appids = [g["appid"] for g in games if g.get("playtime_forever", 0) > 0]
-    if not appids:
-        return 0, False
+class PrivacyWatch:
+    """Spots a private profile early. Steam says 'not public' for every game, so after a few
+    such answers and no good ones there is no point asking about the remaining games."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.blocked = 0
+        self.good = 0
 
-    total = blocked = done = 0
-    pool = ThreadPoolExecutor(max_workers=ACHIEVEMENT_WORKERS)
-    try:
-        futures = [pool.submit(achievements_for_game, a, steamid, key) for a in appids]
-        for f in as_completed(futures):
-            result = f.result()
-            if result is None:
-                blocked += 1
-            else:
-                total += result
-            done += 1
-            print(f"\r  Counting achievements... {done}/{len(appids)} games", end="", flush=True)
-    except BaseException:
+    def record(self, result):
+        with self.lock:
+            if result == BLOCKED:
+                self.blocked += 1
+            elif isinstance(result, int):
+                self.good += 1
+
+    def private(self):
+        with self.lock:
+            return self.blocked >= 3 and self.good == 0
+
+
+def lookup_game(appid, steamid, key, watch):
+    if watch.private():
+        return BLOCKED
+    result = achievements_for_game(appid, steamid, key)
+    watch.record(result)
+    return result
+
+
+def count_achievements(steamid, key, games, refresh=False):
+    """Total unlocked achievements over every game you have played (free ones too), using
+    the cache wherever the saved result is still valid. Returns a dict:
+      total, hidden (Steam hides them and nothing is known), reused (games read from the
+      cache), queried (games asked about on Steam), failed / blocked (games that could not
+      be checked this time), new (achievements gained since the last complete visit, or
+      None on a first visit), had_cache, refreshed, games."""
+    cache, had_cache = load_cache(steamid)
+    old = cache["games"]
+    now = time.time()
+    played = [g for g in games if g.get("playtime_forever", 0) > 0]
+
+    counts = {}                      # appid -> unlocked achievements
+    todo = []
+    for g in played:
+        k = str(g["appid"])
+        if not refresh and entry_is_current(old.get(k), g, now):
+            counts[k] = old[k]["unlocked"]
+        else:
+            todo.append(g)
+    stats = {"total": 0, "hidden": False, "reused": len(played) - len(todo), "queried": len(todo),
+             "failed": 0, "blocked": 0, "new": None, "had_cache": had_cache,
+             "refreshed": bool(refresh), "games": len(played)}
+
+    results = {}                     # appid -> number, BLOCKED or FAILED
+    if todo:
+        watch = PrivacyWatch()
+        pool = ThreadPoolExecutor(max_workers=ACHIEVEMENT_WORKERS)
+        futures = {pool.submit(lookup_game, g["appid"], steamid, key, watch): g for g in todo}
         try:
-            pool.shutdown(wait=False, cancel_futures=True)
-        except TypeError:                    # Python older than 3.9
-            pool.shutdown(wait=False)
-        print()
-        raise
-    pool.shutdown()
-    print("\r" + " " * 48 + "\r", end="", flush=True)
-    return total, blocked == len(appids)
+            for f in as_completed(futures):
+                results[str(futures[f]["appid"])] = f.result()
+                print(f"\r  Counting achievements... {len(results)}/{len(todo)} games",
+                      end="", flush=True)
+        except BaseException:
+            # Interrupted (Ctrl+C): keep every game that finished, so the next run only has
+            # to do the rest. last_total stays as it was, because the scan is incomplete.
+            for f, g in futures.items():
+                if f.done() and not f.cancelled() and f.exception() is None:
+                    results.setdefault(str(g["appid"]), f.result())
+            try:
+                pool.shutdown(wait=False, cancel_futures=True)
+            except TypeError:                # Python older than 3.9
+                pool.shutdown(wait=False)
+            if apply_results(cache, todo, results, now):
+                save_cache(cache)
+            print()
+            raise
+        pool.shutdown()
+        print("\r" + " " * 48 + "\r", end="", flush=True)
+
+    for g in todo:
+        k = str(g["appid"])
+        result = results.get(k, FAILED)
+        if isinstance(result, int):
+            counts[k] = result
+        else:                        # unknown right now: use the last known value, never a guess
+            stats["blocked" if result == BLOCKED else "failed"] += 1
+            prior = old.get(k)
+            counts[k] = prior["unlocked"] if isinstance(prior, dict) and isinstance(
+                prior.get("unlocked"), int) else 0
+
+    total = sum(counts.values())
+    stats["total"] = total
+    stats["hidden"] = bool(todo) and stats["blocked"] == len(todo) and total == 0
+
+    dirty = apply_results(cache, todo, results, now)
+    if stats["failed"] == 0 and stats["blocked"] == 0:   # only a complete scan sets the baseline
+        if cache["last_total"] is not None:
+            stats["new"] = total - cache["last_total"]
+        if cache["last_total"] != total:
+            cache["last_total"] = total
+            dirty = True
+    if dirty:
+        save_cache(cache)
+    return stats
 
 
 def get_friend_ids(steamid, key):
@@ -494,6 +771,42 @@ def roll_talent(steamid):
     SteamID always rolls the same talent, which keeps the death roll stable too."""
     rng = random.Random(f"talent-{steamid}")
     return rng.choices(TALENTS, weights=[t["weight"] for t in TALENTS], k=1)[0]
+
+
+def get_personalities(info, friend_count):
+    """Every personality this profile qualifies for, in table order."""
+    return [p for p in PERSONALITIES if p["test"](info, friend_count)]
+
+
+def personality_phrase(personalities):
+    traits = [p["trait"] for p in personalities] or [NO_PERSONALITY_TRAIT]
+    if len(traits) == 1:
+        return traits[0]
+    return ", ".join(traits[:-1]) + " and " + traits[-1]
+
+
+def reputation_rank(points):
+    idx = 0
+    for i, (threshold, _) in enumerate(REPUTATION_RANKS):
+        if points >= threshold:
+            idx = i
+    return idx
+
+
+def roll_reputation(steamid, info, personalities):
+    """Badges give the base reputation, personalities add to it. A personality with a
+    rep_chance below 1.0 rolls for its points; the roll comes from the SteamID, and
+    every group in the table draws in a fixed order, so results never shift."""
+    rng = random.Random(f"rep-{steamid}")
+    groups = list(dict.fromkeys(p.get("roll_group", p["name"]) for p in PERSONALITIES))
+    rolls = {g: rng.random() for g in groups}
+    badge_points = info["badges"] * REP_PER_BADGE
+    bonuses = [(p["name"], p["rep"]) for p in personalities
+               if p["rep"] and rolls[p.get("roll_group", p["name"])] < p["rep_chance"]]
+    points = max(0, badge_points + sum(amount for _, amount in bonuses))
+    idx = reputation_rank(points)
+    return {"points": points, "badge_points": badge_points, "bonuses": bonuses,
+            "rank_index": idx, "rank": REPUTATION_RANKS[idx][1]}
 
 
 def get_realm(score):
@@ -579,7 +892,8 @@ def describe_death(c, info, friend):
 def generate_cultivator(info, steamid, friend_ids=None):
     rng = random.Random(int(steamid))  # same profile -> same cultivator
     talent = roll_talent(steamid)      # rolled first: it changes both power and death risk
-    score = power_score(info, talent["power"])
+    personalities = get_personalities(info, len(friend_ids or []))   # second: same reason
+    score = power_score(info, talent["power"] + sum(p["power"] for p in personalities))
     idx, (_, realm, realm_flavor) = get_realm(score)
 
     if idx <= 2:
@@ -600,7 +914,9 @@ def generate_cultivator(info, steamid, friend_ids=None):
 
     lifespan = 80 + idx * rng.randint(150, 400)
     lightning = max(0, idx - 5) * 3 + (9 if idx == 9 else 0)
-    fate = roll_fate(steamid, idx, lifespan, friend_ids or [], talent["death"])
+    death_chance = min(1.0, talent["death"] + sum(p["death"] for p in personalities))
+    fate = roll_fate(steamid, idx, lifespan, friend_ids or [], death_chance)
+    reputation = roll_reputation(steamid, info, personalities)
 
     # Sect missions: every unlocked achievement counts, and each one pays sect points
     missions = info["achievements"]
@@ -614,8 +930,14 @@ def generate_cultivator(info, steamid, friend_ids=None):
     dao = pick_variant(lvl, DAO_TIERS, rng, **nums)
     mission_text = pick_variant(missions, MISSION_TIERS, rng, **nums)
 
+    # The reputation sentence uses its own generator so it never disturbs the picks above
+    rep_text = pick_variant(reputation["rank_index"], REPUTATION_TIERS,
+                            random.Random(f"repphrase-{steamid}"),
+                            sect=sect, rank=reputation["rank"])
+
     article = "an" if title[0] in "AEIOU" else "a"
     backstory = rng.choice(BACKSTORIES).format(
+        personality=personality_phrase(personalities), reputation=rep_text,
         steam=info["name"], name=name, sect=sect, a_title=f"{article} {title}",
         talent=talent["blurb"], dao=dao, meditation=meditation, treasury=treasury,
         missions=mission_text, treasure=treasure, element=element, technique=technique,
@@ -627,12 +949,43 @@ def generate_cultivator(info, steamid, friend_ids=None):
         "lightning": lightning, "treasure": treasure, "backstory": backstory, "score": score,
         "birth_year": fate["birth_year"], "death": fate["death"], "talent": talent,
         "missions": missions, "sect_points": sect_points,
+        "personalities": personalities, "reputation": reputation, "death_chance": death_chance,
     }
 
 
 def power_bar(idx):
     total = len(REALMS)
     return "[" + "#" * (idx + 1) + "-" * (total - idx - 1) + f"] {idx + 1}/{total}"
+
+
+def achievement_note(st):
+    """One short line about where the achievement numbers came from."""
+    if not st or st["hidden"] or st["games"] == 0:
+        return None
+    parts = []
+    if st["refreshed"]:
+        parts.append(f"full re-check of {st['queried']:,} games, cache updated")
+    elif st["queried"] == 0:
+        parts.append(f"all {st['reused']:,} games read from the cache, no Steam lookups needed")
+    elif st["reused"] == 0:
+        parts.append(f"{st['queried']:,} games checked with Steam and saved to the cache"
+                     if not st["had_cache"] else f"{st['queried']:,} games checked with Steam")
+    else:
+        parts.append(f"{st['queried']:,} of {st['games']:,} games checked with Steam, "
+                     f"{st['reused']:,} read from the cache")
+    unknown = st["failed"] + st["blocked"]
+    if unknown:
+        parts.append(f"{unknown:,} could not be checked this time and will be retried next visit")
+    return "; ".join(parts)
+
+
+def personality_label(p):
+    effects = []
+    if p["power"]:
+        effects.append(f"{p['power']:+d} power")
+    if p["death"]:
+        effects.append(f"{p['death'] * 100:+g}% death risk")
+    return p["name"] + (f" ({', '.join(effects)})" if effects else "")
 
 
 def print_cultivator(c, info):
@@ -643,7 +996,16 @@ def print_cultivator(c, info):
     print(f"  Realm       : {c['realm']} ({c['realm_flavor']})")
     print(f"  Power       : {power_bar(c['realm_index'])}   (score {c['score']:,.0f})")
     t = c["talent"]
-    print(f"  Talent      : {t['name']} (power {t['power']:+d}, death risk {t['death'] * 100:g}%)")
+    print(f"  Talent      : {t['name']} (power {t['power']:+d})")
+    if c["personalities"]:
+        print("  Personality : " + ", ".join(personality_label(p) for p in c["personalities"]))
+    else:
+        print("  Personality : none (a quiet temperament)")
+    rep = c["reputation"]
+    print(f"  Reputation  : {rep['rank']} ({rep['points']:,} points)")
+    if rep["bonuses"]:
+        print("  Fame boosts : " + ", ".join(f"{n} +{a}" for n, a in rep["bonuses"]))
+    print(f"  Death risk  : {c['death_chance'] * 100:g}%")
     print(f"  Affinity    : {c['element']}")
     print(f"  Signature   : {c['technique']}")
     print(f"  Treasure    : {c['treasure']}")
@@ -652,6 +1014,10 @@ def print_cultivator(c, info):
     else:
         n = c["missions"]
         print(f"  Missions    : {n:,} sect mission{'' if n == 1 else 's'} completed")
+        new = info.get("achievements_new")
+        if new and new > 0:
+            print(f"  Since last  : +{new:,} new mission{'' if new == 1 else 's'} "
+                  f"(+{new * SECT_POINTS_PER_MISSION:,} sect points) since your last visit")
     print(f"  Sect points : {c['sect_points']:,}")
     cut = " (cut short)" if c["death"] else ""
     print(f"  Lifespan    : {c['lifespan']:,} years{cut}")
@@ -668,6 +1034,13 @@ def print_cultivator(c, info):
     print(f"    Steam level : {info['level']}")
     print(f"    Paid games  : {info['game_count']:,}")
     print(f"    Achievements: {info['achievements']:,}")
+    note = achievement_note(info.get("ach_stats"))
+    if note:
+        print(f"      ({note})")
+    if info["badges_hidden"]:
+        print("    Badges      : 0 (Steam is hiding your badges)")
+    else:
+        print(f"    Badges      : {info['badges']:,}")
     if info["top_game"]:
         print(f"    Most played : {info['top_game']} ({info['top_hours']:,.0f} h)")
     print(line)
@@ -713,16 +1086,23 @@ def main():
     if not key:
         sys.exit("An API key is required (https://steamcommunity.com/dev/apikey).")
 
-    print("Welcome, seeker of the Dao. Press Ctrl+C to leave.\n")
+    print("Welcome, seeker of the Dao. Press Ctrl+C to leave.")
+    print("Tip: type 'refresh <profile>' to ignore the saved achievement cache.\n")
+    refresh_first = "--refresh" in sys.argv[1:]   # refresh each profile's first lookup this run
     profiles = {}
     while True:
         try:
             text = input("Steam profile URL, custom name, or SteamID64: ").strip()
+            refresh = False
+            if text.lower().startswith("refresh "):
+                refresh, text = True, text[len("refresh "):].strip()
             if not text:
                 continue
             steamid = resolve_steamid(text, key)
-            if steamid not in profiles:          # looking up the same profile again is instant
-                profiles[steamid] = fetch_profile(steamid, key)
+            if refresh_first and steamid not in profiles:
+                refresh = True
+            if refresh or steamid not in profiles:   # a repeat lookup in the same run is instant
+                profiles[steamid] = fetch_profile(steamid, key, refresh)
             info = profiles[steamid]
             friend_ids, note = get_friend_ids(steamid, key)
             cultivator = generate_cultivator(info, steamid, friend_ids)
