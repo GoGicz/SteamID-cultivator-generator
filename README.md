@@ -9,6 +9,7 @@ Features
 - Life, death, and heavenly fate
 - Encounters with Steam friends
 - Achievements as sect missions
+- Personality and Reputation system based on your steam Stats
 
   example:
   <img width="1446" height="922" alt="ChatGPT Image Oct 29, 2026, 07_42_31 AM" src="https://github.com/user-attachments/assets/4bbfb225-86f6-4453-8349-1bedce2ebdcf" />
