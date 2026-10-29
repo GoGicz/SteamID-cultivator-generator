@@ -18,6 +18,10 @@ a time, so the first lookup of a big library takes a little while. The results a
 saved in a "cache" folder next to this file, so later runs only ask Steam about games
 whose playtime changed (or new ones) and report how many achievements you gained since
 your last visit. Type "refresh <profile>" (or run with --refresh) to re-check everything.
+Every cultivator walks the Righteous Path (70% by default, +5 reputation) or the Demonic
+Path (+20 power), by luck from the SteamID. Type "mocb" (or "mocb <profile1> <profile2>")
+to make two cultivators duel: the program works out who is most likely to win and tells a
+short story of the battle.
 Your Steam badges build your reputation, from "Unknown Nobody" up to "Universal
 Legend". Personalities, earned from your friends, badges, achievements and games,
 add reputation (some only by chance) and a few also change power and death risk,
@@ -110,6 +114,30 @@ PERSONALITIES = [
      "trait": "could never walk past a treasure stall without stopping"},
 ]
 NO_PERSONALITY_TRAIT = "kept a quiet temperament that set off no gossip"
+
+# ---------------------------------------------------------------------------
+# Paths. Every cultivator walks one of two, picked by luck from the SteamID (never from
+# Steam stats). RIGHTEOUS_CHANCE is the chance of the Righteous Path; the Demonic Path
+# gets the rest, so 0.70 means 70% / 30%.
+#   power : added to the power score        rep : added to the reputation points
+# ---------------------------------------------------------------------------
+RIGHTEOUS_CHANCE = 0.70
+PATHS = [
+    {"name": "Righteous", "power": 0, "rep": 5},
+    {"name": "Demonic", "power": 20, "rep": 0},
+]
+
+# ---------------------------------------------------------------------------
+# Duels ("mocb"). Win chance = power^BATTLE_EXPONENT, compared with the other fighter's
+# (BATTLE_SCORE_FLOOR keeps two very weak fighters from dividing by nothing). A higher
+# exponent makes the stronger fighter win more reliably.
+# BATTLE_UPSETS = True: the dice decide the real winner using those chances (the
+# favorite usually wins, sometimes not). False: the favorite always wins.
+# The dice are fixed by the two SteamIDs, so the same pair always gives the same winner.
+# ---------------------------------------------------------------------------
+BATTLE_EXPONENT = 2.0
+BATTLE_SCORE_FLOOR = 25
+BATTLE_UPSETS = True
 ACHIEVEMENT_WORKERS = 8       # how many games are asked about at the same time
 
 # Achievement cache (see "Achievements and the achievement cache" below)
@@ -773,6 +801,21 @@ def roll_talent(steamid):
     return rng.choices(TALENTS, weights=[t["weight"] for t in TALENTS], k=1)[0]
 
 
+def roll_path(steamid):
+    """Righteous or Demonic, by luck only. The same SteamID always walks the same path."""
+    rng = random.Random(f"path-{steamid}")
+    return PATHS[0] if rng.random() < RIGHTEOUS_CHANCE else PATHS[1]
+
+
+def path_label(path):
+    effects = []
+    if path["power"]:
+        effects.append(f"+{path['power']} power")
+    if path["rep"]:
+        effects.append(f"+{path['rep']} reputation")
+    return path["name"] + (f" ({', '.join(effects)})" if effects else "")
+
+
 def get_personalities(info, friend_count):
     """Every personality this profile qualifies for, in table order."""
     return [p for p in PERSONALITIES if p["test"](info, friend_count)]
@@ -793,16 +836,18 @@ def reputation_rank(points):
     return idx
 
 
-def roll_reputation(steamid, info, personalities):
-    """Badges give the base reputation, personalities add to it. A personality with a
-    rep_chance below 1.0 rolls for its points; the roll comes from the SteamID, and
-    every group in the table draws in a fixed order, so results never shift."""
+def roll_reputation(steamid, info, personalities, path=None):
+    """Badges give the base reputation; personalities and the path add to it. A
+    personality with a rep_chance below 1.0 rolls for its points; the roll comes from the
+    SteamID, and every group in the table draws in a fixed order, so results never shift."""
     rng = random.Random(f"rep-{steamid}")
     groups = list(dict.fromkeys(p.get("roll_group", p["name"]) for p in PERSONALITIES))
     rolls = {g: rng.random() for g in groups}
     badge_points = info["badges"] * REP_PER_BADGE
     bonuses = [(p["name"], p["rep"]) for p in personalities
                if p["rep"] and rolls[p.get("roll_group", p["name"])] < p["rep_chance"]]
+    if path and path["rep"]:
+        bonuses.append((f"{path['name']} Path", path["rep"]))
     points = max(0, badge_points + sum(amount for _, amount in bonuses))
     idx = reputation_rank(points)
     return {"points": points, "badge_points": badge_points, "bonuses": bonuses,
@@ -893,7 +938,9 @@ def generate_cultivator(info, steamid, friend_ids=None):
     rng = random.Random(int(steamid))  # same profile -> same cultivator
     talent = roll_talent(steamid)      # rolled first: it changes both power and death risk
     personalities = get_personalities(info, len(friend_ids or []))   # second: same reason
-    score = power_score(info, talent["power"] + sum(p["power"] for p in personalities))
+    path = roll_path(steamid)          # third: the Demonic Path adds power
+    score = power_score(info, talent["power"] + sum(p["power"] for p in personalities)
+                        + path["power"])
     idx, (_, realm, realm_flavor) = get_realm(score)
 
     if idx <= 2:
@@ -916,7 +963,7 @@ def generate_cultivator(info, steamid, friend_ids=None):
     lightning = max(0, idx - 5) * 3 + (9 if idx == 9 else 0)
     death_chance = min(1.0, talent["death"] + sum(p["death"] for p in personalities))
     fate = roll_fate(steamid, idx, lifespan, friend_ids or [], death_chance)
-    reputation = roll_reputation(steamid, info, personalities)
+    reputation = roll_reputation(steamid, info, personalities, path)
 
     # Sect missions: every unlocked achievement counts, and each one pays sect points
     missions = info["achievements"]
@@ -950,6 +997,7 @@ def generate_cultivator(info, steamid, friend_ids=None):
         "birth_year": fate["birth_year"], "death": fate["death"], "talent": talent,
         "missions": missions, "sect_points": sect_points,
         "personalities": personalities, "reputation": reputation, "death_chance": death_chance,
+        "path": path,
     }
 
 
@@ -1001,6 +1049,7 @@ def print_cultivator(c, info):
         print("  Personality : " + ", ".join(personality_label(p) for p in c["personalities"]))
     else:
         print("  Personality : none (a quiet temperament)")
+    print(f"  Path        : {path_label(c['path'])}")
     rep = c["reputation"]
     print(f"  Reputation  : {rep['rank']} ({rep['points']:,} points)")
     if rep["bonuses"]:
@@ -1079,6 +1128,260 @@ def print_death(c, info, friend):
 
 
 # ---------------------------------------------------------------------------
+# Duels: the "mocb" command
+# ---------------------------------------------------------------------------
+BATTLE_PLACES = [
+    "a storm-lashed cliff above the Nine-Dragon Sea", "the ruins of an ancient sect gate",
+    "a frozen mountain pass", "the arena of the Heavenly Tournament",
+    "a moonlit bamboo forest", "a valley where the Qi hung thick as fog",
+    "the courtyard of an abandoned temple", "a floating island high above the clouds",
+]
+
+# Openings by the two paths. In a mixed pair {x} is always the Righteous one and {y} the
+# Demonic one. Placeholders: {x} {y} {x_sect} {y_sect} {place}
+BATTLE_OPENINGS = {
+    ("Righteous", "Righteous"): [
+        "At {place}, {x} of the {x_sect} and {y} of the {y_sect}, both walkers of the "
+        "Righteous Path, agreed to settle an old argument over who was the greater "
+        "cultivator. Neither intended to hold back.",
+        "Two upright cultivators, {x} and {y}, met at {place}. Bows were exchanged, then the "
+        "Qi began to rise, because both were far too proud to yield.",
+    ],
+    ("Demonic", "Demonic"): [
+        "At {place}, {x} and {y}, two walkers of the Demonic Path, reached for the same prize. "
+        "Demonic cultivators do not share, and they certainly do not talk it over.",
+        "{x} of the {x_sect} and {y} of the {y_sect} met at {place}, and the air turned bitter "
+        "with killing intent. On the Demonic Path, only one of them was walking away.",
+    ],
+    ("Righteous", "Demonic"): [
+        "At {place}, {x} of the {x_sect}, a champion of the Righteous Path, finally cornered "
+        "{y} of the {y_sect}, whose Demonic arts had troubled the region for years.",
+        "{y}, a Demonic cultivator, was trespassing near {place} when {x} of the Righteous Path "
+        "appeared and demanded they leave. {y} laughed, and the sky darkened.",
+    ],
+}
+
+# Placeholders: {x} {y} {x_tech} {y_tech} {x_elem} {y_elem}
+BATTLE_CLASHES = [
+    "{x} opened with {x_tech}, and {y} met it with {y_tech}, {x_elem} colliding with "
+    "{y_elem} until the ground cracked.",
+    "{x_tech} tore across the sky, answered by {y_tech}; {x_elem} Qi and {y_elem} Qi spiralled "
+    "together in a roaring storm.",
+    "The first exchange shook the mountain: {x_tech} against {y_tech}, {x_elem} against "
+    "{y_elem}, and neither dared to blink.",
+]
+
+# The turning point depends on how likely the winner was to win.
+# Placeholders: {w} {l} (winner, loser) {w_tech} {l_tech} {gap} (a sentence about the realms, or empty)
+BATTLE_TURNS = {
+    "close": [
+        "For a hundred exchanges neither gave an inch, until {w} found a single opening in "
+        "{l}'s defense and drove {w_tech} straight through it.",
+        "The duel hung by a thread. In the end it was {w_tech} landing a heartbeat before "
+        "{l_tech} that decided everything.",
+        "Both were bleeding Qi, and both were smiling. Then {l} stumbled on a loose stone, and "
+        "{w} did not waste the gift.",
+    ],
+    "clear": [
+        "Little by little the difference in cultivation showed. {w}'s Qi flowed steady while "
+        "{l}'s began to falter.{gap}",
+        "{w} read every move of {l}'s {l_tech} and answered each one with calm precision.{gap}",
+        "{l} fought bravely, but {w_tech} grew heavier with every exchange.{gap}",
+    ],
+    "crushing": [
+        "It was hardly a contest. A single wave of {w}'s Qi sent {l} skidding across the "
+        "stone.{gap}",
+        "{l} barely finished {l_tech} before {w_tech} swept it aside like autumn leaves.{gap}",
+        "The ground itself bowed under {w}'s Qi, and {l} could only watch as {w_tech} "
+        "descended.{gap}",
+    ],
+    "upset": [
+        "Everyone would have bet on {l}, but fortune had other plans. A forgotten trick, a lucky "
+        "misstep, and suddenly {w_tech} was past {l}'s guard.{gap}",
+        "Against every prediction, {w} refused to fall. When {l} grew careless, the heavens "
+        "themselves seemed to tilt, and {w_tech} struck true.{gap}",
+        "The odds said {l}. The Dao said otherwise. {w} caught {l_tech} on a borrowed breath and "
+        "turned it back with ruthless timing.{gap}",
+    ],
+}
+
+# Endings by (winner's path, loser's path).
+# Placeholders: {w} {l} {w_sect} {l_sect} {w_treasure} {l_treasure}
+BATTLE_ENDINGS = {
+    ("Righteous", "Righteous"): [
+        "{w} stepped back and offered {l} a healing pill. 'You fought well,' {w} said, and "
+        "neither of them ever mentioned {l_treasure} again.",
+        "{l} yielded with a bow, and {w} returned it. Word of the duel spread through the "
+        "{w_sect}, and everyone agreed it had been an honorable one.",
+        "Afterwards the two sat down to share a pot of spirit tea, arguing happily about who "
+        "had really been the stronger.",
+    ],
+    ("Righteous", "Demonic"): [
+        "{w} sealed {l}'s Qi with a talisman and carried {l} off to the {w_sect} for judgment, "
+        "as the Righteous Path demanded.",
+        "Ignoring {l}'s pleas, {w} shattered {l_treasure} and warned {l} never to return.",
+        "{w} broke {l}'s demonic cultivation with a single palm. 'Walk a better road,' {w} "
+        "said, and left.",
+    ],
+    ("Demonic", "Righteous"): [
+        "{w} smiled coldly, plucked {l_treasure} from the dust, and left {l} to crawl home with "
+        "a broken pride.",
+        "Showing no mercy, {w} drained the last of {l}'s Qi and strolled away with "
+        "{l_treasure}, humming a cheerful tune.",
+        "{l} spoke of honor and mercy. {w} laughed, took {l_treasure} as the price of the "
+        "lesson, and vanished into the night.",
+    ],
+    ("Demonic", "Demonic"): [
+        "{w} finished the duel with a flick of the wrist. By morning the {l_sect} was missing "
+        "one cultivator, and {w} was wearing {l_treasure}.",
+        "{w} wiped a drop of blood from a thumb, claimed {l_treasure}, and left {l} as a "
+        "warning to every other demonic cultivator in the region.",
+        "{l} begged for mercy. {w} considered it, took {l_treasure} as the price, and let {l} "
+        "live, for the moment.",
+    ],
+}
+
+
+def battle_odds(a, b):
+    """Chance (0 to 1) that cultivator a beats cultivator b, from both power scores."""
+    sa = (a["score"] + BATTLE_SCORE_FLOOR) ** BATTLE_EXPONENT
+    sb = (b["score"] + BATTLE_SCORE_FLOOR) ** BATTLE_EXPONENT
+    return sa / (sa + sb)
+
+
+def fight(a, b, id_a, id_b):
+    """Decides the duel. Same two SteamIDs, same winner, whichever order they are given in."""
+    p_a = battle_odds(a, b)
+    a_is_first = int(id_a) <= int(id_b)
+    favorite_is_a = p_a > 0.5 or (p_a == 0.5 and a_is_first)
+    if BATTLE_UPSETS:
+        lo, hi = sorted((int(id_a), int(id_b)))
+        roll = random.Random(f"battle-{lo}-{hi}").random()
+        p_first = p_a if a_is_first else 1 - p_a
+        a_wins = (roll < p_first) == a_is_first
+    else:
+        a_wins = favorite_is_a
+    p_winner = p_a if a_wins else 1 - p_a
+    return {"p_a": p_a, "p_b": 1 - p_a, "even": abs(p_a - 0.5) < 1e-9,
+            "winner": a if a_wins else b, "loser": b if a_wins else a,
+            "favorite": a if favorite_is_a else b, "p_winner": p_winner,
+            "upset": p_winner < 0.5}
+
+
+def battle_class(p_winner):
+    if p_winner < 0.5:
+        return "upset"
+    if p_winner < 0.65:
+        return "close"
+    if p_winner < 0.85:
+        return "clear"
+    return "crushing"
+
+
+def realm_gap_text(w, l):
+    d = w["realm_index"] - l["realm_index"]
+    if d > 0:
+        return f" {w['name']}'s {w['realm']} cultivation towered over {l['name']}'s {l['realm']}."
+    if d < 0:
+        return (f" On paper, {l['name']}'s {l['realm']} cultivation should have crushed "
+                f"{w['name']}'s {w['realm']}.")
+    return ""
+
+
+def battle_story(a, b, result):
+    """A short story of the duel. The winner is fixed by fight(); the telling is random,
+    so asking again gives the same result told in a different way."""
+    x, y = a, b
+    if a["path"]["name"] == "Demonic" and b["path"]["name"] == "Righteous":
+        x, y = b, a                      # in a mixed pair, {x} is always the Righteous one
+    w, l = result["winner"], result["loser"]
+    fmt = dict(
+        x=x["name"], y=y["name"], x_sect=x["sect"], y_sect=y["sect"],
+        x_tech=x["technique"], y_tech=y["technique"], x_elem=x["element"], y_elem=y["element"],
+        w=w["name"], l=l["name"], w_tech=w["technique"], l_tech=l["technique"],
+        w_sect=w["sect"], l_sect=l["sect"], w_treasure=w["treasure"], l_treasure=l["treasure"],
+        place=random.choice(BATTLE_PLACES), gap=realm_gap_text(w, l))
+    parts = [
+        random.choice(BATTLE_OPENINGS[(x["path"]["name"], y["path"]["name"])]),
+        random.choice(BATTLE_CLASHES),
+        random.choice(BATTLE_TURNS[battle_class(result["p_winner"])]),
+        random.choice(BATTLE_ENDINGS[(w["path"]["name"], l["path"]["name"])]),
+    ]
+    text = " ".join(p.format(**fmt) for p in parts)
+    if w["personalities"]:
+        text += f" As ever, {w['name']} {random.choice(w['personalities'])['trait']}."
+    return text
+
+
+def print_battle(a, b, info_a, info_b, result, story):
+    line = "=" * 64
+    print("\n" + line)
+    print("  MOCB  -  Clash of Cultivators")
+    print(line)
+    for tag, c, info, p in (("A", a, info_a, result["p_a"]), ("B", b, info_b, result["p_b"])):
+        print(f"  [{tag}] {c['name']}  of the {c['sect']}")
+        print(f"      Steam name : {info['name']}")
+        print(f"      Realm      : {c['realm']}")
+        print(f"      Power      : {c['score']:,.0f}")
+        print(f"      Talent     : {c['talent']['name']}")
+        print(f"      Path       : {c['path']['name']}")
+        print(f"      Technique  : {c['technique']}")
+        print(f"      Win chance : {p * 100:.1f}%")
+        print()
+    if result["even"]:
+        wrap_print("Prediction : a perfectly even match, too close to call")
+    else:
+        fav = result["favorite"]
+        p_fav = result["p_a"] if fav is a else result["p_b"]
+        wrap_print(f"Prediction : {fav['name']} is most likely to win ({p_fav * 100:.1f}%)")
+    print(line)
+    print()
+    wrap_print(story)
+    print()
+    winner = result["winner"]
+    if result["upset"]:
+        wrap_print(f"Result : UPSET! {winner['name']} beat the odds "
+                   f"({result['p_winner'] * 100:.1f}% chance) and wins the duel.")
+    else:
+        wrap_print(f"Result : {winner['name']} wins the duel.")
+    print(line + "\n")
+
+
+def get_info(steamid, key, profiles, refresh=False):
+    """Steam data for a profile. A repeat lookup in the same run comes from memory."""
+    if refresh or steamid not in profiles:
+        profiles[steamid] = fetch_profile(steamid, key, refresh)
+    return profiles[steamid]
+
+
+def build_cultivator(steamid, key, profiles, refresh=False):
+    """Returns (info, friend_ids, friends_note, cultivator) for one profile."""
+    info = get_info(steamid, key, profiles, refresh)
+    friend_ids, note = get_friend_ids(steamid, key)
+    return info, friend_ids, note, generate_cultivator(info, steamid, friend_ids)
+
+
+def run_battle(args, key, profiles):
+    """The "mocb" command. Profiles come from the command line ('mocb <p1> <p2>') or are
+    asked for one by one; a blank answer cancels."""
+    ids = []
+    for n, ordinal in enumerate(("First", "Second")):
+        if n < len(args):
+            text = args[n]
+        else:
+            text = input(f"  {ordinal} profile (URL, name or SteamID64, blank to cancel): ").strip()
+        if not text:
+            print("  Duel cancelled.\n")
+            return
+        ids.append(resolve_steamid(text, key))
+    if ids[0] == ids[1]:
+        raise SteamError("Pick two different profiles: a cultivator cannot duel themselves.")
+    (info_a, _, _, a), (info_b, _, _, b) = [build_cultivator(i, key, profiles) for i in ids]
+    result = fight(a, b, ids[0], ids[1])
+    print_battle(a, b, info_a, info_b, result, battle_story(a, b, result))
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -1087,12 +1390,20 @@ def main():
         sys.exit("An API key is required (https://steamcommunity.com/dev/apikey).")
 
     print("Welcome, seeker of the Dao. Press Ctrl+C to leave.")
+    print("Tip: type 'mocb' to make two profiles duel (or 'mocb <profile1> <profile2>').")
     print("Tip: type 'refresh <profile>' to ignore the saved achievement cache.\n")
     refresh_first = "--refresh" in sys.argv[1:]   # refresh each profile's first lookup this run
     profiles = {}
     while True:
         try:
             text = input("Steam profile URL, custom name, or SteamID64: ").strip()
+            parts = text.split()
+            if parts and parts[0].lower() == "mocb":
+                if len(parts) > 3:
+                    raise SteamError("mocb takes two profiles, for example: "
+                                     "mocb <profile1> <profile2>")
+                run_battle(parts[1:], key, profiles)
+                continue
             refresh = False
             if text.lower().startswith("refresh "):
                 refresh, text = True, text[len("refresh "):].strip()
@@ -1101,11 +1412,7 @@ def main():
             steamid = resolve_steamid(text, key)
             if refresh_first and steamid not in profiles:
                 refresh = True
-            if refresh or steamid not in profiles:   # a repeat lookup in the same run is instant
-                profiles[steamid] = fetch_profile(steamid, key, refresh)
-            info = profiles[steamid]
-            friend_ids, note = get_friend_ids(steamid, key)
-            cultivator = generate_cultivator(info, steamid, friend_ids)
+            info, friend_ids, note, cultivator = build_cultivator(steamid, key, profiles, refresh)
             friend = resolve_friend(cultivator, friend_ids, key)
             print_cultivator(cultivator, info)
             if friend:
