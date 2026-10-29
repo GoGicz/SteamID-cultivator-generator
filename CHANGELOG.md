@@ -1,0 +1,6 @@
+Added:
+1.Sect mission count, your achievements dictate how many sect missions you completed which in return gives 5 sect points per mission completed (achivement), for now the sect points don't do anything
+
+2.Added more dynamic backstories so it's not just one single backstory for everyone, still not as many but much better than before.
+
+3.Live achievement progress counter, since steam doesn't say how many achievements an account has at once it has to count each achievements so it might take a little of time to count everything, on an account with  347 games it took about 6 or so seconds, might tweak this later though.
