@@ -1,6 +1,6 @@
 Added:
 
-1.Achievements caching, now only the first time lookup takes time any any secondary lookup will use the cache file that gets created in the "cache" folder
+1.Achievements caching, now only the first time lookup takes time and any secondary lookup will use the cache file that gets created in the "cache" folder
 
 2.When new achievements appear, the card shows a line such as “+12 new missions (+60 sect points) since your last visit”. A note under the stats says where the numbers came from, for example “1 of 37 games checked with Steam, 36 read from the cache”
 
