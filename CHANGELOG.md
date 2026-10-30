@@ -1,5 +1,5 @@
 **Added:**
-Battle arsenal
+*Battle arsenal*
 
 Each cultivator keeps their signature technique (named after their most played game), and it still starts the first clash and delivers the deciding blow.
 
@@ -11,10 +11,10 @@ The battle story has a new middle section where both fighters use these moves. I
 
 The arsenal shows on the cultivator card as Arsenal and in each duel fighter block as Moves, wrapped between names so no name is split.
 
-Changed:
+**Changed:**
 
 New steamID fetch data now ignore games from being loaded if the games fail 3 times in a row
 
-fixes:
+**fixes:**
 
 1.fixed a crash in the card’s Age line. It happened when a cultivator died and Steam hadn’t given the account’s creation date.
