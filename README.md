@@ -11,6 +11,7 @@ Features
 - Achievements as sect missions
 - Personality and Reputation system based on your steam Stats
 - Mock Battle system which allow two different SteamID's to have dynamic battles between them
+- full profile caching for better load time
 
   example:
   <img width="1920" height="896" alt="obrazek" src="https://github.com/user-attachments/assets/35a975d0-eb21-41d4-b16d-5185940b9e07" />
