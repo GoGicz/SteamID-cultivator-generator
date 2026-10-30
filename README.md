@@ -13,10 +13,13 @@ Features
 - Mock Battle system which allow two different SteamID's to have dynamic battles between them
 
   example:
-  <img width="1446" height="922" alt="ChatGPT Image Oct 29, 2026, 07_42_31 AM" src="https://github.com/user-attachments/assets/4bbfb225-86f6-4453-8349-1bedce2ebdcf" />
+  <img width="1920" height="896" alt="obrazek" src="https://github.com/user-attachments/assets/35a975d0-eb21-41d4-b16d-5185940b9e07" />
+
 
   example of the mock battle:
-  <img width="978" height="513" alt="obrazek" src="https://github.com/user-attachments/assets/cbe11ace-c54e-4cb8-b542-5abe107a3c86" />
+  
+  <img width="751" height="517" alt="obrazek" src="https://github.com/user-attachments/assets/72dee07a-2aa0-4dd9-bb95-c55c7598df4c" />
+
 
 
 
