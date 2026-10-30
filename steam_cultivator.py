@@ -21,7 +21,14 @@ your last visit. Type "refresh <profile>" (or run with --refresh) to re-check ev
 Every cultivator walks the Righteous Path (70% by default, +5 reputation) or the Demonic
 Path (+20 power), by luck from the SteamID. Type "mocb" (or "mocb <profile1> <profile2>")
 to make two cultivators duel: the program works out who is most likely to win and tells a
-short story of the battle.
+short story of the battle. Affinity matters in duels: an element that is strong against
+the other's gets +3% win chance (every element beats two and loses to two), and when one
+fighter's power towers over the other's, the story shows the stronger one's arrogance.
+The age of your Steam account sets the age of your cultivator: a brand-new account gives
+a youth, and an account of 20 years or more a cultivator close to the end of their
+lifespan (a doomed cultivator dies at that age). Every command is written to a log file
+in the "Logs" folder next to this file (one file per day), with what was run and how
+many Steam API calls it used. The API key is never written to the log.
 Your Steam badges build your reputation, from "Unknown Nobody" up to "Universal
 Legend". Personalities, earned from your friends, badges, achievements and games,
 add reputation (some only by chance) and a few also change power and death risk,
@@ -44,6 +51,7 @@ The friend story needs a public "Friends List" too; if it is private (or you
 have no friends) the story is simply skipped.
 """
 
+import datetime
 import json
 import os
 import random
@@ -142,6 +150,12 @@ ACHIEVEMENT_WORKERS = 8       # how many games are asked about at the same time
 
 # Achievement cache (see "Achievements and the achievement cache" below)
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Logs")
+
+# A Steam account of ACCOUNT_YEARS_FOR_MAX_AGE years or more gives the oldest possible
+# cultivator; a brand-new account gives the youngest. In between it scales evenly.
+ACCOUNT_YEARS_FOR_MAX_AGE = 20
+SECONDS_PER_YEAR = 365.25 * 24 * 3600
 CACHE_VERSION = 1
 RECHECK_AFTER_DAYS = 30       # re-check a saved game after this long even if nothing changed
                               # (set to 0 to trust the cache until playtime changes)
@@ -230,6 +244,38 @@ STORIES_COMMON = [
 
     "{friend} once asked {me} for a pill recipe. {me} confidently provided one, and the furnace "
     "explosion was seen from three provinces away. The {sect} still sends {friend} the bill.",
+
+    "{me} and {friend} bet a month of spirit stones on who could meditate longer. Three days "
+    "in, both were still sitting perfectly still, glaring at each other. A passing sect elder "
+    "declared it a draw and quietly took the whole pot.",
+
+    "{friend} dragged {me} into a market haggling contest over {treasure}. After an hour of "
+    "dramatic gasps and walking away twice, the merchant paid {me} to leave. Nobody can "
+    "explain how that works.",
+
+    "In a thunderstorm, {me} and {friend} sheltered inside a cave that turned out to be the "
+    "den of a sleeping dragon. They tiptoed out together, whispering about {game}, and "
+    "agreed never to mention the dragon's snoring to anyone.",
+
+    "{friend} invited {me} to a banquet 'with only a few guests'. It was the entire "
+    "{sect}, two rival sects, and a goose of unclear origin. {me} still insists the goose "
+    "started the fight.",
+
+    "On a lonely road, {me} and {friend} found a map to a legendary treasure. They followed "
+    "it for a week, argued at every crossroads, and finally dug up a chest holding a single "
+    "spirit stone and a note: 'Friendship was the real treasure.' They split the stone anyway.",
+
+    "{me} taught {friend} the secret of a {game}-inspired sword form. {friend} practiced it "
+    "so loudly that the neighbors filed a complaint with the {sect}. The form is now banned "
+    "after sunset.",
+
+    "{friend} once swore to {me} that a certain mushroom was perfectly safe. For three days "
+    "both of them saw the future, though sadly only the part where they ate more mushrooms. "
+    "They have not looked at a mushroom since.",
+
+    "Lost in a mountain fog, {me} and {friend} walked in circles for a whole day before "
+    "realizing they had been following each other. They laughed until the fog lifted, and the "
+    "path home turned out to be right behind them.",
 ]
 
 STORIES_WEAK = [
@@ -240,6 +286,14 @@ STORIES_WEAK = [
     "Both {me} and {friend} were too poor to afford a single spirit stone, so they pooled their "
     "savings for one steamed bun and shared it under a tree, swearing that one day they would "
     "rule the heavens. The bun was delicious.",
+
+    "Still only at {realm}, {me} could not make a flying sword rise higher than a stool. "
+    "{friend} stood on the stool to cheer anyway, and the sword wobbled into the air for one "
+    "glorious second before dropping them both into a pond.",
+
+    "{me} and {friend} were hired as guards for a merchant caravan, and managed to lose the "
+    "caravan, the merchant and one very patient donkey. They were paid in a sack of turnips, "
+    "which they ate with great dignity.",
 ]
 
 STORIES_STRONG = [
@@ -248,6 +302,18 @@ STORIES_STRONG = [
 
     "At the Great Ascension Banquet, every elder bowed to {me}. Only {friend} dared to say, "
     "'You still owe me a spirit stone.' {me} paid up immediately.",
+
+    "When {me}, a master of {realm}, finally walked through the gates of the {sect}, ten "
+    "thousand disciples knelt. {friend} waved from the back and shouted, 'Nice robe!' It was "
+    "the only compliment {me} remembered.",
+
+    "{me} once split a mountain in two to settle a dispute. {friend} asked politely whether "
+    "{me} could put it back, since the mountain had a very good view. {me} spent the rest of "
+    "the week gluing a mountain together.",
+
+    "Heaven's tribulation lightning rained on {me} for nine hours. {friend} sat beside the "
+    "crater with a parasol and a flask of tea, remarking that {me} looked 'a little "
+    "crispy'. They shared the tea after.",
 ]
 
 # ---------------------------------------------------------------------------
@@ -425,10 +491,127 @@ class SteamError(Exception):
     pass
 
 
+# ---------------------------------------------------------------------------
+# Logging. Every Steam request goes through steam_get(), which counts it, so each
+# command you run is written to Logs/steam_cultivator_<date>.log with what was run, what
+# happened and how many Steam API calls it used (retries count too, because Steam counts
+# every request). The API key is never written to the log.
+# ---------------------------------------------------------------------------
+def stamp(ts):
+    """'2026-10-30 02:15:00' in local time."""
+    return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+class RunLog:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.secret = ""                 # the API key, hidden if it ever shows up in a message
+        self.session_calls = 0
+        self.session_commands = 0
+        self.session_started = None
+        self.session_written = False
+        self.warned = False
+        self.begin("")
+
+    def begin(self, command):
+        with self.lock:
+            self.command = command
+            self.started = time.time()
+            self.calls = {}              # endpoint -> number of requests
+            self.problems = {}           # (endpoint, outcome) -> number of requests
+            self.notes = []
+
+    def record(self, endpoint, outcome):
+        with self.lock:
+            self.calls[endpoint] = self.calls.get(endpoint, 0) + 1
+            if outcome != "HTTP 200":
+                k = (endpoint, outcome)
+                self.problems[k] = self.problems.get(k, 0) + 1
+
+    def note(self, text):
+        with self.lock:
+            self.notes.append(text)
+
+    def total(self):
+        with self.lock:
+            return sum(self.calls.values())
+
+    def scrub(self, text):
+        text = re.sub(r"(key=)[0-9A-Za-z]+", r"\1<hidden>", str(text))
+        if self.secret:
+            text = text.replace(self.secret, "<hidden>")
+        return text
+
+    def _write(self, text):
+        """Appends to today's log file. A log that can't be written never stops the program."""
+        try:
+            os.makedirs(LOG_DIR, exist_ok=True)
+            path = os.path.join(LOG_DIR, "steam_cultivator_" + stamp(time.time())[:10] + ".log")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(text)
+            return True
+        except OSError as e:
+            if not self.warned:
+                self.warned = True
+                print(f"\n  (Could not write the log in '{LOG_DIR}': {e}. Carrying on without it.)")
+            return False
+
+    def finish(self, status):
+        """Writes the entry for the command that just ran."""
+        now = time.time()
+        with self.lock:
+            calls, problems, notes = dict(self.calls), dict(self.problems), list(self.notes)
+            command, took = self.command, now - self.started
+        total = sum(calls.values())
+        lines = []
+        if not self.session_written:
+            self.session_started = self.session_started or self.started
+            lines.append(f"=== Session started {stamp(self.session_started)} ===\n")
+        lines.append(f"[{stamp(self.started)}] "
+                     f"{self.scrub(command)}\n")
+        lines.append(f"  Result : {self.scrub(status)}\n")
+        lines.append(f"  Steam API calls: {total} ({took:.1f}s)\n")
+        for ep in sorted(calls):
+            lines.append(f"    {ep:<34} {calls[ep]:>5}\n")
+        for (ep, outcome), n in sorted(problems.items()):
+            lines.append(f"  Problem: {ep}: {n} x {outcome}\n")
+        for n in notes:
+            lines.append(f"  Note   : {self.scrub(n)}\n")
+        lines.append("\n")
+        if self._write("".join(lines)):
+            self.session_written = True
+        self.session_calls += total
+        self.session_commands += 1
+        self.begin("")
+
+    def end_session(self):
+        if self.session_commands:
+            self._write(f"=== Session ended {stamp(time.time())}: "
+                        f"{self.session_commands} command(s), {self.session_calls} Steam API "
+                        f"call(s) in total ===\n\n")
+
+
+RUN_LOG = RunLog()
+
+
+def steam_get(endpoint, params):
+    """Makes one Steam request and counts it. Every request in the program goes through here."""
+    name = re.sub(r"/v\d+/?$", "", endpoint.strip("/"))
+    try:
+        r = requests.get(f"{API}/{endpoint}", params=params, timeout=TIMEOUT)
+    except requests.RequestException:
+        RUN_LOG.record(name, "network error")
+        raise
+    # Steam answers 400 to "achievements of a game that has none", which is normal
+    normal = r.status_code == 200 or (r.status_code == 400 and "GetPlayerAchievements" in name)
+    RUN_LOG.record(name, "HTTP 200" if normal else f"HTTP {r.status_code}")
+    return r
+
+
 def api_get(path, key, **params):
     params["key"] = key
     try:
-        r = requests.get(f"{API}/{path}", params=params, timeout=TIMEOUT)
+        r = steam_get(path, params)
     except requests.RequestException as e:
         raise SteamError(f"Could not reach Steam: {e}")
     if r.status_code in (401, 403):
@@ -492,6 +675,10 @@ def fetch_profile(steamid, key, refresh=False):
     games = all_resp.get("games", [])
     top = max(games, key=lambda g: g.get("playtime_forever", 0), default=None)
     ach = count_achievements(steamid, key, games, refresh)
+    RUN_LOG.note(f"achievements: {ach['total']} over {ach['games']} played games "
+                 f"(asked Steam about {ach['queried']}, read {ach['reused']} from cache, "
+                 f"{ach['failed']} failed, {ach['blocked']} blocked"
+                 f"{', refresh forced' if ach['refreshed'] else ''})")
 
     # Badges (they feed the reputation system). Steam level is built purely from badge
     # XP, so a level above 0 with zero badges means Steam is not showing us the badges.
@@ -501,8 +688,12 @@ def fetch_profile(steamid, key, refresh=False):
         badge_resp = {}
     badges = len(badge_resp.get("badges", []))
     badges_hidden = badges == 0 and level_resp.get("player_level", 0) > 0
+    created = player.get("timecreated")      # Unix time the account was made (public profiles)
+    RUN_LOG.note(f"profile {steamid}: {player.get('personaname', 'Unknown')}, "
+                 f"{len(games)} games owned incl. free, {badges} badges")
     return {
         "name": player.get("personaname", "Unknown"),
+        "account_created": created if isinstance(created, int) and created > 0 else None,
         "level": level_resp.get("player_level", 0),
         "game_count": paid_resp.get("game_count", 0),
         "top_game": top.get("name", "Unknown Game") if top else None,
@@ -611,9 +802,8 @@ def achievements_for_game(appid, steamid, key):
     A game that has no achievements is simply 0."""
     for attempt in range(3):
         try:
-            r = requests.get(f"{API}/ISteamUserStats/GetPlayerAchievements/v1/",
-                             params={"key": key, "steamid": steamid, "appid": appid},
-                             timeout=TIMEOUT)
+            r = steam_get("ISteamUserStats/GetPlayerAchievements/v1/",
+                          {"key": key, "steamid": steamid, "appid": appid})
         except requests.RequestException:
             time.sleep(1 + attempt)
             continue
@@ -746,9 +936,8 @@ def get_friend_ids(steamid, key):
     """Returns (friend_ids, note). The list is empty when there are no friends or the
     friends list can't be read; note is a short explanation worth showing, or None."""
     try:
-        r = requests.get(f"{API}/ISteamUser/GetFriendList/v1/",
-                         params={"key": key, "steamid": steamid, "relationship": "friend"},
-                         timeout=TIMEOUT)
+        r = steam_get("ISteamUser/GetFriendList/v1/",
+                      {"key": key, "steamid": steamid, "relationship": "friend"})
     except requests.RequestException:
         return [], None
     if r.status_code in (401, 403):
@@ -890,10 +1079,29 @@ def killer_phrases(realm_index):
     return "a legendary rogue cultivator", "a bandit alliance of ten thousand blades"
 
 
-def roll_fate(steamid, realm_index, lifespan, friend_ids, death_chance):
+def account_years(created, now=None):
+    """How many years old the Steam account is, or None when Steam did not tell us."""
+    if not isinstance(created, (int, float)) or created <= 0:
+        return None
+    return max(0.0, ((time.time() if now is None else now) - created) / SECONDS_PER_YEAR)
+
+
+def cultivator_age(years, lifespan):
+    """Age of the cultivator from the age of the Steam account: the older the account, the
+    older the cultivator. A brand-new account is a youngster (16 at the very least), and an
+    account of ACCOUNT_YEARS_FOR_MAX_AGE years or more is nearly at the end of the lifespan
+    (95% of it). Returns None when the account age is unknown."""
+    if years is None:
+        return None
+    share = 0.05 + 0.90 * min(years, ACCOUNT_YEARS_FOR_MAX_AGE) / ACCOUNT_YEARS_FOR_MAX_AGE
+    return 16 + int((lifespan - 16) * share)
+
+
+def roll_fate(steamid, realm_index, lifespan, friend_ids, death_chance, age=None):
     """Birth year and (maybe) death. The same SteamID always gives the same fate.
     Everything is drawn in a fixed order, so a result never shifts because
-    something else (like the friends list) happened to change."""
+    something else (like the friends list) happened to change. If age is given (from
+    the Steam account age), a doomed cultivator dies at that age instead of a random one."""
     fate = random.Random(f"fate-{steamid}")
     dies = fate.random() < death_chance      # death_chance comes from the talent
     betrayed = fate.random() < BETRAYAL_CHANCE
@@ -905,8 +1113,9 @@ def roll_fate(steamid, realm_index, lifespan, friend_ids, death_chance):
 
     result = {"birth_year": birth_year, "death": None}
     if dies:
-        min_age = 18 + realm_index * 60          # a strong cultivator is not a teenager
-        age = min_age + int(age_roll * (lifespan - min_age))
+        if age is None:                          # account age unknown: a random age at death
+            min_age = 18 + realm_index * 60      # a strong cultivator is not a teenager
+            age = min_age + int(age_roll * (lifespan - min_age))
         friend_id = None
         if betrayed and friend_ids:              # no friends -> no betrayal
             ids = sorted(friend_ids)
@@ -962,7 +1171,10 @@ def generate_cultivator(info, steamid, friend_ids=None):
     lifespan = 80 + idx * rng.randint(150, 400)
     lightning = max(0, idx - 5) * 3 + (9 if idx == 9 else 0)
     death_chance = min(1.0, talent["death"] + sum(p["death"] for p in personalities))
-    fate = roll_fate(steamid, idx, lifespan, friend_ids or [], death_chance)
+    years = account_years(info.get("account_created"))
+    age = cultivator_age(years, lifespan)    # None if Steam did not give the account's age
+    fate = roll_fate(steamid, idx, lifespan, friend_ids or [], death_chance, age)
+    age = fate["death"]["age"] if fate["death"] else age
     reputation = roll_reputation(steamid, info, personalities, path)
 
     # Sect missions: every unlocked achievement counts, and each one pays sect points
@@ -995,6 +1207,7 @@ def generate_cultivator(info, steamid, friend_ids=None):
         "realm_index": idx, "element": element, "technique": technique, "lifespan": lifespan,
         "lightning": lightning, "treasure": treasure, "backstory": backstory, "score": score,
         "birth_year": fate["birth_year"], "death": fate["death"], "talent": talent,
+        "age": age, "account_years": years,
         "missions": missions, "sect_points": sect_points,
         "personalities": personalities, "reputation": reputation, "death_chance": death_chance,
         "path": path,
@@ -1056,6 +1269,8 @@ def print_cultivator(c, info):
         print("  Fame boosts : " + ", ".join(f"{n} +{a}" for n, a in rep["bonuses"]))
     print(f"  Death risk  : {c['death_chance'] * 100:g}%")
     print(f"  Affinity    : {c['element']}")
+    print(f"  Matchups    : strong vs {', '.join(ELEMENT_BEATS.get(c['element'], []))}; "
+          f"weak vs {', '.join(element_weak_to(c['element']))}")
     print(f"  Signature   : {c['technique']}")
     print(f"  Treasure    : {c['treasure']}")
     if info["achievements_hidden"]:
@@ -1071,6 +1286,10 @@ def print_cultivator(c, info):
     cut = " (cut short)" if c["death"] else ""
     print(f"  Lifespan    : {c['lifespan']:,} years{cut}")
     print(f"  Born        : Year {c['birth_year']} of the Heavenly Calendar")
+    if c.get("age") is not None:
+        when = " at death" if c["death"] else ""
+        print(f"  Age         : {c['age']:,} years{when} ({c['account_years']:.0f}-year-old "
+              f"account)")
     if c["death"]:
         print(f"  Died        : Year {c['death']['year']} of the Heavenly Calendar "
               f"(aged {c['death']['age']:,})")
@@ -1080,6 +1299,9 @@ def print_cultivator(c, info):
         print(f"  Tribulations: survived {c['lightning']} heavenly lightning strikes")
     print(line)
     print("  Source stats from Steam:")
+    if info.get("account_created") and c.get("account_years") is not None:
+        year = datetime.datetime.fromtimestamp(info["account_created"], datetime.timezone.utc).year
+        print(f"    Account age : {c['account_years']:.1f} years (created {year})")
     print(f"    Steam level : {info['level']}")
     print(f"    Paid games  : {info['game_count']:,}")
     print(f"    Achievements: {info['achievements']:,}")
@@ -1242,11 +1464,153 @@ BATTLE_ENDINGS = {
 }
 
 
-def battle_odds(a, b):
-    """Chance (0 to 1) that cultivator a beats cultivator b, from both power scores."""
+# ---------------------------------------------------------------------------
+# Affinity matchups. ELEMENT_BEATS[x] lists the two elements x is strong against; each of
+# those is weak against x. The table is balanced: every element beats exactly two others
+# and loses to exactly two others, so no element is better than the rest overall.
+# A matchup moves the duel odds by AFFINITY_BONUS for the stronger element and against the
+# weaker one (0.03 = 3 percentage points). Elements not listed against each other, and two
+# of the same element, are neutral.
+# ---------------------------------------------------------------------------
+AFFINITY_BONUS = 0.03
+ELEMENT_BEATS = {
+    "Fire":      ["Wood", "Metal"],         # fire burns wood and melts metal
+    "Water":     ["Fire", "Metal"],         # water douses fire and rusts metal
+    "Wood":      ["Earth", "Wind"],         # roots split earth, trees break the wind
+    "Metal":     ["Wood", "Ice"],           # the axe fells wood, metal shatters ice
+    "Earth":     ["Lightning", "Shadow"],   # earth grounds lightning and buries shadow
+    "Lightning": ["Water", "Shadow"],       # lightning rides water and lights the dark
+    "Wind":      ["Earth", "Lightning"],    # wind erodes earth and scatters the charge
+    "Ice":       ["Water", "Wind"],         # ice freezes water and stills the air
+    "Shadow":    ["Fire", "Ice"],           # darkness swallows flame and chills ice
+}
+
+# ---------------------------------------------------------------------------
+# Power gap. When one fighter's power towers over the other's (compared as a ratio, with
+# the same BATTLE_SCORE_FLOOR as the odds), the story says so, and the stronger fighter
+# acts arrogant and confident. Ratios at or above each limit pick the tier.
+# ---------------------------------------------------------------------------
+GAP_NOTICEABLE = 1.5
+GAP_LARGE = 3.0
+GAP_VAST = 8.0
+
+# Placeholders: {strong} {weak} {strong_power} {weak_power}
+BATTLE_GAP_SETUPS = {
+    "noticeable": [
+        "{strong} held the edge in power, {strong_power} against {weak_power}, and made sure "
+        "{weak} could see the confident smile.",
+        "'Show me what you have,' said {strong}, who commanded {strong_power} power to "
+        "{weak}'s {weak_power}, with the easy confidence of someone who expects to win.",
+        "{strong} rolled a shoulder and smiled. {strong_power} power against {weak_power} was a "
+        "lead worth being smug about.",
+    ],
+    "large": [
+        "{weak}, with only {weak_power} power, had challenged {strong}, who held "
+        "{strong_power}. {strong} laughed out loud. 'Do you even understand the gap between "
+        "us?'",
+        "With {strong_power} power against {weak_power}, {strong} did not bother hiding the "
+        "smirk. 'Kneel now, and I might forget this insolence,' {strong} said.",
+        "{strong} looked down at {weak} the way a mountain looks at a pebble: {strong_power} "
+        "power against a mere {weak_power}.",
+    ],
+    "vast": [
+        "It was the strangest challenge the region had ever seen: {weak}, with a mere "
+        "{weak_power} power, daring to face {strong}, who commanded {strong_power}. {strong} "
+        "yawned. 'I will grant you the first move, and the second, and the third,' {strong} "
+        "said.",
+        "{strong}, arrogant to the bone with {strong_power} power, did not even take a stance. "
+        "'Is this a duel or a joke?' {strong} sneered at {weak}'s {weak_power}.",
+        "Nobody had expected {weak}, with {weak_power} power, to challenge {strong} and "
+        "{strong_power}. {strong} stood with arms folded, wearing the bored face of someone "
+        "watching an ant try to move a mountain.",
+    ],
+}
+
+# After the duel, for large and vast gaps: key is (tier, did the stronger fighter win?)
+BATTLE_GAP_AFTERMATH = {
+    ("large", True): [
+        "{strong} did not even look back. 'Come again when you are worth my time,' {strong} "
+        "said.",
+        "Without a scratch on them, {strong} dusted off a sleeve, already bored. 'Next,' "
+        "{strong} called.",
+    ],
+    ("large", False): [
+        "{strong}'s smile was gone. The tale of how pride cost {strong} the duel against "
+        "{weak} would be told in tea houses for years.",
+        "{strong} stared at the sky, stunned. Arrogance, it turned out, was the one opponent "
+        "{strong} had never trained against.",
+    ],
+    ("vast", True): [
+        "'Come back in a thousand years,' {strong} said over a shoulder, and did not wait for "
+        "an answer.",
+        "{strong} yawned again. The whole fight had taken less effort than a morning stretch, "
+        "and everyone present knew it.",
+    ],
+    ("vast", False): [
+        "The silence was enormous. {strong}, who had boasted of {strong_power} power, had been "
+        "humbled by a cultivator with only {weak_power}, and the whole region would never let "
+        "{strong} forget it.",
+        "{weak} bowed politely. {strong} could not speak. By the next morning, 'pride before "
+        "the fall' was a saying in every tea house.",
+    ],
+}
+
+# When the elements favor one fighter. Placeholders: {adv} {dis} {adv_elem} {dis_elem}
+BATTLE_ELEMENT_LINES = [
+    "{adv_elem} is the natural bane of {dis_elem}, and {adv} felt the Qi tilt ever so slightly "
+    "in their favor.",
+    "The elements leaned toward {adv}: {adv_elem} holds the upper hand over {dis_elem}.",
+    "{dis} could feel {dis_elem} Qi struggle against {adv}'s {adv_elem}, like swimming against "
+    "a gentle current.",
+]
+
+
+def element_edge(x, y):
+    """+1 if element x is strong against element y, -1 if it is weak against it, else 0."""
+    if y in ELEMENT_BEATS.get(x, ()):
+        return 1
+    if x in ELEMENT_BEATS.get(y, ()):
+        return -1
+    return 0
+
+
+def element_weak_to(x):
+    """The elements that are strong against element x, in the usual element order."""
+    return [e for e in ELEMENTS if x in ELEMENT_BEATS.get(e, ())]
+
+
+def power_odds(a, b):
+    """Chance (0 to 1) that cultivator a beats cultivator b, from both power scores alone."""
     sa = (a["score"] + BATTLE_SCORE_FLOOR) ** BATTLE_EXPONENT
     sb = (b["score"] + BATTLE_SCORE_FLOOR) ** BATTLE_EXPONENT
     return sa / (sa + sb)
+
+
+def element_shift(a, b):
+    """How far the elements move a's chance: +AFFINITY_BONUS, -AFFINITY_BONUS or 0."""
+    return AFFINITY_BONUS * element_edge(a["element"], b["element"])
+
+
+def battle_odds(a, b):
+    """Chance (0 to 1) that cultivator a beats cultivator b: power plus the element matchup.
+    Kept inside 0.1% to 99.9%, so no duel is ever certain."""
+    return min(0.999, max(0.001, power_odds(a, b) + element_shift(a, b)))
+
+
+def power_gap(a, b):
+    """Returns (tier, stronger, weaker, ratio). tier is 'noticeable', 'large', 'vast' or None."""
+    sa, sb = a["score"] + BATTLE_SCORE_FLOOR, b["score"] + BATTLE_SCORE_FLOOR
+    strong, weak = (a, b) if sa >= sb else (b, a)
+    ratio = max(sa, sb) / min(sa, sb)
+    if ratio >= GAP_VAST:
+        tier = "vast"
+    elif ratio >= GAP_LARGE:
+        tier = "large"
+    elif ratio >= GAP_NOTICEABLE:
+        tier = "noticeable"
+    else:
+        tier = None
+    return tier, strong, weak, ratio
 
 
 def fight(a, b, id_a, id_b):
@@ -1265,7 +1629,8 @@ def fight(a, b, id_a, id_b):
     return {"p_a": p_a, "p_b": 1 - p_a, "even": abs(p_a - 0.5) < 1e-9,
             "winner": a if a_wins else b, "loser": b if a_wins else a,
             "favorite": a if favorite_is_a else b, "p_winner": p_winner,
-            "upset": p_winner < 0.5}
+            "upset": p_winner < 0.5,
+            "p_power_a": power_odds(a, b), "element_edge_a": element_edge(a["element"], b["element"])}
 
 
 def battle_class(p_winner):
@@ -1295,18 +1660,31 @@ def battle_story(a, b, result):
     if a["path"]["name"] == "Demonic" and b["path"]["name"] == "Righteous":
         x, y = b, a                      # in a mixed pair, {x} is always the Righteous one
     w, l = result["winner"], result["loser"]
+    tier, strong, weak, _ = power_gap(a, b)
+    edge = element_edge(a["element"], b["element"])
+    adv, dis = (a, b) if edge > 0 else (b, a)            # only used when edge != 0
+    big_gap = tier in ("large", "vast")
     fmt = dict(
         x=x["name"], y=y["name"], x_sect=x["sect"], y_sect=y["sect"],
         x_tech=x["technique"], y_tech=y["technique"], x_elem=x["element"], y_elem=y["element"],
         w=w["name"], l=l["name"], w_tech=w["technique"], l_tech=l["technique"],
         w_sect=w["sect"], l_sect=l["sect"], w_treasure=w["treasure"], l_treasure=l["treasure"],
-        place=random.choice(BATTLE_PLACES), gap=realm_gap_text(w, l))
-    parts = [
-        random.choice(BATTLE_OPENINGS[(x["path"]["name"], y["path"]["name"])]),
-        random.choice(BATTLE_CLASHES),
-        random.choice(BATTLE_TURNS[battle_class(result["p_winner"])]),
-        random.choice(BATTLE_ENDINGS[(w["path"]["name"], l["path"]["name"])]),
-    ]
+        place=random.choice(BATTLE_PLACES),
+        # a big power gap already gets its own lines, so the realm comparison is skipped then
+        gap="" if big_gap else realm_gap_text(w, l),
+        strong=strong["name"], weak=weak["name"],
+        strong_power=f"{strong['score']:,.0f}", weak_power=f"{weak['score']:,.0f}",
+        adv=adv["name"], dis=dis["name"], adv_elem=adv["element"], dis_elem=dis["element"])
+    parts = [random.choice(BATTLE_OPENINGS[(x["path"]["name"], y["path"]["name"])])]
+    if tier:                                             # the stronger fighter shows off
+        parts.append(random.choice(BATTLE_GAP_SETUPS[tier]))
+    parts.append(random.choice(BATTLE_CLASHES))
+    if edge:                                             # one element has the upper hand
+        parts.append(random.choice(BATTLE_ELEMENT_LINES))
+    parts.append(random.choice(BATTLE_TURNS[battle_class(result["p_winner"])]))
+    parts.append(random.choice(BATTLE_ENDINGS[(w["path"]["name"], l["path"]["name"])]))
+    if big_gap:                                          # arrogance paid off, or did not
+        parts.append(random.choice(BATTLE_GAP_AFTERMATH[(tier, w is strong)]))
     text = " ".join(p.format(**fmt) for p in parts)
     if w["personalities"]:
         text += f" As ever, {w['name']} {random.choice(w['personalities'])['trait']}."
@@ -1325,9 +1703,27 @@ def print_battle(a, b, info_a, info_b, result, story):
         print(f"      Power      : {c['score']:,.0f}")
         print(f"      Talent     : {c['talent']['name']}")
         print(f"      Path       : {c['path']['name']}")
+        print(f"      Affinity   : {c['element']}")
         print(f"      Technique  : {c['technique']}")
         print(f"      Win chance : {p * 100:.1f}%")
         print()
+    edge = element_edge(a["element"], b["element"])
+    if edge:
+        adv, dis = (a, b) if edge > 0 else (b, a)
+        p_power_adv = result["p_power_a"] if adv is a else 1 - result["p_power_a"]
+        wrap_print(f"Elements   : {adv['element']} is strong against {dis['element']}, so "
+                   f"{adv['name']} gets +{AFFINITY_BONUS * 100:g}% win chance "
+                   f"(power alone: {p_power_adv * 100:.1f}%)")
+    elif a["element"] == b["element"]:
+        wrap_print(f"Elements   : both are {a['element']}, so neither has the advantage")
+    else:
+        wrap_print(f"Elements   : {a['element']} and {b['element']} are neutral against each other")
+    tier, strong, weak, ratio = power_gap(a, b)
+    if tier:
+        wrap_print(f"Power gap  : {tier} ({strong['score']:,.0f} vs {weak['score']:,.0f}), "
+                   f"{strong['name']} is far ahead and knows it" if tier != "noticeable" else
+                   f"Power gap  : noticeable ({strong['score']:,.0f} vs {weak['score']:,.0f}), "
+                   f"{strong['name']} has the edge")
     if result["even"]:
         wrap_print("Prediction : a perfectly even match, too close to call")
     else:
@@ -1358,7 +1754,11 @@ def build_cultivator(steamid, key, profiles, refresh=False):
     """Returns (info, friend_ids, friends_note, cultivator) for one profile."""
     info = get_info(steamid, key, profiles, refresh)
     friend_ids, note = get_friend_ids(steamid, key)
-    return info, friend_ids, note, generate_cultivator(info, steamid, friend_ids)
+    cultivator = generate_cultivator(info, steamid, friend_ids)
+    RUN_LOG.note(f"friends: {len(friend_ids)}{' (' + note + ')' if note else ''}; cultivator "
+                 f"{cultivator['name']}, {cultivator['realm']}, age {cultivator['age']}, "
+                 f"{'died' if cultivator['death'] else 'alive'}")
+    return info, friend_ids, note, cultivator
 
 
 def run_battle(args, key, profiles):
@@ -1394,38 +1794,65 @@ def main():
     print("Tip: type 'refresh <profile>' to ignore the saved achievement cache.\n")
     refresh_first = "--refresh" in sys.argv[1:]   # refresh each profile's first lookup this run
     profiles = {}
+    RUN_LOG.secret = key
     while True:
         try:
             text = input("Steam profile URL, custom name, or SteamID64: ").strip()
-            parts = text.split()
-            if parts and parts[0].lower() == "mocb":
-                if len(parts) > 3:
-                    raise SteamError("mocb takes two profiles, for example: "
-                                     "mocb <profile1> <profile2>")
-                run_battle(parts[1:], key, profiles)
-                continue
-            refresh = False
-            if text.lower().startswith("refresh "):
-                refresh, text = True, text[len("refresh "):].strip()
             if not text:
                 continue
-            steamid = resolve_steamid(text, key)
-            if refresh_first and steamid not in profiles:
-                refresh = True
-            info, friend_ids, note, cultivator = build_cultivator(steamid, key, profiles, refresh)
-            friend = resolve_friend(cultivator, friend_ids, key)
-            print_cultivator(cultivator, info)
-            if friend:
-                print_story(generate_story(cultivator, info, friend), friend)
-            elif note:
-                print(f"  ({note})\n")
-            if cultivator["death"]:
-                print_death(cultivator, info, friend)
-        except SteamError as e:
-            print(f"\n  ! {e}\n")
+            RUN_LOG.begin(describe_command(text))
+            status = "ok"
+            try:
+                run_command(text, key, profiles, refresh_first)
+            except SteamError as e:
+                status = f"error: {e}"
+                print(f"\n  ! {e}\n")
+            except BaseException as e:           # Ctrl+C or end of input in the middle of a command
+                RUN_LOG.finish("interrupted" if isinstance(e, (KeyboardInterrupt, EOFError))
+                               else f"crashed: {type(e).__name__}: {e}")
+                raise
+            RUN_LOG.finish(status)
         except (KeyboardInterrupt, EOFError):
             print("\nMay your Dao be eternal. Farewell.")
             break
+    RUN_LOG.end_session()
+
+
+def describe_command(text):
+    """What the log says was run, e.g. 'mocb a b', 'refresh lookup of x' or 'lookup of x'."""
+    parts = text.split()
+    if parts[0].lower() == "mocb":
+        return "mocb " + " ".join(parts[1:])
+    if text.lower().startswith("refresh "):
+        return f"refresh lookup of {text[len('refresh '):].strip()}"
+    return f"lookup of {text}"
+
+
+def run_command(text, key, profiles, refresh_first):
+    """One line typed by the user: a lookup, a 'refresh <profile>' lookup, or 'mocb'."""
+    parts = text.split()
+    if parts[0].lower() == "mocb":
+        if len(parts) > 3:
+            raise SteamError("mocb takes two profiles, for example: mocb <profile1> <profile2>")
+        run_battle(parts[1:], key, profiles)
+        return
+    refresh = False
+    if text.lower().startswith("refresh "):
+        refresh, text = True, text[len("refresh "):].strip()
+    if not text:
+        return
+    steamid = resolve_steamid(text, key)
+    if refresh_first and steamid not in profiles:
+        refresh = True
+    info, friend_ids, note, cultivator = build_cultivator(steamid, key, profiles, refresh)
+    friend = resolve_friend(cultivator, friend_ids, key)
+    print_cultivator(cultivator, info)
+    if friend:
+        print_story(generate_story(cultivator, info, friend), friend)
+    elif note:
+        print(f"  ({note})\n")
+    if cultivator["death"]:
+        print_death(cultivator, info, friend)
 
 
 if __name__ == "__main__":
