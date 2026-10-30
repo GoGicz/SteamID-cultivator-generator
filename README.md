@@ -21,6 +21,9 @@ Features
   
   <img width="751" height="517" alt="obrazek" src="https://github.com/user-attachments/assets/72dee07a-2aa0-4dd9-bb95-c55c7598df4c" />
 
+  <img width="978" height="513" alt="obrazek" src="https://github.com/user-attachments/assets/19e65829-2f65-4513-abdd-812e07924d97" />
+
+
 
 
 
