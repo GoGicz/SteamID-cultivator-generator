@@ -17,7 +17,13 @@ mission pays 5 sect points. Steam can only be asked about achievements one game 
 a time, so the first lookup of a big library takes a little while. The results are
 saved in a "cache" folder next to this file, so later runs only ask Steam about games
 whose playtime changed (or new ones) and report how many achievements you gained since
-your last visit. Type "refresh <profile>" (or run with --refresh) to re-check everything.
+your last visit. Everything else Steam tells us about a profile is saved there too, each
+kind with its own refresh time: the friends list every hour, the display name and account
+age every 6 hours, games, level and badges every 12 hours, a friend's name every day, a
+custom profile name every 7 days, and achievements (per game) every 30 days or as soon as
+a game's playtime changes. A profile looked up again 20 minutes later needs no Steam calls
+at all. The times are in REFRESH_HOURS near the top. Type "refresh <profile>" (or run
+with --refresh) to ignore all saved data and ask Steam for everything again.
 Every cultivator walks the Righteous Path (70% by default, +5 reputation) or the Demonic
 Path (+20 power), by luck from the SteamID. Type "mocb" (or "mocb <profile1> <profile2>")
 to make two cultivators duel: the program works out who is most likely to win and tells a
@@ -29,6 +35,12 @@ a youth, and an account of 20 years or more a cultivator close to the end of the
 lifespan (a doomed cultivator dies at that age). Every command is written to a log file
 in the "Logs" folder next to this file (one file per day), with what was run and how
 many Steam API calls it used. The API key is never written to the log.
+Besides the unique signature technique (named after your most played game), every
+cultivator has an arsenal of four more moves, fixed by the SteamID: two attacks of their
+element, one attack of their path and one defense. Duels use all of them.
+If the achievement check keeps failing for the same game (3 visits in a row), that game
+is not asked about any more, and the log says which games failed and which were given
+up. "refresh <profile>" tries them again.
 Your Steam badges build your reputation, from "Unknown Nobody" up to "Universal
 Legend". Personalities, earned from your friends, badges, achievements and games,
 add reputation (some only by chance) and a few also change power and death risk,
@@ -156,7 +168,25 @@ LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Logs")
 # cultivator; a brand-new account gives the youngest. In between it scales evenly.
 ACCOUNT_YEARS_FOR_MAX_AGE = 20
 SECONDS_PER_YEAR = 365.25 * 24 * 3600
+
+# How long each kind of saved Steam data is trusted before Steam is asked again (hours).
+# Data that rarely changes is checked rarely, data that changes often is checked often.
+# Achievements have their own rule: RECHECK_AFTER_DAYS (30 days) per game, and a game is
+# also re-checked whenever its playtime changes (which is seen when "games" refreshes).
+REFRESH_HOURS = {
+    "friends": 1,         # the friends list: new friends are added all the time
+    "games": 12,          # games owned, playtime, most played game
+    "level": 12,          # Steam level
+    "badges": 12,         # badge count
+    "summary": 6,         # display name and account age
+    "friend_names": 24,   # the display name of a friend used in a story
+    "vanity": 168,        # which SteamID a custom profile name belongs to (7 days)
+}
 CACHE_VERSION = 1
+GIVE_UP_AFTER_FAILURES = 3    # a game whose achievement check failed this many visits in a row
+                              # is no longer asked about ("refresh <profile>" tries it again)
+OUTAGE_MIN_GAMES = 5          # if this many or more games are asked in one scan and ALL fail,
+                              # it looks like a Steam outage, so those failures are not counted
 RECHECK_AFTER_DAYS = 30       # re-check a saved game after this long even if nothing changed
                               # (set to 0 to trust the cache until playtime changes)
 
@@ -223,6 +253,63 @@ TREASURES_MID = ["a flying sword of the sixth rank", "a purple-gold gourd", "a t
                  "a jade slip with an ancient inheritance"]
 TREASURES_HIGH = ["a Heaven-Grade artifact", "a fragment of the Primordial Chaos Bell",
                   "a stolen divine artifact", "a Dao-seeking lantern older than the heavens"]
+
+# ---------------------------------------------------------------------------
+# Battle arsenal. Besides the unique signature technique (named after the most played game),
+# every cultivator knows four more moves, picked from these tables by the SteamID: two
+# attacks of their own element, one attack of their path, and one defensive or movement
+# technique. The names are complete on their own and the duel story only ever uses them as
+# "an attack" or "a defense", so any combination reads sensibly.
+# ---------------------------------------------------------------------------
+ELEMENT_MOVES = {
+    "Fire": ["Crimson Lotus Flame Wave", "Phoenix Feather Barrage", "Scorching Sun Palm",
+             "Ember Rain Sword Dance", "Inferno Dragon Roar", "Cinder Storm Fist"],
+    "Water": ["Tidal Dragon Surge", "Moonlit Pool Reflection Strike", "Nine-Bend River Slash",
+              "Rainfall Needle Barrage", "Abyssal Whirlpool Palm", "Thousand-Wave Fist"],
+    "Wood": ["Ten Thousand Vine Bind", "Ancient Tree Crushing Palm", "Thorn Rain Barrage",
+             "Verdant Sprout Sword", "Bamboo Forest Blade Dance", "Spirit Root Eruption"],
+    "Metal": ["Heavenly Blade Rain", "Gold-Splitting Sword Light", "Iron Mountain Crushing Fist",
+              "Ten Thousand Swords Return", "Steel Dragon Claw", "Piercing Needle Barrage"],
+    "Earth": ["Mountain-Shaking Palm", "Yellow Earth Crushing Fist", "Boulder Rain Barrage",
+              "Earth Dragon Rising Strike", "Ten-Thousand-Li Rockfall", "Quake Heart Stomp"],
+    "Lightning": ["Nine Heavens Thunder Palm", "Purple Lightning Sword", "Thunder Tribulation Strike",
+                  "Storm-Splitting Fist", "Chain Lightning Dance", "Heaven's Wrath Bolt"],
+    "Wind": ["Hurricane Blade Dance", "Cloud-Cutting Palm", "Gale Feather Barrage",
+             "Nine-Turn Whirlwind Kick", "Sky-Rending Wind Claw", "Tempest Sword Wave"],
+    "Ice": ["Frost Lotus Spear Barrage", "Ice Phoenix Piercing Strike", "Glacier Crushing Palm",
+            "Frozen Heart Sword", "Snowstorm Blade Dance", "Hundred-Li Frost Wave"],
+    "Shadow": ["Shadow Clone Slash", "Nightfall Soul Claw", "Void Shade Palm",
+               "Eclipse Dagger Rain", "Phantom Dance Strike", "Black Mist Devouring Fist"],
+}
+PATH_MOVES = {
+    "Righteous": ["Heaven-Upholding Sword Light", "Righteous Qi Palm", "Orthodox Sword Formation",
+                  "Vast Justice Strike", "Dao-Guarding Seal Fist"],
+    "Demonic": ["Blood Moon Soul Reaping", "Demonic Qi Devouring Palm", "Ten-Thousand-Corpse Hand",
+                "Bone-Chilling Demon Claw", "Soul-Shattering Devil Cry"],
+}
+DEFENSE_MOVES = ["Golden Bell Shield", "Cloud-Treading Shadowless Step", "Heavenly Turtle Barrier",
+                 "Nine Palaces Void Step", "Jade Mirror Guard", "Spirit Veil Evasion",
+                 "Diamond Body Technique", "Flowing Cloud Dodge"]
+
+
+def build_arsenal(seed, element, path_name):
+    """Two attacks of the element, one of the path, one defense: the same seed always gives
+    the same four moves. Uses its own random generator, so nothing else shifts."""
+    rng = random.Random(f"arsenal-{seed}")
+    return {"attacks": rng.sample(ELEMENT_MOVES[element], 2),
+            "path_attack": rng.choice(PATH_MOVES.get(path_name, PATH_MOVES["Righteous"])),
+            "defense": rng.choice(DEFENSE_MOVES)}
+
+
+def arsenal_of(c):
+    """A cultivator's arsenal (built on the fly for a cultivator that has none yet)."""
+    return c.get("arsenal") or build_arsenal(c["name"], c["element"], c["path"]["name"])
+
+
+def arsenal_text(c):
+    a = arsenal_of(c)
+    return ", ".join(a["attacks"] + [a["path_attack"], a["defense"]])
+
 
 # ---------------------------------------------------------------------------
 # Friend stories. Placeholders: {me} {friend} {friend_steam} {game} {sect}
@@ -638,67 +725,242 @@ def parse_profile_input(text):
     return "vanity", text.strip("/ ")
 
 
-def resolve_steamid(text, key):
+def resolve_steamid(text, key, refresh=False):
     kind, value = parse_profile_input(text)
     if kind == "id":
         return value
+    now = time.time()
+    lookups = load_lookups()
+    saved = lookups["vanity"].get(value.lower())
+    if (not refresh and entry_fresh(saved, "vanity", now)
+            and re.fullmatch(r"\d{17}", str(saved.get("steamid", "")))):
+        RUN_LOG.note(f"custom name '{value}': SteamID from cache ({ago(now - saved['at'])} old)")
+        return saved["steamid"]
     resp = api_get("ISteamUser/ResolveVanityURL/v1/", key, vanityurl=value)
     if resp.get("success") != 1:
         raise SteamError(f"Could not find a profile named '{value}'.")
+    lookups["vanity"][value.lower()] = {"at": now, "steamid": resp["steamid"]}
+    save_lookups(lookups)
     return resp["steamid"]
 
 
+# ---------------------------------------------------------------------------
+# The profile cache. Everything Steam tells us about a profile is saved in
+# cache/<SteamID>.profile.json, and each kind of data has its own refresh time
+# (REFRESH_HOURS): things that rarely change are asked for rarely, things that change
+# often (the friends list) more often. So a profile looked up again 20 minutes later
+# needs almost no Steam calls. Only complete, successful answers are ever saved.
+# The cultivator itself is rebuilt from this data each time (instantly, and always to the
+# same result), and achievements have their own cache (see further down).
+# "refresh <profile>" ignores every cache. Deleting the cache folder is always safe.
+# ---------------------------------------------------------------------------
+PROFILE_CACHE_VERSION = 1
+_NUM = (int, float)
+SECTION_SHAPES = {          # what a saved section must look like to be trusted
+    "summary": {"name": str, "created": (int, type(None))},
+    "level": {"level": int},
+    "games": {"game_count": int, "top_game": (str, type(None)), "top_hours": _NUM,
+              "total_hours": _NUM, "played": list},
+    "badges": {"count": int},
+    "friends": {"ids": list, "note": (str, type(None))},
+}
+_unsaved = {}               # path -> data that could not be written to disk (read-only folder)
+
+
+def ago(seconds):
+    """'45s', '20m', '3h' or '2d': a short, rounded age for the log."""
+    seconds = max(0, int(seconds))
+    for limit, unit, size in ((90, "s", 1), (5400, "m", 60), (129600, "h", 3600)):
+        if seconds < limit:
+            return f"{round(seconds / size)}{unit}"
+    return f"{round(seconds / 86400)}d"
+
+
+def entry_fresh(entry, name, now):
+    """True if a saved entry (a dict with an 'at' time) is younger than REFRESH_HOURS[name]."""
+    if not isinstance(entry, dict):
+        return False
+    at = entry.get("at")
+    if isinstance(at, bool) or not isinstance(at, _NUM):
+        return False
+    return 0 <= now - at < REFRESH_HOURS[name] * 3600      # a clock set backwards counts as stale
+
+
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return _unsaved.get(path)
+    return data if isinstance(data, dict) else None
+
+
+def store_json(path, data):
+    """Saves data; if the folder is not writable it is kept in memory for this run instead."""
+    if write_json(path, data):
+        _unsaved.pop(path, None)
+        return True
+    _unsaved[path] = data
+    return False
+
+
+def profile_cache_path(steamid):
+    return os.path.join(CACHE_DIR, f"{steamid}.profile.json")
+
+
+def load_profile_cache(steamid):
+    data = read_json(profile_cache_path(steamid))
+    if (not data or data.get("version") != PROFILE_CACHE_VERSION
+            or data.get("steamid") != str(steamid) or not isinstance(data.get("sections"), dict)):
+        data = {"version": PROFILE_CACHE_VERSION, "steamid": str(steamid), "sections": {}}
+    return data
+
+
+def save_profile_cache(pc):
+    return store_json(profile_cache_path(pc["steamid"]), pc)
+
+
+def section_fresh(pc, name, now):
+    """True if the saved section can be used without asking Steam: young enough and intact."""
+    sec = pc["sections"].get(name)
+    if not entry_fresh(sec, name, now) or not isinstance(sec.get("value"), dict):
+        return False
+    return all(isinstance(sec["value"].get(k), t) and not isinstance(sec["value"].get(k), bool)
+               for k, t in SECTION_SHAPES[name].items())
+
+
+def load_lookups():
+    """Saved custom-name -> SteamID answers and friends' display names (shared by all profiles)."""
+    data = read_json(os.path.join(CACHE_DIR, "lookups.json"))
+    if not data or data.get("version") != PROFILE_CACHE_VERSION:
+        data = {"version": PROFILE_CACHE_VERSION}
+    for k in ("vanity", "names"):
+        if not isinstance(data.get(k), dict):
+            data[k] = {}
+    return data
+
+
+def save_lookups(lookups):
+    return store_json(os.path.join(CACHE_DIR, "lookups.json"), lookups)
+
+
 def fetch_profile(steamid, key, refresh=False):
-    summary = api_get("ISteamUser/GetPlayerSummaries/v2/", key, steamids=steamid)
-    players = summary.get("players", [])
-    if not players:
-        raise SteamError("No Steam profile exists with that ID.")
-    player = players[0]
-    if player.get("communityvisibilitystate") != 3:
-        raise SteamError("This profile is private. Set the profile and 'Game details' to Public "
-                         "in Steam > Edit Profile > Privacy Settings, then try again.")
+    now = time.time()
+    pc = load_profile_cache(steamid)
+    source = {}                              # section -> "cache (20m old)" or "Steam", for the log
+    changed = False
 
-    level_resp = api_get("IPlayerService/GetSteamLevel/v1/", key, steamid=steamid)
+    def saved(name):
+        """The saved section if it can be used, else None."""
+        if not refresh and section_fresh(pc, name, now):
+            source[name] = f"cache ({ago(now - pc['sections'][name]['at'])} old)"
+            return pc["sections"][name]["value"]
+        return None
 
-    # By default Steam leaves free-to-play games out of this list, so this is the
-    # paid-games count (promo games that were claimed for free can still slip in).
-    paid_resp = api_get("IPlayerService/GetOwnedGames/v1/", key, steamid=steamid,
-                        include_appinfo=1)
-    if "game_count" not in paid_resp:
-        raise SteamError("Game details are hidden. Set 'Game details' to Public in your "
-                         "Steam privacy settings (and untick 'Always keep my total playtime private').")
+    def keep(name, value):
+        nonlocal changed
+        pc["sections"][name] = {"at": now, "value": value}
+        source[name] = "Steam"
+        changed = True
 
-    # The most-played game is looked up among ALL games, free-to-play included,
-    # so a cultivator can still be named after your Dota 2 / CS2 habit.
-    all_resp = api_get("IPlayerService/GetOwnedGames/v1/", key, steamid=steamid,
-                       include_appinfo=1, include_played_free_games=1)
-    games = all_resp.get("games", [])
-    top = max(games, key=lambda g: g.get("playtime_forever", 0), default=None)
-    ach = count_achievements(steamid, key, games, refresh)
-    RUN_LOG.note(f"achievements: {ach['total']} over {ach['games']} played games "
-                 f"(asked Steam about {ach['queried']}, read {ach['reused']} from cache, "
-                 f"{ach['failed']} failed, {ach['blocked']} blocked"
-                 f"{', refresh forced' if ach['refreshed'] else ''})")
+    summary = saved("summary")
+    if summary is None:
+        resp = api_get("ISteamUser/GetPlayerSummaries/v2/", key, steamids=steamid)
+        players = resp.get("players", [])
+        if not players:
+            raise SteamError("No Steam profile exists with that ID.")
+        player = players[0]
+        if player.get("communityvisibilitystate") != 3:
+            raise SteamError("This profile is private. Set the profile and 'Game details' to "
+                             "Public in Steam > Edit Profile > Privacy Settings, then try again.")
+        created = player.get("timecreated")  # Unix time the account was made (public profiles)
+        summary = {"name": player.get("personaname", "Unknown"),
+                   "created": created if isinstance(created, int) and created > 0 else None}
+        keep("summary", summary)
+
+    level = saved("level")
+    if level is None:
+        level_resp = api_get("IPlayerService/GetSteamLevel/v1/", key, steamid=steamid)
+        level = {"level": int(level_resp.get("player_level", 0))}
+        keep("level", level)
+
+    games = saved("games")
+    if games is None:
+        # By default Steam leaves free-to-play games out of this list, so this is the
+        # paid-games count (promo games that were claimed for free can still slip in).
+        paid_resp = api_get("IPlayerService/GetOwnedGames/v1/", key, steamid=steamid,
+                            include_appinfo=1)
+        if "game_count" not in paid_resp:
+            raise SteamError("Game details are hidden. Set 'Game details' to Public in your "
+                             "Steam privacy settings (and untick 'Always keep my total playtime private').")
+        # The most-played game is looked up among ALL games, free-to-play included,
+        # so a cultivator can still be named after your Dota 2 / CS2 habit.
+        all_resp = api_get("IPlayerService/GetOwnedGames/v1/", key, steamid=steamid,
+                           include_appinfo=1, include_played_free_games=1)
+        owned = all_resp.get("games", [])
+        top = max(owned, key=lambda g: g.get("playtime_forever", 0), default=None)
+        games = {
+            "game_count": int(paid_resp.get("game_count", 0)),
+            "top_game": top.get("name", "Unknown Game") if top else None,
+            "top_hours": (top.get("playtime_forever", 0) / 60) if top else 0.0,
+            "total_hours": sum(g.get("playtime_forever", 0) for g in owned) / 60,
+            # only the games that were played matter for achievements: [appid, minutes, last played]
+            "played": [[g["appid"], g.get("playtime_forever", 0), g.get("rtime_last_played", 0)]
+                       for g in owned if g.get("playtime_forever", 0) > 0],
+            # names of those games, only used to say which game is meant in the log
+            "names": {str(g["appid"]): g["name"] for g in owned
+                      if g.get("playtime_forever", 0) > 0 and isinstance(g.get("name"), str)},
+            "owned_total": len(owned),
+        }
+        keep("games", games)
+    if changed:                              # saved now, so a Ctrl+C during the long
+        save_profile_cache(pc)               # achievement scan does not lose these answers
+        changed = False
+
+    played = []
+    names = games.get("names") if isinstance(games.get("names"), dict) else {}
+    for row in games["played"]:
+        if (isinstance(row, list) and len(row) == 3 and all(isinstance(v, _NUM) for v in row)):
+            game = {"appid": int(row[0]), "playtime_forever": row[1], "rtime_last_played": row[2]}
+            name = names.get(str(int(row[0])))
+            if isinstance(name, str):
+                game["name"] = name
+            played.append(game)
+    ach = count_achievements(steamid, key, played, refresh)
 
     # Badges (they feed the reputation system). Steam level is built purely from badge
     # XP, so a level above 0 with zero badges means Steam is not showing us the badges.
-    try:
-        badge_resp = api_get("IPlayerService/GetBadges/v1/", key, steamid=steamid)
-    except SteamError:
-        badge_resp = {}
-    badges = len(badge_resp.get("badges", []))
-    badges_hidden = badges == 0 and level_resp.get("player_level", 0) > 0
-    created = player.get("timecreated")      # Unix time the account was made (public profiles)
-    RUN_LOG.note(f"profile {steamid}: {player.get('personaname', 'Unknown')}, "
-                 f"{len(games)} games owned incl. free, {badges} badges")
+    badges_saved = saved("badges")
+    if badges_saved is None:
+        try:
+            badge_resp = api_get("IPlayerService/GetBadges/v1/", key, steamid=steamid)
+        except SteamError:
+            badge_resp = None                # not saved: a failed answer is never kept
+        if badge_resp is not None:
+            badges_saved = {"count": len(badge_resp.get("badges", []))}
+            keep("badges", badges_saved)
+            save_profile_cache(pc)
+    badges = badges_saved["count"] if badges_saved else 0
+    badges_hidden = badges == 0 and level["level"] > 0
+
+    RUN_LOG.note(f"profile {steamid}: {summary['name']}, "
+                 f"{games.get('owned_total', len(games['played']))} games owned incl. free, "
+                 f"{badges} badges")
+    RUN_LOG.note("data from: " + ", ".join(f"{n} {source.get(n, 'Steam (no answer)')}"
+                                           for n in ("summary", "level", "games", "badges")))
+    RUN_LOG.note(f"achievements: {ach['total']} over {ach['games']} played games "
+                 f"(asked Steam about {ach['queried']}, read {ach['reused']} from cache, "
+                 f"{ach['failed']} failed, {ach['blocked']} blocked, {ach['skipped']} skipped"
+                 f"{', refresh forced' if ach['refreshed'] else ''})")
+    log_achievement_failures(ach)
     return {
-        "name": player.get("personaname", "Unknown"),
-        "account_created": created if isinstance(created, int) and created > 0 else None,
-        "level": level_resp.get("player_level", 0),
-        "game_count": paid_resp.get("game_count", 0),
-        "top_game": top.get("name", "Unknown Game") if top else None,
-        "top_hours": (top.get("playtime_forever", 0) / 60) if top else 0.0,
-        "total_hours": sum(g.get("playtime_forever", 0) for g in games) / 60,
+        "name": summary["name"],
+        "account_created": summary["created"],
+        "level": level["level"],
+        "game_count": games["game_count"],
+        "top_game": games["top_game"],
+        "top_hours": games["top_hours"],
+        "total_hours": games["total_hours"],
         "achievements": ach["total"],
         "achievements_hidden": ach["hidden"],
         "achievements_new": ach["new"],      # gained since the last complete visit, or None
@@ -735,7 +997,8 @@ def cache_path(steamid):
 
 def load_cache(steamid):
     """Returns (cache, found). A missing, damaged or outdated file just counts as no cache."""
-    empty = {"version": CACHE_VERSION, "steamid": str(steamid), "last_total": None, "games": {}}
+    empty = {"version": CACHE_VERSION, "steamid": str(steamid), "last_total": None, "games": {},
+             "failed": {}}
     try:
         with open(cache_path(steamid), encoding="utf-8") as f:
             data = json.load(f)
@@ -746,18 +1009,21 @@ def load_cache(steamid):
         return empty, False
     if not isinstance(data.get("last_total"), int):
         data["last_total"] = None
+    failed = data.get("failed")
+    data["failed"] = {k: v for k, v in failed.items() if isinstance(v, dict) and
+                      isinstance(v.get("tries"), int) and not isinstance(v.get("tries"), bool)
+                      } if isinstance(failed, dict) else {}
     return data, True
 
 
-def save_cache(cache):
-    """Writes the cache file; returns False (after one warning) if the folder is not writable."""
+def write_json(path, data):
+    """Writes a cache file; returns False (after one warning) if the folder is not writable."""
     global _cache_warned
-    path = cache_path(cache["steamid"])
     try:
         os.makedirs(CACHE_DIR, exist_ok=True)
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cache, f, indent=1)
+            json.dump(data, f, indent=1)
         os.replace(tmp, path)       # all or nothing: an interrupted save never leaves half a file
         return True
     except OSError as e:
@@ -765,6 +1031,10 @@ def save_cache(cache):
             _cache_warned = True
             print(f"\n  (Could not save the cache in '{CACHE_DIR}': {e}. Carrying on without it.)")
         return False
+
+
+def save_cache(cache):
+    return write_json(cache_path(cache["steamid"]), cache)
 
 
 def entry_is_current(entry, game, now):
@@ -795,6 +1065,46 @@ def apply_results(cache, games, results, now):
                                  "last_played": g.get("rtime_last_played", 0), "checked_at": now}
             changed = True
     return changed
+
+
+def game_label(g):
+    """'Half-Life (app 70)' for the log, or just 'app 70' when the name is not known."""
+    name = g.get("name")
+    return f"{name} (app {g['appid']})" if name else f"app {g['appid']}"
+
+
+def given_up(cache, appid):
+    """True once a game's achievement check has failed GIVE_UP_AFTER_FAILURES visits."""
+    entry = cache["failed"].get(str(appid))
+    return bool(entry) and entry["tries"] >= GIVE_UP_AFTER_FAILURES
+
+
+def track_failures(cache, todo, results, now):
+    """Counts, per game, the visits in which its achievement check failed (a success wipes
+    the count). Returns {'failed': [(game, tries)], 'gave_up': [game], 'outage': bool,
+    'changed': bool}. Only FAILED counts: a private profile (BLOCKED) says nothing about the
+    game. If every game asked in a big scan failed, it was Steam that was down, not the games,
+    so nothing is counted against them."""
+    asked = [g for g in todo if str(g["appid"]) in results]
+    failed = [g for g in asked if results[str(g["appid"])] == FAILED]
+    outage = len(asked) >= OUTAGE_MIN_GAMES and len(failed) == len(asked)
+    out = {"failed": [], "gave_up": [], "outage": outage, "changed": False}
+    for g in asked:
+        k = str(g["appid"])
+        result = results[k]
+        if isinstance(result, int):
+            if cache["failed"].pop(k, None) is not None:
+                out["changed"] = True
+        elif result == FAILED:
+            tries = cache["failed"].get(k, {}).get("tries", 0)
+            if not outage:
+                tries += 1
+                cache["failed"][k] = {"tries": tries, "last": now}
+                out["changed"] = True
+                if tries >= GIVE_UP_AFTER_FAILURES:
+                    out["gave_up"].append(g)
+            out["failed"].append((g, tries))
+    return out
 
 
 def achievements_for_game(appid, steamid, key):
@@ -865,18 +1175,28 @@ def count_achievements(steamid, key, games, refresh=False):
     old = cache["games"]
     now = time.time()
     played = [g for g in games if g.get("playtime_forever", 0) > 0]
+    dirty = False
+    if refresh and cache["failed"]:
+        cache["failed"] = {}         # a refresh gives every game a fresh start
+        dirty = True
 
     counts = {}                      # appid -> unlocked achievements
-    todo = []
+    todo, skipped = [], []
     for g in played:
         k = str(g["appid"])
         if not refresh and entry_is_current(old.get(k), g, now):
             counts[k] = old[k]["unlocked"]
+        elif given_up(cache, k):     # failed too many visits in a row: not asked any more
+            skipped.append(g)
+            prior = old.get(k)
+            counts[k] = prior["unlocked"] if isinstance(prior, dict) and isinstance(
+                prior.get("unlocked"), int) else 0
         else:
             todo.append(g)
-    stats = {"total": 0, "hidden": False, "reused": len(played) - len(todo), "queried": len(todo),
-             "failed": 0, "blocked": 0, "new": None, "had_cache": had_cache,
-             "refreshed": bool(refresh), "games": len(played)}
+    stats = {"total": 0, "hidden": False, "reused": len(played) - len(todo) - len(skipped),
+             "queried": len(todo), "failed": 0, "blocked": 0, "new": None, "had_cache": had_cache,
+             "refreshed": bool(refresh), "games": len(played), "skipped": len(skipped),
+             "skipped_games": skipped, "failed_games": [], "gave_up": [], "outage": False}
 
     results = {}                     # appid -> number, BLOCKED or FAILED
     if todo:
@@ -898,7 +1218,8 @@ def count_achievements(steamid, key, games, refresh=False):
                 pool.shutdown(wait=False, cancel_futures=True)
             except TypeError:                # Python older than 3.9
                 pool.shutdown(wait=False)
-            if apply_results(cache, todo, results, now):
+            tracked = track_failures(cache, todo, results, now)
+            if apply_results(cache, todo, results, now) or tracked["changed"] or dirty:
                 save_cache(cache)
             print()
             raise
@@ -920,7 +1241,10 @@ def count_achievements(steamid, key, games, refresh=False):
     stats["total"] = total
     stats["hidden"] = bool(todo) and stats["blocked"] == len(todo) and total == 0
 
-    dirty = apply_results(cache, todo, results, now)
+    tracked = track_failures(cache, todo, results, now)
+    stats["failed_games"], stats["gave_up"] = tracked["failed"], tracked["gave_up"]
+    stats["outage"] = tracked["outage"]
+    dirty = apply_results(cache, todo, results, now) or tracked["changed"] or dirty
     if stats["failed"] == 0 and stats["blocked"] == 0:   # only a complete scan sets the baseline
         if cache["last_total"] is not None:
             stats["new"] = total - cache["last_total"]
@@ -932,34 +1256,79 @@ def count_achievements(steamid, key, games, refresh=False):
     return stats
 
 
-def get_friend_ids(steamid, key):
-    """Returns (friend_ids, note). The list is empty when there are no friends or the
-    friends list can't be read; note is a short explanation worth showing, or None."""
+def fetch_friend_ids(steamid, key):
+    """Asks Steam for the friends list. Returns (friend_ids, note, complete): complete is
+    False when the answer is not trustworthy (network trouble, Steam error), so it is not saved."""
     try:
         r = steam_get("ISteamUser/GetFriendList/v1/",
                       {"key": key, "steamid": steamid, "relationship": "friend"})
     except requests.RequestException:
-        return [], None
+        return [], None, False
     if r.status_code in (401, 403):
-        return [], "Your friends list is private, so no friend story this time."
+        return [], "Your friends list is private, so no friend story this time.", True
     if r.status_code != 200:
-        return [], None
+        return [], None, False
     try:
         friends = r.json().get("friendslist", {}).get("friends", [])
     except ValueError:
-        return [], None
-    return [f["steamid"] for f in friends], None  # no friends -> empty list -> story skipped
+        return [], None, False
+    return [f["steamid"] for f in friends], None, True  # no friends -> empty list -> story skipped
+
+
+def get_friend_ids(steamid, key):
+    """Returns (friend_ids, note). The list is empty when there are no friends or the
+    friends list can't be read; note is a short explanation worth showing, or None."""
+    ids, note, _ = fetch_friend_ids(steamid, key)
+    return ids, note
+
+
+def get_friends(steamid, key, refresh=False):
+    """Like get_friend_ids, but a list that was saved less than REFRESH_HOURS['friends'] ago is
+    used instead of asking Steam. If Steam cannot be reached, the last saved list is used even
+    when it is older, so the story and a possible betrayal do not change because of a hiccup."""
+    now = time.time()
+    pc = load_profile_cache(steamid)
+    if not refresh and section_fresh(pc, "friends", now):
+        v = pc["sections"]["friends"]["value"]
+        RUN_LOG.note(f"friends: {len(v['ids'])} from cache "
+                     f"({ago(now - pc['sections']['friends']['at'])} old)")
+        return list(v["ids"]), v["note"]
+    ids, note, complete = fetch_friend_ids(steamid, key)
+    if complete:
+        pc["sections"]["friends"] = {"at": now, "value": {"ids": ids, "note": note}}
+        save_profile_cache(pc)
+        RUN_LOG.note(f"friends: {len(ids)} from Steam")
+        return ids, note
+    old = pc["sections"].get("friends")
+    if isinstance(old, dict) and isinstance(old.get("value"), dict) and \
+            isinstance(old["value"].get("ids"), list):
+        RUN_LOG.note(f"friends: Steam did not answer, using the saved list of "
+                     f"{len(old['value']['ids'])} ({ago(now - old.get('at', now))} old)")
+        return list(old["value"]["ids"]), old["value"].get("note")
+    RUN_LOG.note("friends: Steam did not answer and nothing was saved")
+    return ids, note
 
 
 def get_friend(friend_id, key):
-    """Returns {'steamid', 'name'} or None if that friend's profile can't be read."""
+    """Returns {'steamid', 'name'} or None if that friend's profile can't be read.
+    A display name that was saved less than REFRESH_HOURS['friend_names'] ago is reused."""
+    now = time.time()
+    lookups = load_lookups()
+    saved = lookups["names"].get(str(friend_id))
+    if entry_fresh(saved, "friend_names", now) and isinstance(saved.get("name"), str):
+        RUN_LOG.note(f"friend {friend_id}: name from cache")
+        return {"steamid": friend_id, "name": saved["name"]}
     try:
         players = api_get("ISteamUser/GetPlayerSummaries/v2/", key, steamids=friend_id).get("players", [])
     except SteamError:
         return None
     if not players:
         return None
-    return {"steamid": friend_id, "name": players[0].get("personaname", "a mysterious stranger")}
+    name = players[0].get("personaname")
+    if isinstance(name, str) and name:
+        lookups["names"][str(friend_id)] = {"at": now, "name": name}
+        save_lookups(lookups)
+    return {"steamid": friend_id, "name": name or "a mysterious stranger"}
 
 
 def resolve_friend(c, friend_ids, key):
@@ -1208,6 +1577,7 @@ def generate_cultivator(info, steamid, friend_ids=None):
         "lightning": lightning, "treasure": treasure, "backstory": backstory, "score": score,
         "birth_year": fate["birth_year"], "death": fate["death"], "talent": talent,
         "age": age, "account_years": years,
+        "arsenal": build_arsenal(steamid, element, path["name"]),
         "missions": missions, "sect_points": sect_points,
         "personalities": personalities, "reputation": reputation, "death_chance": death_chance,
         "path": path,
@@ -1217,6 +1587,34 @@ def generate_cultivator(info, steamid, friend_ids=None):
 def power_bar(idx):
     total = len(REALMS)
     return "[" + "#" * (idx + 1) + "-" * (total - idx - 1) + f"] {idx + 1}/{total}"
+
+
+def game_list(games, limit=15):
+    """'A (app 1), B (app 2) and 3 more' for the log."""
+    labels = [game_label(g) for g in games]
+    if len(labels) > limit:
+        labels = labels[:limit] + [f"and {len(labels) - limit} more"]
+    return ", ".join(labels)
+
+
+def log_achievement_failures(ach):
+    """Writes into the log which games failed their achievement check, and which were given up."""
+    if ach["failed_games"]:
+        what = ", ".join(f"{game_label(g)} [try {t} of {GIVE_UP_AFTER_FAILURES}]"
+                         for g, t in ach["failed_games"][:15])
+        more = len(ach["failed_games"]) - 15
+        RUN_LOG.note(f"achievement check FAILED for {len(ach['failed_games'])} game(s): {what}"
+                     f"{f', and {more} more' if more > 0 else ''}")
+        if ach["outage"]:
+            RUN_LOG.note("every game asked failed, so this looks like a Steam outage: "
+                         "these failures were NOT counted against the games")
+    if ach["gave_up"]:
+        RUN_LOG.note(f"achievement check GAVE UP on {len(ach['gave_up'])} game(s) after "
+                     f"{GIVE_UP_AFTER_FAILURES} failed tries, they will not be asked again "
+                     f"(use 'refresh <profile>' to retry): {game_list(ach['gave_up'])}")
+    if ach["skipped_games"]:
+        RUN_LOG.note(f"achievement check SKIPPED {len(ach['skipped_games'])} game(s) that already "
+                     f"failed {GIVE_UP_AFTER_FAILURES} times: {game_list(ach['skipped_games'])}")
 
 
 def achievement_note(st):
@@ -1272,6 +1670,7 @@ def print_cultivator(c, info):
     print(f"  Matchups    : strong vs {', '.join(ELEMENT_BEATS.get(c['element'], []))}; "
           f"weak vs {', '.join(element_weak_to(c['element']))}")
     print(f"  Signature   : {c['technique']}")
+    wrap_field("Arsenal", arsenal_text(c))
     print(f"  Treasure    : {c['treasure']}")
     if info["achievements_hidden"]:
         print("  Missions    : 0 (Steam is hiding your achievements)")
@@ -1288,8 +1687,9 @@ def print_cultivator(c, info):
     print(f"  Born        : Year {c['birth_year']} of the Heavenly Calendar")
     if c.get("age") is not None:
         when = " at death" if c["death"] else ""
-        print(f"  Age         : {c['age']:,} years{when} ({c['account_years']:.0f}-year-old "
-              f"account)")
+        yrs = c.get("account_years")
+        src = f" ({yrs:.0f}-year-old account)" if yrs is not None else ""
+        print(f"  Age         : {c['age']:,} years{when}{src}")
     if c["death"]:
         print(f"  Died        : Year {c['death']['year']} of the Heavenly Calendar "
               f"(aged {c['death']['age']:,})")
@@ -1305,9 +1705,6 @@ def print_cultivator(c, info):
     print(f"    Steam level : {info['level']}")
     print(f"    Paid games  : {info['game_count']:,}")
     print(f"    Achievements: {info['achievements']:,}")
-    note = achievement_note(info.get("ach_stats"))
-    if note:
-        print(f"      ({note})")
     if info["badges_hidden"]:
         print("    Badges      : 0 (Steam is hiding your badges)")
     else:
@@ -1318,6 +1715,23 @@ def print_cultivator(c, info):
     print()
     wrap_print(c["backstory"])
     print(line + "\n")
+
+
+def print_items(head, items, width=64):
+    """Prints 'head' + items separated by commas, wrapping between items (never inside a
+    name) and lining the continuation up under the first item."""
+    pad, line = " " * len(head), head
+    for n, item in enumerate(items):
+        piece = item + ("," if n < len(items) - 1 else "")
+        if len(line) + len(piece) > width and line.strip() != head.strip():
+            print(line.rstrip())
+            line = pad
+        line += piece + " "
+    print(line.rstrip())
+
+
+def wrap_field(label, text, width=64):
+    print_items(f"  {label:<12}: ", text.split(", "), width)
 
 
 def wrap_print(text, width=62):
@@ -1392,6 +1806,44 @@ BATTLE_CLASHES = [
     "The first exchange shook the mountain: {x_tech} against {y_tech}, {x_elem} against "
     "{y_elem}, and neither dared to blink.",
 ]
+
+# The middle of the fight, where the rest of the arsenal is used. The signature technique
+# keeps the first clash and the deciding blow; these lines use the other four moves.
+# By how likely the winner was to win. Placeholders for each side (w = winner, l = loser):
+# {w_atk1} {w_atk2} (element attacks) {w_path} (path attack) {w_def} (defense), same for l.
+BATTLE_EXCHANGES = {
+    "close": [
+        "{l} opened with {l_atk1}, and {w} answered with {w_atk1}. Neither gave way, and the "
+        "ground between them cracked.",
+        "{w} slipped past {l_atk2} using {w_def}, only for {l} to return the favor against "
+        "{w_path}.",
+        "Blow for blow, {w_atk2} met {l_atk2}, and the shockwave flattened the trees around "
+        "them.",
+        "{l_path} lit up the sky, but {w_def} caught most of it, and {w}'s counter with "
+        "{w_atk1} left {l} gasping.",
+    ],
+    "clear": [
+        "{l} struck with {l_atk1}, but {w_def} absorbed it, and {w_atk1} came straight back.",
+        "Again and again {l_atk2} fell short, while {w_atk2} found its mark.",
+        "{w} read {l}'s {l_path} perfectly, avoided it with {w_def}, and punished {l} with "
+        "{w_path}.",
+    ],
+    "crushing": [
+        "{l_atk1} broke against {w_def} without leaving a mark, and {w_atk1} sent {l} skidding "
+        "backwards.",
+        "{l} gathered everything into {l_path}. {w} did not even bother with {w_def}; "
+        "{w_atk2} alone swatted it aside.",
+        "Nothing {l} threw, not {l_atk1}, not {l_atk2}, could get through {w_def}.",
+    ],
+    "upset": [
+        "{l_atk1} and {l_atk2} rained down on {w}, but {w_def} bent where it should have "
+        "broken, and {w} waited for the single opening.",
+        "{w} took {l_path} on the shoulder and answered with {w_path}, a gamble that should "
+        "have failed.",
+        "{l} overreached with {l_atk1}. {w} slipped away with {w_def} and struck back with "
+        "{w_atk1}, as if the odds did not exist.",
+    ],
+}
 
 # The turning point depends on how likely the winner was to win.
 # Placeholders: {w} {l} (winner, loser) {w_tech} {l_tech} {gap} (a sentence about the realms, or empty)
@@ -1653,6 +2105,13 @@ def realm_gap_text(w, l):
     return ""
 
 
+def move_fields(tag, c):
+    """Format fields for one fighter's arsenal: {tag_atk1} {tag_atk2} {tag_path} {tag_def}."""
+    a = arsenal_of(c)
+    return {f"{tag}_atk1": a["attacks"][0], f"{tag}_atk2": a["attacks"][1],
+            f"{tag}_path": a["path_attack"], f"{tag}_def": a["defense"]}
+
+
 def battle_story(a, b, result):
     """A short story of the duel. The winner is fixed by fight(); the telling is random,
     so asking again gives the same result told in a different way."""
@@ -1669,7 +2128,8 @@ def battle_story(a, b, result):
         x_tech=x["technique"], y_tech=y["technique"], x_elem=x["element"], y_elem=y["element"],
         w=w["name"], l=l["name"], w_tech=w["technique"], l_tech=l["technique"],
         w_sect=w["sect"], l_sect=l["sect"], w_treasure=w["treasure"], l_treasure=l["treasure"],
-        place=random.choice(BATTLE_PLACES),
+        place=random.choice(BATTLE_PLACES), **move_fields("w", w), **move_fields("l", l),
+        **move_fields("x", x), **move_fields("y", y),
         # a big power gap already gets its own lines, so the realm comparison is skipped then
         gap="" if big_gap else realm_gap_text(w, l),
         strong=strong["name"], weak=weak["name"],
@@ -1679,9 +2139,12 @@ def battle_story(a, b, result):
     if tier:                                             # the stronger fighter shows off
         parts.append(random.choice(BATTLE_GAP_SETUPS[tier]))
     parts.append(random.choice(BATTLE_CLASHES))
+    kind = battle_class(result["p_winner"])
+    pool = BATTLE_EXCHANGES[kind]                        # the rest of the arsenal in action
+    parts += random.sample(pool, 2 if kind in ("close", "upset") else 1)
     if edge:                                             # one element has the upper hand
         parts.append(random.choice(BATTLE_ELEMENT_LINES))
-    parts.append(random.choice(BATTLE_TURNS[battle_class(result["p_winner"])]))
+    parts.append(random.choice(BATTLE_TURNS[kind]))
     parts.append(random.choice(BATTLE_ENDINGS[(w["path"]["name"], l["path"]["name"])]))
     if big_gap:                                          # arrogance paid off, or did not
         parts.append(random.choice(BATTLE_GAP_AFTERMATH[(tier, w is strong)]))
@@ -1705,6 +2168,7 @@ def print_battle(a, b, info_a, info_b, result, story):
         print(f"      Path       : {c['path']['name']}")
         print(f"      Affinity   : {c['element']}")
         print(f"      Technique  : {c['technique']}")
+        print_moves(c)
         print(f"      Win chance : {p * 100:.1f}%")
         print()
     edge = element_edge(a["element"], b["element"])
@@ -1743,19 +2207,23 @@ def print_battle(a, b, info_a, info_b, result, story):
     print(line + "\n")
 
 
+def print_moves(c):
+    """The 'Moves' row of a duel fighter block, wrapped under its label."""
+    print_items("      Moves      : ", arsenal_text(c).split(", "))
+
+
 def get_info(steamid, key, profiles, refresh=False):
-    """Steam data for a profile. A repeat lookup in the same run comes from memory."""
-    if refresh or steamid not in profiles:
-        profiles[steamid] = fetch_profile(steamid, key, refresh)
+    """Steam data for a profile. What is still fresh in the profile cache is not asked again."""
+    profiles[steamid] = fetch_profile(steamid, key, refresh)
     return profiles[steamid]
 
 
 def build_cultivator(steamid, key, profiles, refresh=False):
     """Returns (info, friend_ids, friends_note, cultivator) for one profile."""
     info = get_info(steamid, key, profiles, refresh)
-    friend_ids, note = get_friend_ids(steamid, key)
+    friend_ids, note = get_friends(steamid, key, refresh)
     cultivator = generate_cultivator(info, steamid, friend_ids)
-    RUN_LOG.note(f"friends: {len(friend_ids)}{' (' + note + ')' if note else ''}; cultivator "
+    RUN_LOG.note(f"{len(friend_ids)} friends{' (' + note + ')' if note else ''}; cultivator "
                  f"{cultivator['name']}, {cultivator['realm']}, age {cultivator['age']}, "
                  f"{'died' if cultivator['death'] else 'alive'}")
     return info, friend_ids, note, cultivator
@@ -1791,7 +2259,7 @@ def main():
 
     print("Welcome, seeker of the Dao. Press Ctrl+C to leave.")
     print("Tip: type 'mocb' to make two profiles duel (or 'mocb <profile1> <profile2>').")
-    print("Tip: type 'refresh <profile>' to ignore the saved achievement cache.\n")
+    print("Tip: type 'refresh <profile>' to ignore all saved Steam data.\n")
     refresh_first = "--refresh" in sys.argv[1:]   # refresh each profile's first lookup this run
     profiles = {}
     RUN_LOG.secret = key
@@ -1841,7 +2309,7 @@ def run_command(text, key, profiles, refresh_first):
         refresh, text = True, text[len("refresh "):].strip()
     if not text:
         return
-    steamid = resolve_steamid(text, key)
+    steamid = resolve_steamid(text, key, refresh or (refresh_first and not profiles))
     if refresh_first and steamid not in profiles:
         refresh = True
     info, friend_ids, note, cultivator = build_cultivator(steamid, key, profiles, refresh)
