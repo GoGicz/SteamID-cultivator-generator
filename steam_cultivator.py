@@ -54,6 +54,12 @@ realm (only 10 per realm if both are Righteous). Same realm, or the stronger rea
 changes nothing. The points are saved in the profile's JSON file and shown as "Duels" in
 the card's fame boosts; reputation never goes below 0. The dead cannot duel: a cultivator
 who died in their fate cannot be used in "mocb".
+Type "pavilion" to open the sect's Martial Pavilion for the cultivator you looked up
+last (looking up another profile makes that one the latest; "mocb" does not). Pills,
+weapons, treasures and the Spatial Escape Talisman cost sect points and are saved in that
+cultivator's JSON file. A talisman stops one Demonic theft, then is used up. The dead cannot
+shop, and "pavilion" is refused until a cultivator has been looked up. Reputation ranks
+now rise gradually: the first ranks come quickly, the later ones need far more points.
 Your Steam badges build your reputation, from "Unknown Nobody" up to "Universal
 Legend". Personalities, earned from your friends, badges, achievements and games,
 add reputation (some only by chance) and a few also change power and death risk,
@@ -97,19 +103,24 @@ SECT_POINTS_PER_MISSION = 5   # 1 unlocked achievement = 1 sect mission = 5 sect
 # ---------------------------------------------------------------------------
 # Reputation: every Steam badge is worth REP_PER_BADGE reputation points, and the
 # personalities below add more. Ranks are (minimum points, name), lowest to highest.
+# The steps between ranks grow gradually: the first ranks come quickly but still take some
+# work, the last ones need a great deal. A duel won against a stronger realm pays 25 points
+# per realm of difference (see REP_GAIN_PER_REALM), so with one realm of difference it takes
+# about 2, 3, 4, 6, 9, 12, 16, 22 and 32 such wins to climb from each rank to the next; no
+# single ordinary duel can skip a rank.
 # ---------------------------------------------------------------------------
 REP_PER_BADGE = 2
 REPUTATION_RANKS = [
     (0,    "Unknown Nobody"),
-    (10,   "Barely Noticed"),
-    (30,   "Familiar Face"),
-    (70,   "Sect Favorite"),
-    (130,  "Regional Celebrity"),
-    (220,  "Famed Across the Provinces"),
-    (350,  "Renowned Master"),
-    (520,  "Continental Legend"),
-    (750,  "Name Spoken by the Heavens"),
-    (1000, "Universal Legend"),
+    (40,   "Barely Noticed"),
+    (100,  "Familiar Face"),
+    (200,  "Sect Favorite"),
+    (350,  "Regional Celebrity"),
+    (560,  "Famed Across the Provinces"),
+    (850,  "Renowned Master"),
+    (1250, "Continental Legend"),
+    (1800, "Name Spoken by the Heavens"),
+    (2600, "Universal Legend"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -282,6 +293,8 @@ ALL_TREASURES = [TREASURES_LOW, TREASURES_MID, TREASURES_HIGH]
 
 def treasure_rank(item):
     """0 for a low treasure, 1 for a middle one, 2 for a high one."""
+    if item in PAVILION_TREASURE_RANKS:
+        return PAVILION_TREASURE_RANKS[item]
     for rank in (2, 1, 0):
         if item in ALL_TREASURES[rank]:
             return rank
@@ -309,6 +322,68 @@ def describe_treasures(items):
     for item in items:
         counts[item] = counts.get(item, 0) + 1
     return ", ".join(f"{k} (x{v})" if v > 1 else k for k, v in counts.items())
+
+
+# ---------------------------------------------------------------------------
+# The sect's Martial Pavilion ("pavilion" command). The last cultivator you looked up can
+# spend sect points here. Pills, weapons and talismans are kept in the cultivator's JSON
+# file (key "pavilion"); treasures go into the treasure inventory, so they can be stolen.
+# A Spatial Escape Talisman stops a Demonic winner from stealing the owner's treasure. It is
+# used up when it does (TALISMAN_SINGLE_USE; set it to False to keep the talisman).
+# ---------------------------------------------------------------------------
+TALISMAN_ID = "spatial_escape_talisman"
+TALISMAN_SINGLE_USE = True
+PAVILION_ITEMS = [
+    {"id": "qi_gathering_pill", "name": "Qi Gathering Pill", "kind": "Pill", "price": 100,
+     "blurb": "Gathers a little Qi. Nobody has ever complained about it."},
+    {"id": "meridian_cleansing_pill", "name": "Meridian Cleansing Pill", "kind": "Pill",
+     "price": 250, "blurb": "Clears blocked meridians. Tastes like swamp water."},
+    {"id": "foundation_pill", "name": "Foundation Establishment Pill", "kind": "Pill",
+     "price": 600, "blurb": "Steadies the Dao foundation before a breakthrough."},
+    {"id": "soul_restoring_pill", "name": "Nine-Turn Soul Restoring Pill", "kind": "Pill",
+     "price": 1200, "blurb": "Calls a wounded soul back from the edge."},
+    {"id": "breakthrough_pill", "name": "Heaven-Defying Breakthrough Pill", "kind": "Pill",
+     "price": 3000, "blurb": "Alchemists whisper that it was stolen from the heavens."},
+    {"id": "iron_spirit_sword", "name": "Iron Spirit Sword", "kind": "Weapon", "price": 200,
+     "blurb": "A reliable blade for disciples who still count their spirit stones."},
+    {"id": "azure_frost_spear", "name": "Azure Frost Spear", "kind": "Weapon", "price": 500,
+     "blurb": "Leaves a trail of frost, and sometimes a cold."},
+    {"id": "thousand_li_sword", "name": "Thousand-Li Flying Sword", "kind": "Weapon",
+     "price": 1200, "blurb": "Crosses a thousand li in the time it takes to sneeze."},
+    {"id": "dragon_halberd", "name": "Dragon-Slaying Halberd", "kind": "Weapon", "price": 2500,
+     "blurb": "No dragon has been slain with it yet. The sect is hopeful."},
+    {"id": "thunder_blade", "name": "Nine-Heavens Thunder Blade", "kind": "Weapon",
+     "price": 5000, "blurb": "Calls down lightning on command, and occasionally by itself."},
+    {"id": "storage_ring", "name": "a sect-forged storage ring", "kind": "Treasure", "rank": 0,
+     "price": 250, "blurb": "A treasure. It can be stolen."},
+    {"id": "jade_pendant", "name": "a spirit-nourishing jade pendant", "kind": "Treasure",
+     "rank": 1, "price": 700, "blurb": "A treasure. It can be stolen."},
+    {"id": "alchemy_cauldron", "name": "a nine-tier alchemy cauldron", "kind": "Treasure",
+     "rank": 1, "price": 1500, "blurb": "A treasure. It can be stolen."},
+    {"id": "lotus_throne", "name": "a Heaven-Grade lotus throne", "kind": "Treasure", "rank": 2,
+     "price": 4000, "blurb": "A treasure. It can be stolen, unless you own a talisman."},
+    {"id": TALISMAN_ID, "name": "Spatial Escape Talisman", "kind": "Talisman", "price": 2500,
+     "blurb": "Single use: when a Demonic winner tries to steal your treasure, space folds "
+              "and the treasure slips out of reach."},
+]
+PAVILION_BY_ID = {item["id"]: item for item in PAVILION_ITEMS}
+PAVILION_TREASURE_RANKS = {item["name"]: item["rank"] for item in PAVILION_ITEMS
+                           if item["kind"] == "Treasure"}
+
+
+def talisman_count(c):
+    """How many Spatial Escape Talismans a cultivator holds."""
+    return c.get("pavilion", {}).get("items", {}).get(TALISMAN_ID, 0)
+
+
+def describe_goods(items):
+    """'Qi Gathering Pill (x2), Iron Spirit Sword' for the pavilion goods a cultivator owns."""
+    parts = []
+    for item in PAVILION_ITEMS:
+        n = items.get(item["id"], 0)
+        if n and item["kind"] != "Treasure":
+            parts.append(f"{item['name']} (x{n})" if n > 1 else item["name"])
+    return ", ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -905,6 +980,30 @@ def write_inventory(steamid, treasures, events=()):
     return save_profile_cache(pc)
 
 
+def read_pavilion(steamid):
+    """{'items': {id: count}, 'spent': sect points spent, 'history': [...]} saved for this
+    profile; all empty if nothing was ever bought here (or the saved data is damaged)."""
+    d = load_profile_cache(steamid).get("pavilion")
+    empty = {"items": {}, "spent": 0, "history": []}
+    def whole(v, low):
+        return isinstance(v, int) and not isinstance(v, bool) and v >= low
+    if (isinstance(d, dict) and whole(d.get("spent"), 0) and isinstance(d.get("items"), dict)
+            and all(isinstance(k, str) and whole(v, 1) for k, v in d["items"].items())
+            and isinstance(d.get("history"), list)):
+        return {"items": dict(d["items"]), "spent": d["spent"],
+                "history": [e for e in d["history"] if isinstance(e, dict)]}
+    return empty
+
+
+def write_pavilion(steamid, items, spent, event=None):
+    """Saves the goods bought in the pavilion and the sect points spent on them."""
+    pc = load_profile_cache(steamid)
+    history = read_pavilion(steamid)["history"] + ([event] if event else [])
+    pc["pavilion"] = {"items": {k: v for k, v in items.items() if v > 0}, "spent": int(spent),
+                      "history": history[-INVENTORY_HISTORY_LIMIT:]}
+    return save_profile_cache(pc)
+
+
 def read_duel_rep(steamid):
     """(points, history) of the fame or shame this profile won in duels; (0, []) if none."""
     d = load_profile_cache(steamid).get("duel_reputation")
@@ -934,6 +1033,8 @@ def describe_event(e):
         return f"took {item} from {who} ({when})"
     if kind == "found":
         return f"found {item} after a duel ({when})"
+    if kind == "bought":
+        return f"bought {item} at the Martial Pavilion ({when})"
     return f"{kind} ({when})"
 
 
@@ -1633,7 +1734,8 @@ def describe_death(c, info, friend):
     return label, pool[d["scene"] % len(pool)].format(**fmt)
 
 
-def generate_cultivator(info, steamid, friend_ids=None, inventory=None, duel_points=0):
+def generate_cultivator(info, steamid, friend_ids=None, inventory=None, duel_points=0,
+                        pavilion=None):
     rng = random.Random(int(steamid))  # same profile -> same cultivator
     talent = roll_talent(steamid)      # rolled first: it changes both power and death risk
     personalities = get_personalities(info, len(friend_ids or []))   # second: same reason
@@ -1671,7 +1773,9 @@ def generate_cultivator(info, steamid, friend_ids=None, inventory=None, duel_poi
 
     # Sect missions: every unlocked achievement counts, and each one pays sect points
     missions = info["achievements"]
-    sect_points = missions * SECT_POINTS_PER_MISSION
+    sect_points_earned = missions * SECT_POINTS_PER_MISSION
+    pavilion = pavilion or {"items": {}, "spent": 0, "history": []}
+    sect_points = max(0, sect_points_earned - pavilion["spent"])    # what is left to spend
 
     # Backstory built from the real stats (variants and template picked from the SteamID)
     hrs, gc, lvl = info["top_hours"], info["game_count"], info["level"]
@@ -1703,6 +1807,7 @@ def generate_cultivator(info, steamid, friend_ids=None, inventory=None, duel_poi
         "age": age, "account_years": years,
         "arsenal": build_arsenal(steamid, element, path["name"]),
         "missions": missions, "sect_points": sect_points,
+        "sect_points_earned": sect_points_earned, "pavilion": pavilion,
         "personalities": personalities, "reputation": reputation, "death_chance": death_chance,
         "path": path,
     }
@@ -1809,7 +1914,12 @@ def print_cultivator(c, info):
         if new and new > 0:
             print(f"  Since last  : +{new:,} new mission{'' if new == 1 else 's'} "
                   f"(+{new * SECT_POINTS_PER_MISSION:,} sect points) since your last visit")
-    print(f"  Sect points : {c['sect_points']:,}")
+    spent = c.get("pavilion", {}).get("spent", 0)
+    print(f"  Sect points : {c['sect_points']:,}"
+          + (f" (earned {c['sect_points_earned']:,}, spent {spent:,})" if spent else ""))
+    goods = describe_goods(c.get("pavilion", {}).get("items", {}))
+    if goods:
+        wrap_field("Pavilion", goods)
     cut = " (cut short)" if c["death"] else ""
     print(f"  Lifespan    : {c['lifespan']:,} years{cut}")
     print(f"  Born        : Year {c['birth_year']} of the Heavenly Calendar")
@@ -1900,6 +2010,130 @@ def print_death(c, info, friend):
     print()
     wrap_print(text)
     print("=" * 64 + "\n")
+
+
+# ---------------------------------------------------------------------------
+# The Martial Pavilion: the "pavilion" command. It always serves the cultivator you looked
+# up last in this run (session["latest"]); looking up another profile makes that one the
+# latest. mocb does not change it.
+# ---------------------------------------------------------------------------
+def pavilion_status(c, item):
+    """'you can afford it', 'need 120 more', 'already owned'... for one item."""
+    owned = c["pavilion"]["items"].get(item["id"], 0)
+    if item["kind"] == "Weapon" and owned:
+        return "already owned"
+    price = item["price"]
+    if price > c["sect_points"]:
+        return f"need {price - c['sect_points']:,} more"
+    return "you can afford it" + (f" (you own {owned})" if owned else "")
+
+
+def print_pavilion(c):
+    line = "=" * 64
+    print("\n" + line)
+    wrap_words("  ", f"SECT MARTIAL PAVILION  -  {c['name']} of the {c['sect']}")
+    print(line)
+    print(f"  Sect points available: {c['sect_points']:,}")
+    kind_seen = None
+    for n, item in enumerate(PAVILION_ITEMS, 1):
+        if item["kind"] != kind_seen:
+            kind_seen = item["kind"]
+            print(f"\n  {kind_seen.upper()}S")
+        print(f"  {n:>2}. {item['name']}")
+        wrap_words("      ", f"{item['price']:,} sect points - {pavilion_status(c, item)}")
+        wrap_words("      ", item["blurb"])
+    print(line)
+
+
+def pavilion_goods_text(c):
+    """What a cultivator holds from the pavilion, for the purchase receipt."""
+    goods = describe_goods(c["pavilion"]["items"])
+    return goods or "nothing yet"
+
+
+def buy_pavilion_item(steamid, c, number):
+    """Buys item number `number` (1-based, as listed) for the cultivator c: the sect points
+    are spent, and the item is written into their JSON file (a treasure goes into the
+    treasure inventory, everything else into the pavilion goods). One write, so a purchase is
+    never half done. Raises SteamError if the choice is not valid or too expensive."""
+    try:
+        n = int(str(number).strip().lstrip("#"))
+    except ValueError:
+        raise SteamError(f"'{number}' is not an item number. Pick one from 1 to {len(PAVILION_ITEMS)}.")
+    if not 1 <= n <= len(PAVILION_ITEMS):
+        raise SteamError(f"There is no item number {n}. Pick one from 1 to {len(PAVILION_ITEMS)}.")
+    item = PAVILION_ITEMS[n - 1]
+    pav = c["pavilion"]
+    if item["kind"] == "Weapon" and pav["items"].get(item["id"], 0):
+        raise SteamError(f"{c['name']} already owns {item['name']}; one is enough.")
+    if item["price"] > c["sect_points"]:
+        raise SteamError(f"Not enough sect points: {item['name']} costs {item['price']:,}, "
+                         f"but {c['name']} has {c['sect_points']:,}.")
+    now = time.time()
+    spent = pav["spent"] + item["price"]
+    items = dict(pav["items"])
+    event = {"at": now, "type": "bought", "item": item["name"], "price": item["price"]}
+    pc = load_profile_cache(steamid)
+    if item["kind"] == "Treasure":
+        inv = pc.get("inventory")
+        if not inventory_valid(inv):
+            inv = {"treasures": treasures_of(c), "history": list(c.get("inventory_history", []))}
+        inv["treasures"] = list(inv["treasures"]) + [item["name"]]
+        inv["history"] = (inv["history"] + [{"at": now, "type": "bought", "item": item["name"],
+                                              "other": None}])[-INVENTORY_HISTORY_LIMIT:]
+        pc["inventory"] = inv
+        c["treasures"] = inv["treasures"]
+        c["treasure"] = prized_treasure(inv["treasures"]) or FALLBACK_TREASURE
+        c["inventory_history"] = inv["history"]
+    else:
+        items[item["id"]] = items.get(item["id"], 0) + 1
+    history = (pav["history"] + [event])[-INVENTORY_HISTORY_LIMIT:]
+    pc["pavilion"] = {"items": items, "spent": spent, "history": history}
+    save_profile_cache(pc)
+    c["pavilion"] = {"items": items, "spent": spent, "history": history}
+    c["sect_points"] = max(0, c["sect_points_earned"] - spent)
+    RUN_LOG.note(f"pavilion: {c['name']} ({steamid}) bought {item['name']} for {item['price']} "
+                 f"sect points, {c['sect_points']} left")
+    return item
+
+
+def run_pavilion(args, key, profiles, session):
+    """The "pavilion" command: 'pavilion' lists the goods and asks what to buy, 'pavilion 7'
+    buys item 7 straight away."""
+    steamid = session.get("latest")
+    if not steamid:
+        raise SteamError("No cultivator has been selected yet. Look up a Steam profile first, "
+                         "then type 'pavilion' to shop for that cultivator.")
+    if len(args) > 1:
+        raise SteamError("pavilion takes one optional item number, for example: pavilion 3")
+    info, _, _, c = build_cultivator(steamid, key, profiles)
+    if c["death"]:
+        raise SteamError(f"{c['name']} died in Year {c['death']['year']} of the Heavenly "
+                         f"Calendar. The dead have no use for the Martial Pavilion.")
+    if args:
+        choice = args[0]
+    else:
+        print_pavilion(c)
+        choice = input("  Buy which item? (number, blank to leave): ").strip()
+        if not choice:
+            print("  You leave the pavilion without buying anything.\n")
+            return
+    item = buy_pavilion_item(steamid, c, choice)
+    line = "=" * 64
+    print("\n" + line)
+    wrap_words("  ", f"{c['name']} bought {item['name']} for {item['price']:,} sect points.")
+    if item["kind"] == "Treasure":
+        wrap_words("  ", "It was added to the treasure inventory (a treasure can be stolen by "
+                         "a Demonic winner).")
+    elif item["id"] == TALISMAN_ID:
+        wrap_words("  ", "It will save the owner's treasure from the next Demonic winner who "
+                         "tries to steal it.")
+    else:
+        wrap_words("  ", "It was saved in the cultivator's JSON file.")
+    print(f"  Sect points left: {c['sect_points']:,}")
+    wrap_words("  Pavilion goods: ", pavilion_goods_text(c))
+    wrap_words("  Treasures     : ", describe_treasures(treasures_of(c)) or "none")
+    print(line + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -2061,6 +2295,15 @@ BATTLE_LOOT = [
     "With a cold smile, {w} pocketed {stolen}. It was, after all, what Demonic cultivators "
     "do.",
 ]
+# A Spatial Escape Talisman saves the loser's treasure. Placeholders: {w} {l}
+BATTLE_TALISMAN = [
+    "{w} reached for {l}'s treasure, but a Spatial Escape Talisman flared in {l}'s sleeve. "
+    "Space folded, and the treasure slipped out of reach.",
+    "'Hand it over,' {w} snarled. Nothing happened. {l}'s Spatial Escape Talisman had "
+    "already torn the treasure out of this place, and {w} grasped at empty air.",
+    "A Spatial Escape Talisman burned to ash on {l}'s chest, and with it went every chance "
+    "of {w} stealing a single thing. {w} cursed for a full minute.",
+]
 BATTLE_NO_LOOT = [
     "{w} searched {l} from head to toe for treasure, but {l} owned nothing worth taking. "
     "{w} left in a worse mood than before.",
@@ -2080,13 +2323,16 @@ BATTLE_FINDS = [
 
 def resolve_loot(w, l, rng=random):
     """What the winner w takes or finds after beating l. Returns {'stolen': treasure or None,
-    'nothing': True if a Demonic winner had nothing to steal, 'found': treasure or None}.
+    'nothing': True if a Demonic winner had nothing to steal, 'blocked': True if the loser's
+    Spatial Escape Talisman stopped the theft, 'found': treasure or None}.
     A Demonic winner steals the loser's prized treasure; any winner has a DROP_CHANCE of
     finding a random treasure that suits their realm and that they do not own yet."""
-    loot = {"stolen": None, "nothing": False, "found": None}
+    loot = {"stolen": None, "nothing": False, "found": None, "blocked": False}
     if w["path"]["name"] == "Demonic":
         prize = prized_treasure(treasures_of(l))
-        if prize:
+        if prize and talisman_count(l) > 0:          # a Spatial Escape Talisman saves it
+            loot["blocked"] = True
+        elif prize:
             loot["stolen"] = prize
         else:
             loot["nothing"] = True
@@ -2192,11 +2438,24 @@ def apply_reputation(ids, a, b, result, change):
 def apply_loot(ids, a, b, result, loot):
     """Saves what changed hands in the two profiles' inventory files and updates the two
     cultivators to match. ids are the SteamIDs of a and b."""
-    if not (loot["stolen"] or loot["found"]):
+    if not (loot["stolen"] or loot["found"] or loot.get("blocked")):
         return
     w, l = result["winner"], result["loser"]
     w_id, l_id = (ids[0], ids[1]) if w is a else (ids[1], ids[0])
     now = time.time()
+    if loot.get("blocked") and TALISMAN_SINGLE_USE:      # the talisman is used up
+        goods = dict(l["pavilion"]["items"])
+        goods[TALISMAN_ID] -= 1
+        event = {"at": now, "type": "talisman used", "item": "Spatial Escape Talisman",
+                 "other": w["name"]}
+        write_pavilion(l_id, goods, l["pavilion"]["spent"], event)
+        l["pavilion"] = dict(l["pavilion"], items={k: v for k, v in goods.items() if v > 0})
+        loot["talismans_left"] = goods[TALISMAN_ID]
+    if loot.get("blocked"):
+        RUN_LOG.note(f"loot: {l['name']} ({l_id})'s Spatial Escape Talisman saved the treasure "
+                     f"from {w['name']} ({w_id})")
+    if not (loot["stolen"] or loot["found"]):
+        return
     w_items, l_items = treasures_of(w), treasures_of(l)
     w_events, l_events = [], []
     if loot["stolen"]:
@@ -2453,7 +2712,9 @@ def battle_story(a, b, result, loot=None, change=None):
         parts.append(random.choice(BATTLE_ELEMENT_LINES))
     parts.append(random.choice(BATTLE_TURNS[kind]))
     parts.append(random.choice(BATTLE_ENDINGS[(w["path"]["name"], l["path"]["name"])]))
-    if loot.get("stolen"):                               # a Demonic winner takes the treasure...
+    if loot.get("blocked"):                              # ...unless a talisman saves it...
+        parts.append(random.choice(BATTLE_TALISMAN))
+    elif loot.get("stolen"):                             # a Demonic winner takes the treasure...
         parts.append(random.choice(BATTLE_LOOT))
     elif loot.get("nothing"):                            # ...or finds there is none
         parts.append(random.choice(BATTLE_NO_LOOT))
@@ -2524,6 +2785,11 @@ def print_battle(a, b, info_a, info_b, result, story, loot=None, change=None):
         loser = result["loser"]
         if loot["stolen"]:
             wrap_print(f"Loot : {winner['name']} stole {loot['stolen']} from {loser['name']}.")
+        elif loot.get("blocked"):
+            left = loot.get("talismans_left")
+            wrap_print(f"Loot : {winner['name']} tried to rob {loser['name']}, but a Spatial "
+                       f"Escape Talisman saved the treasure"
+                       + (f" ({left} left)." if left is not None else "."))
         elif loot["nothing"]:
             wrap_print(f"Loot : {winner['name']} tried to rob {loser['name']}, but there was "
                        f"no treasure to steal.")
@@ -2569,7 +2835,7 @@ def build_cultivator(steamid, key, profiles, refresh=False):
     duel_points, _ = read_duel_rep(steamid)
     cultivator = generate_cultivator(info, steamid, friend_ids,
                                      inventory=saved[0] if saved else None,
-                                     duel_points=duel_points)
+                                     duel_points=duel_points, pavilion=read_pavilion(steamid))
     if saved is None:                        # first load: the starting treasure becomes the inventory
         start = {"at": time.time(), "type": "start", "item": cultivator["base_treasure"],
                  "other": None}
@@ -2622,9 +2888,11 @@ def main():
 
     print("Welcome, seeker of the Dao. Press Ctrl+C to leave.")
     print("Tip: type 'mocb' to make two profiles duel (or 'mocb <profile1> <profile2>').")
+    print("Tip: type 'pavilion' to spend the sect points of the last cultivator you looked up.")
     print("Tip: type 'refresh <profile>' to ignore all saved Steam data.\n")
     refresh_first = "--refresh" in sys.argv[1:]   # refresh each profile's first lookup this run
     profiles = {}
+    session = {}                                 # the latest cultivator looked up (for 'pavilion')
     RUN_LOG.secret = key
     while True:
         try:
@@ -2634,7 +2902,7 @@ def main():
             RUN_LOG.begin(describe_command(text))
             status = "ok"
             try:
-                run_command(text, key, profiles, refresh_first)
+                run_command(text, key, profiles, refresh_first, session)
             except SteamError as e:
                 status = f"error: {e}"
                 print(f"\n  ! {e}\n")
@@ -2652,16 +2920,21 @@ def main():
 def describe_command(text):
     """What the log says was run, e.g. 'mocb a b', 'refresh lookup of x' or 'lookup of x'."""
     parts = text.split()
-    if parts[0].lower() == "mocb":
-        return "mocb " + " ".join(parts[1:])
+    if parts[0].lower() in ("mocb", "pavilion"):
+        return parts[0].lower() + (" " + " ".join(parts[1:]) if parts[1:] else "")
     if text.lower().startswith("refresh "):
         return f"refresh lookup of {text[len('refresh '):].strip()}"
     return f"lookup of {text}"
 
 
-def run_command(text, key, profiles, refresh_first):
-    """One line typed by the user: a lookup, a 'refresh <profile>' lookup, or 'mocb'."""
+def run_command(text, key, profiles, refresh_first, session=None):
+    """One line typed by the user: a lookup, a 'refresh <profile>' lookup, 'mocb' or
+    'pavilion'. session remembers the latest cultivator you looked up (for the pavilion)."""
+    session = session if session is not None else {}
     parts = text.split()
+    if parts[0].lower() == "pavilion":
+        run_pavilion(parts[1:], key, profiles, session)
+        return
     if parts[0].lower() == "mocb":
         if len(parts) > 3:
             raise SteamError("mocb takes two profiles, for example: mocb <profile1> <profile2>")
@@ -2676,6 +2949,7 @@ def run_command(text, key, profiles, refresh_first):
     if refresh_first and steamid not in profiles:
         refresh = True
     info, friend_ids, note, cultivator = build_cultivator(steamid, key, profiles, refresh)
+    session["latest"] = steamid              # the pavilion serves this cultivator from now on
     friend = resolve_friend(cultivator, friend_ids, key)
     print_cultivator(cultivator, info)
     if friend:
