@@ -15,6 +15,7 @@ Features
 - Inventory and theft system based on your cached cultivator profile
 - Sect martial pavilion let's you buy treasures and talismans for protection
 - Both Gui and Terminal modes so you can choose which one to use
+- breakthrough system and events you made are logged in the "history" tab
 
   **example:**
   <img width="1920" height="861" alt="obrazek" src="https://github.com/user-attachments/assets/5fb88fe7-cdac-43ec-bb5f-cd032eeab14e" />
