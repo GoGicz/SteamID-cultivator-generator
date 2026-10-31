@@ -5,6 +5,8 @@ Steam Cultivator - window version (dark theme, CustomTkinter)
 Needs:  pip install customtkinter
 Run:    python steam_cultivator_gui.py        (steam_cultivator.py must be next to it)
 
+Tabs: Cultivator (with the Breakthrough button), Pavilion, Duel, History and Log.
+
 It uses exactly the same engine, the same cache folder and the same Logs folder as the
 terminal program (python steam_cultivator.py), so both versions share every cultivator, treasure,
 sect point and reputation point.
@@ -72,15 +74,47 @@ class Controller:
 
         def work():
             steamid = sc.resolve_steamid(text, self.key, refresh)
-            info, friend_ids, note, c = sc.build_cultivator(steamid, self.key, self.profiles, refresh)
-            self.session["latest"] = steamid
-            friend = sc.resolve_friend(c, friend_ids, self.key)
-            out = {"steamid": steamid, "info": info, "c": c, "friend": friend, "note": note,
-                   "story": sc.generate_story(c, info, friend) if friend else None,
-                   "death": sc.describe_death(c, info, friend) if c["death"] else None}
-            out["view"] = cultivator_view(c, info)
-            return out
+            return self._view_data(steamid, refresh)
         return self._run(("refresh lookup of " if refresh else "lookup of ") + text, work)
+
+    def _view_data(self, steamid, refresh=False):
+        """Loads a cultivator, makes it the selected one and gathers what the card shows.
+        (Called from inside _run, so it takes no lock itself.)"""
+        info, friend_ids, note, c = sc.build_cultivator(steamid, self.key, self.profiles, refresh)
+        self.session["latest"] = steamid
+        friend = sc.resolve_friend(c, friend_ids, self.key)
+        out = {"steamid": steamid, "info": info, "c": c, "friend": friend, "note": note,
+               "story": sc.generate_story(c, info, friend) if friend else None,
+               "death": sc.describe_death(c, info, friend) if c["death"] else None}
+        out["view"] = cultivator_view(c, info)
+        return out
+
+    # -- breakthrough ----------------------------------------------------------------------
+    def breakthrough_info(self):
+        """What the breakthrough dialog shows for the selected cultivator."""
+        def work():
+            steamid, c = sc.breakthrough_target(self.key, self.profiles, self.session)
+            return breakthrough_view(c)
+        return self._run("breakthrough", work)
+
+    def breakthrough(self, use_pill=False):
+        """Attempts the breakthrough. Returns {'result', 'info', 'data'}: what happened, the
+        dialog data afterwards and the refreshed card data."""
+        def work():
+            steamid, c = sc.breakthrough_target(self.key, self.profiles, self.session)
+            result = sc.attempt_breakthrough(steamid, c, use_pill)
+            data = self._view_data(steamid)
+            return {"result": result, "info": breakthrough_view(data["c"]), "data": data}
+        return self._run("breakthrough attempt" + (" (with a pill)" if use_pill else ""), work)
+
+    # -- history ---------------------------------------------------------------------------
+    def history(self):
+        """{'name', 'entries'} for the selected cultivator; each entry has when/kind/text."""
+        def work():
+            steamid, c = sc.breakthrough_target(self.key, self.profiles, self.session)
+            entries = [dict(e, when=sc.stamp(e["at"])[:16]) for e in sc.history_entries(steamid, 100)]
+            return {"name": c["name"], "entries": entries}
+        return self._run("history", work)
 
     # -- the pavilion tab ------------------------------------------------------------------
     def selected(self):
@@ -235,7 +269,28 @@ def cultivator_view(c, info):
         "power_caption": f"realm {c['realm_index'] + 1}/{len(sc.REALMS)}, score {c['score']:,.0f}",
         "rep_fraction": rep_frac, "rep_caption": rep_caption, "rep_rank": rep["rank"],
         "rows": rows, "source": source, "backstory": c["backstory"],
+        "breakthrough_ready": sc.breakthrough_status(c)["can"],
     }
+
+
+HISTORY_KINDS = {"duel_win": ("Victory", "#6fcf97"), "duel_loss": ("Defeat", "#eb6b6b"),
+                 "bought": ("Bought", "#c8a24a"), "treasure": ("Treasure", "#c667d8"),
+                 "talisman": ("Talisman", "#5fb3ff"), "breakthrough_ok": ("Breakthrough", "#6fcf97"),
+                 "breakthrough_fail": ("Failed", "#eb6b6b"), "start": ("Start", "#9aa3b5")}
+
+
+def breakthrough_view(c):
+    """What the breakthrough dialog needs: whether it can be tried, why not, the realms, the
+    chance with its parts (without and with a pill) and the pills owned."""
+    st = sc.breakthrough_status(c)
+    out = {"name": c["name"], "can": st["can"], "reason": st["reason"], "current": st["current"],
+           "next": st["next"], "pills": st["pills"], "cooldown_left": st["cooldown_left"],
+           "pill_bonus": sc.BREAKTHROUGH_PILL_BONUS, "plain": None, "with_pill": None}
+    if st["chance"]:
+        out["plain"] = {"lines": sc.breakthrough_lines(st["chance"]), "total": st["chance"]["total"]}
+        out["with_pill"] = {"lines": sc.breakthrough_lines(st["chance_pill"]),
+                            "total": st["chance_pill"]["total"]}
+    return out
 
 
 def shop_rows(c):
@@ -289,6 +344,8 @@ class App:
         self.controller = None
         self.events = queue.Queue()
         self.working = False
+        self.selected = False            # has a cultivator been looked up yet?
+        self.bt_dialog = None
         self.title_font = ctk.CTkFont(size=24, weight="bold")
         self.head_font = ctk.CTkFont(size=15, weight="bold")
         self.body_font = ctk.CTkFont(size=13)
@@ -343,11 +400,12 @@ class App:
                                    segmented_button_selected_color=ACCENT,
                                    segmented_button_selected_hover_color="#a8862f")
         self.tabs.pack(fill="both", expand=True, padx=14, pady=(14, 6))
-        for name in ("Cultivator", "Pavilion", "Duel", "Log"):
+        for name in ("Cultivator", "Pavilion", "Duel", "History", "Log"):
             self.tabs.add(name)
         self.build_cultivator_tab(self.tabs.tab("Cultivator"))
         self.build_pavilion_tab(self.tabs.tab("Pavilion"))
         self.build_duel_tab(self.tabs.tab("Duel"))
+        self.build_history_tab(self.tabs.tab("History"))
         self.build_log_tab(self.tabs.tab("Log"))
         bar = ctk.CTkFrame(self.root, fg_color="transparent")
         bar.pack(fill="x", padx=18, pady=(0, 10))
@@ -361,6 +419,8 @@ class App:
         name = self.tabs.get()
         if name == "Pavilion":
             self.refresh_pavilion()
+        elif name == "History":
+            self.refresh_history()
         elif name == "Log":
             self.refresh_log()
 
@@ -422,6 +482,7 @@ class App:
     def set_buttons(self, state):
         for b in (self.look_button, self.fight_button, self.log_button):
             b.configure(state=state)
+        self.bt_button.configure(state=state if self.selected else "disabled")
         for b in self.buy_buttons:
             b.configure(state=state if state == "disabled" else b.intended_state)
 
@@ -442,6 +503,10 @@ class App:
                                          fg_color=ACCENT, hover_color="#a8862f",
                                          text_color="#1a1a1a", width=110)
         self.look_button.pack(side="left")
+        self.bt_button = ctk.CTkButton(top, text="Breakthrough", command=self.do_breakthrough,
+                                       height=36, fg_color="#7b5fd1", hover_color="#5f47a8",
+                                       width=130, state="disabled")
+        self.bt_button.pack(side="left", padx=(8, 0))
         self.card = ctk.CTkScrollableFrame(tab, fg_color=PANEL, corner_radius=10)
         self.card.pack(fill="both", expand=True)
         self.say(self.card, "Look up a Steam profile to meet its cultivator.")
@@ -484,6 +549,10 @@ class App:
         self.chip(chips, v["path"], v["path_color"])
         self.chip(chips, v["realm"], v["realm_color"])
         self.chip(chips, "Fallen" if v["dead"] else "Alive", BAD if v["dead"] else GOOD)
+        if v["breakthrough_ready"]:
+            self.chip(chips, "Ready to break through", "#a98bff")
+        self.selected = True
+        self.bt_button.configure(state="normal")
 
         bars = ctk.CTkFrame(body, fg_color="transparent")
         bars.pack(fill="x", padx=6)
@@ -543,6 +612,153 @@ class App:
         self.ctk.CTkLabel(parent, text=text, anchor="w", justify="left", wraplength=WIDE,
                           font=self.body_font, text_color=MUTED if muted else TEXT
                           ).pack(fill="x", padx=12, pady=3)
+
+    # -- breakthrough dialog ---------------------------------------------------------------
+    def do_breakthrough(self):
+        self.run_async("Checking the realm...", self.controller.breakthrough_info,
+                       self.show_breakthrough_dialog)
+
+    @staticmethod
+    def widget_alive(w):
+        try:
+            return bool(w.winfo_exists())
+        except Exception:
+            return False
+
+    def show_breakthrough_dialog(self, info):
+        ctk = self.ctk
+        if self.bt_dialog is not None and self.widget_alive(self.bt_dialog):
+            self.bt_dialog.destroy()
+        dlg = ctk.CTkToplevel(self.root)
+        self.bt_dialog = dlg
+        dlg.title("Breakthrough")
+        dlg.geometry("560x560")
+        dlg.configure(fg_color=PANEL)
+        try:
+            dlg.transient(self.root)
+        except Exception:
+            pass
+        ctk.CTkLabel(dlg, text=f"Breakthrough - {info['name']}", font=self.title_font,
+                     text_color=ACCENT).pack(padx=24, pady=(22, 4))
+        ctk.CTkLabel(dlg, text=f"{info['current']}   ->   {info['next'] or '-'}",
+                     font=self.head_font).pack(padx=24)
+        if not info["can"]:
+            ctk.CTkLabel(dlg, text=info["reason"], font=self.body_font, text_color=BAD,
+                         wraplength=480, justify="left").pack(padx=30, pady=24)
+            ctk.CTkButton(dlg, text="Close", command=dlg.destroy, width=140).pack(pady=(0, 24))
+            self.focus_dialog(dlg)
+            return
+        state = {"pill": False}
+        chance = ctk.CTkLabel(dlg, text="", font=ctk.CTkFont(size=40, weight="bold"),
+                              text_color=ACCENT)
+        chance.pack(pady=(14, 0))
+        bar = ctk.CTkProgressBar(dlg, width=420, progress_color="#7b5fd1")
+        bar.pack(pady=(4, 10))
+        box = ctk.CTkFrame(dlg, fg_color=PANEL_2, corner_radius=8)
+        box.pack(fill="x", padx=30)
+        lines = ctk.CTkLabel(box, text="", font=self.body_font, justify="left", anchor="w")
+        lines.pack(fill="x", padx=14, pady=10)
+
+        def show():
+            part = info["with_pill"] if state["pill"] else info["plain"]
+            chance.configure(text=f"{part['total'] * 100:g}%")
+            bar.set(part["total"])
+            lines.configure(text="\n".join(part["lines"]))
+        show()
+        pill_var = self.tk.BooleanVar(value=False)
+        if info["pills"]:
+            def toggle():
+                state["pill"] = bool(pill_var.get())
+                show()
+            ctk.CTkCheckBox(dlg, text=f"Swallow a Heaven-Defying Breakthrough Pill "
+                                      f"(+{info['pill_bonus'] * 100:g}%, you own {info['pills']})",
+                            variable=pill_var, command=toggle, font=self.body_font,
+                            fg_color=ACCENT, hover_color="#a8862f").pack(pady=(12, 0))
+        else:
+            ctk.CTkLabel(dlg, text="A Heaven-Defying Breakthrough Pill (+30%) can be bought in the "
+                         "Pavilion for 5,000 sect points.", font=self.small_font, text_color=MUTED,
+                         wraplength=470).pack(pady=(12, 0))
+        result = ctk.CTkLabel(dlg, text="", font=self.body_font, wraplength=480, justify="left")
+        result.pack(padx=30, pady=(12, 0))
+        row = ctk.CTkFrame(dlg, fg_color="transparent")
+        row.pack(pady=18)
+        attempt = ctk.CTkButton(row, text="Attempt breakthrough", fg_color="#7b5fd1",
+                                hover_color="#5f47a8", width=200)
+        close = ctk.CTkButton(row, text="Cancel", command=dlg.destroy, fg_color=PANEL_2, width=120)
+
+        def go():
+            attempt.configure(state="disabled")
+            use = state["pill"]
+
+            def done(res):
+                if not self.widget_alive(dlg):
+                    return
+                r = res["result"]
+                result.configure(
+                    text=(f"SUCCESS! Heavenly lightning rolls across the sky. {info['name']} breaks "
+                          f"through to {r['to']}!") if r["success"] else
+                         (f"FAILED. The Qi turns on {info['name']}, who must rest for "
+                          f"{sc.BREAKTHROUGH_COOLDOWN_MINUTES} minutes before trying again."
+                          + (" The pill is gone." if r["pill_used"] else "")),
+                    text_color=GOOD if r["success"] else BAD)
+                close.configure(text="Close")
+                self.show_cultivator(res["data"])
+
+            def failed(message):
+                if self.widget_alive(dlg):
+                    result.configure(text=message, text_color=BAD)
+                    close.configure(text="Close")
+            self.run_async("The breakthrough begins...", lambda: self.controller.breakthrough(use),
+                           done, failed)
+        attempt.configure(command=go)
+        attempt.pack(side="left", padx=8)
+        close.pack(side="left", padx=8)
+        self.focus_dialog(dlg)
+
+    @staticmethod
+    def focus_dialog(dlg):
+        try:
+            dlg.lift()
+            dlg.focus()
+            dlg.grab_set()           # the main window waits until the dialog is closed
+        except Exception:
+            pass
+
+    # -- tab: history ----------------------------------------------------------------------
+    def build_history_tab(self, tab):
+        ctk = self.ctk
+        self.hist_head = ctk.CTkLabel(tab, text="History", font=self.head_font, anchor="w",
+                                      text_color=ACCENT)
+        self.hist_head.pack(fill="x", padx=6, pady=(4, 6))
+        self.hist_list = ctk.CTkScrollableFrame(tab, fg_color=PANEL, corner_radius=10)
+        self.hist_list.pack(fill="both", expand=True)
+        self.say(self.hist_list, "Look up a cultivator to see what they did recently.")
+
+    def refresh_history(self):
+        if self.working or self.controller is None:
+            return
+        self.run_async("Reading the history...", self.controller.history, self.show_history,
+                       lambda m: self.say(self.hist_list, m, BAD, 30))
+
+    def show_history(self, data):
+        ctk = self.ctk
+        self.hist_head.configure(text=f"Recent history of {data['name']}")
+        if not data["entries"]:
+            self.say(self.hist_list, "Nothing yet: no duels, purchases or breakthroughs.")
+            return
+        body = self.fresh(self.hist_list)
+        for e in data["entries"]:
+            label, color = HISTORY_KINDS.get(e["kind"], (e["kind"], MUTED))
+            row = ctk.CTkFrame(body, fg_color=PANEL_2, corner_radius=8)
+            row.pack(fill="x", padx=6, pady=3)
+            ctk.CTkLabel(row, text=f"  {label}  ", fg_color=color, text_color="#101010",
+                         corner_radius=10, font=self.small_font, width=110).pack(side="left", padx=10, pady=8)
+            text = ctk.CTkFrame(row, fg_color="transparent")
+            text.pack(side="left", fill="x", expand=True)
+            ctk.CTkLabel(text, text=e["text"], font=self.body_font, anchor="w", justify="left",
+                         wraplength=WIDE - 190).pack(fill="x")
+            ctk.CTkLabel(text, text=e["when"], font=self.small_font, text_color=MUTED,
+                         anchor="w").pack(fill="x")
 
     # -- tab: pavilion ---------------------------------------------------------------------
     def build_pavilion_tab(self, tab):

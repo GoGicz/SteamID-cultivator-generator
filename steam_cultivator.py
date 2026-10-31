@@ -60,6 +60,9 @@ weapons, treasures and the Spatial Escape Talisman cost sect points and are save
 cultivator's JSON file. A talisman stops one Demonic theft, then is used up. The dead cannot
 shop, and "pavilion" is refused until a cultivator has been looked up. Reputation ranks
 now rise gradually: the first ranks come quickly, the later ones need far more points.
+Type "breakthrough" when the power score reaches the next realm: the chance depends on the
+realm, the personality, the talent and an optional Heaven-Defying Breakthrough Pill (+30%,
+5,000 sect points). Type "history" to see recent duels, purchases and breakthroughs.
 Level, paid games, hours in the top game and badges are remembered at their highest ever in
 the profile's JSON file: a dip in Steam's data or a refresh never takes power or reputation
 away, and only genuinely new levels, games, hours or badges add to it.
@@ -387,7 +390,8 @@ PAVILION_ITEMS = [
     {"id": "soul_restoring_pill", "name": "Nine-Turn Soul Restoring Pill", "kind": "Pill",
      "price": 1200, "blurb": "Calls a wounded soul back from the edge."},
     {"id": "breakthrough_pill", "name": "Heaven-Defying Breakthrough Pill", "kind": "Pill",
-     "price": 3000, "blurb": "Alchemists whisper that it was stolen from the heavens."},
+     "price": 5000, "blurb": "Alchemists whisper it was stolen from the heavens. Adds +30% to "
+                             "one breakthrough attempt."},
     {"id": "iron_spirit_sword", "name": "Iron Spirit Sword", "kind": "Weapon", "price": 200,
      "blurb": "A reliable blade for disciples who still count their spirit stones."},
     {"id": "azure_frost_spear", "name": "Azure Frost Spear", "kind": "Weapon", "price": 500,
@@ -1106,6 +1110,116 @@ def apply_peaks(steamid, info):
         RUN_LOG.note(f"peaks: Steam now shows less {', '.join(kept)} than ever before; "
                      f"the highest known values are kept")
     return eff
+
+
+def read_realm_state(steamid):
+    """{'realm_index': the realm they hold (None if never saved), 'last_failed': time of the
+    last failed breakthrough or None}. The realm only changes through a breakthrough."""
+    d = load_profile_cache(steamid).get("realm_state")
+    out = {"realm_index": None, "last_failed": None}
+    if isinstance(d, dict):
+        i = d.get("realm_index")
+        if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < len(REALMS):
+            out["realm_index"] = i
+        t = d.get("last_failed")
+        if isinstance(t, (int, float)) and not isinstance(t, bool):
+            out["last_failed"] = float(t)
+    return out
+
+
+def write_realm_state(steamid, realm_index, last_failed=None):
+    pc = load_profile_cache(steamid)
+    pc["realm_state"] = {"realm_index": int(realm_index), "last_failed": last_failed}
+    return save_profile_cache(pc)
+
+
+ACTIVITY_LIMIT = 200
+
+
+def read_activity(steamid):
+    """What this cultivator did recently that nothing else records: duels and breakthroughs."""
+    d = load_profile_cache(steamid).get("activity")
+    return [e for e in d if isinstance(e, dict) and isinstance(e.get("at"), (int, float))] \
+        if isinstance(d, list) else []
+
+
+def add_activity(steamid, event):
+    pc = load_profile_cache(steamid)
+    pc["activity"] = (read_activity(steamid) + [event])[-ACTIVITY_LIMIT:]
+    return save_profile_cache(pc)
+
+
+def history_entries(steamid, limit=80):
+    """Everything this cultivator did recently, newest first, as dicts {'at', 'kind', 'text'}.
+    It merges the duel and breakthrough log with the inventory history (found, stolen, robbed,
+    bought) and the pavilion history (purchases, talisman use). kind is one of: duel_win,
+    duel_loss, bought, treasure, talisman, breakthrough_ok, breakthrough_fail, start."""
+    pc = load_profile_cache(steamid)
+    entries, seen = [], set()
+
+    def add(at, kind, text, key=None):
+        if key is not None:
+            if key in seen:
+                return
+            seen.add(key)
+        entries.append({"at": at, "kind": kind, "text": text})
+
+    activity = read_activity(steamid)
+    first_duel = min([e["at"] for e in activity if e.get("type") == "duel"], default=None)
+    for e in activity:
+        if e.get("type") == "duel":
+            p, rep = e.get("p"), e.get("rep", 0)
+            text = (f"{'Defeated' if e.get('won') else 'Lost to'} {e.get('other', 'someone')} "
+                    f"({e.get('other_realm', '?')}) in a duel"
+                    + (f" (win chance {p * 100:.0f}%)" if isinstance(p, (int, float)) else "")
+                    + (" - an upset!" if e.get("upset") else "")
+                    + (f". Reputation {rep:+d}" if rep else ""))
+            add(e["at"], "duel_win" if e.get("won") else "duel_loss", text)
+        elif e.get("type") == "breakthrough":
+            how = f" ({e.get('chance', 0) * 100:.0f}% chance" \
+                  + (", helped by a Heaven-Defying Breakthrough Pill)" if e.get("pill") else ")")
+            if e.get("success"):
+                add(e["at"], "breakthrough_ok",
+                    f"Broke through from {e.get('from')} to {e.get('to')}{how}")
+            else:
+                add(e["at"], "breakthrough_fail",
+                    f"The breakthrough to {e.get('to')} failed{how}")
+    pav = pc.get("pavilion")
+    for e in (pav.get("history", []) if isinstance(pav, dict) else []):
+        if not isinstance(e, dict) or not isinstance(e.get("at"), (int, float)):
+            continue
+        if e.get("type") == "bought":
+            add(e["at"], "bought", f"Bought {e.get('item')} for {e.get('price', 0):,} sect points",
+                ("bought", round(e["at"], 2), e.get("item")))
+        elif e.get("type") == "talisman used":
+            add(e["at"], "talisman", f"A Spatial Escape Talisman saved their treasure from "
+                                      f"{e.get('other', 'a thief')}")
+    inv = pc.get("inventory")
+    for e in (inv.get("history", []) if isinstance(inv, dict) else []):
+        if not isinstance(e, dict) or not isinstance(e.get("at"), (int, float)):
+            continue
+        who, item, kind = e.get("other") or "someone", e.get("item", "a treasure"), e.get("type")
+        if kind == "robbed":
+            add(e["at"], "treasure", f"Robbed of {item} by {who}")
+        elif kind == "stole":
+            add(e["at"], "treasure", f"Took {item} from {who}")
+        elif kind == "found":
+            add(e["at"], "treasure", f"Found {item} after a duel")
+        elif kind == "bought":
+            add(e["at"], "bought", f"Bought {item} at the Martial Pavilion",
+                ("bought", round(e["at"], 2), item))
+        elif kind == "start":
+            add(e["at"], "start", f"Began the journey owning {item}")
+    rep = pc.get("duel_reputation")             # duels from before the activity log existed
+    for e in (rep.get("history", []) if isinstance(rep, dict) else []):
+        if (isinstance(e, dict) and isinstance(e.get("at"), (int, float))
+                and (first_duel is None or e["at"] < first_duel - 1)):
+            won = e.get("won")
+            add(e["at"], "duel_win" if won else "duel_loss",
+                f"{'Defeated' if won else 'Lost to'} {e.get('other', 'someone')} "
+                f"({e.get('other_realm', '?')}) in a duel. Reputation {e.get('points', 0):+d}")
+    entries.sort(key=lambda x: x["at"], reverse=True)
+    return entries[:limit]
 
 
 def read_duel_rep(steamid):
@@ -1854,14 +1968,18 @@ def describe_death(c, info, friend):
 
 
 def generate_cultivator(info, steamid, friend_ids=None, inventory=None, duel_points=0,
-                        pavilion=None):
+                        pavilion=None, realm_index=None):
     rng = random.Random(int(steamid))  # same profile -> same cultivator
     talent = roll_talent(steamid)      # rolled first: it changes both power and death risk
     personalities = get_personalities(info, len(friend_ids or []))   # second: same reason
     path = roll_path(steamid)          # third: the Demonic Path adds power
     score = power_score(info, talent["power"] + sum(p["power"] for p in personalities)
                         + path["power"])
-    idx, (_, realm, realm_flavor) = get_realm(score)
+    eligible, _ = get_realm(score)       # the highest realm the power score allows
+    # The realm they actually hold is saved in their file and only rises through a breakthrough
+    # (realm_index); with nothing saved yet they start in the realm their score gives.
+    idx = eligible if realm_index is None else realm_index
+    _, realm, realm_flavor = REALMS[idx]
 
     tier_no = 0 if idx <= 2 else 1 if idx <= 6 else 2
     titles, treasures = (TITLES_LOW, TITLES_MID, TITLES_HIGH)[tier_no], \
@@ -1921,7 +2039,8 @@ def generate_cultivator(info, steamid, friend_ids=None, inventory=None, duel_poi
 
     return {
         "name": name, "sect": sect, "title": title, "realm": realm, "realm_flavor": realm_flavor,
-        "realm_index": idx, "element": element, "technique": technique, "lifespan": lifespan,
+        "realm_index": idx, "eligible_realm_index": eligible, "element": element,
+        "technique": technique, "lifespan": lifespan,
         "lightning": lightning, "treasure": main_treasure, "treasures": owned,
         "base_treasure": treasure, "inventory_history": [], "backstory": backstory, "score": score,
         "birth_year": fate["birth_year"], "death": fate["death"], "talent": talent,
@@ -2264,6 +2383,176 @@ def run_pavilion(args, key, profiles, session):
     wrap_words("  Pavilion goods: ", pavilion_goods_text(c))
     wrap_words("  Treasures     : ", describe_treasures(treasures_of(c)) or "none")
     print(line + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Breakthrough: the "breakthrough" command (and the Breakthrough button in the window). The realm
+# a cultivator holds is saved in their file. When the power score reaches the next realm's
+# threshold they may try to break through, one realm at a time. The chance is
+#     base chance of the realm they are leaving (95% for the lowest ... 22% before the last)
+#   + personality bonus (Fearless +5%, Brave +2%)
+#   + talent bonus (Gifted Spirit Root +3% ... Reincarnation of the Dao +40%)
+#   + 30% if a Heaven-Defying Breakthrough Pill is swallowed (it is used up either way),
+# capped at 100%. A failed attempt means a rest of BREAKTHROUGH_COOLDOWN_MINUTES.
+# ---------------------------------------------------------------------------
+BREAKTHROUGH_BASE = [0.95, 0.86, 0.77, 0.68, 0.58, 0.49, 0.40, 0.31, 0.22]   # by current realm
+TALENT_BREAKTHROUGH = {"Poor Martial Body": 0.0, "Regular Martial Body": 0.0,
+                       "Gifted Spirit Root": 0.03, "Heaven-Favored Genius": 0.10,
+                       "Divine Physique": 0.18, "Primordial Chaos Body": 0.28,
+                       "Reincarnation of the Dao": 0.40}
+PERSONALITY_BREAKTHROUGH = {"Fearless": 0.05, "Brave": 0.02}
+BREAKTHROUGH_PILL_ID = "breakthrough_pill"
+BREAKTHROUGH_PILL_BONUS = 0.30
+BREAKTHROUGH_COOLDOWN_MINUTES = 60
+
+
+def breakthrough_chance(c, use_pill=False):
+    """The chance for cultivator c to break through to the next realm, with its parts."""
+    base = BREAKTHROUGH_BASE[min(c["realm_index"], len(BREAKTHROUGH_BASE) - 1)]
+    personalities = [(p["name"], PERSONALITY_BREAKTHROUGH[p["name"]]) for p in c["personalities"]
+                     if PERSONALITY_BREAKTHROUGH.get(p["name"])]
+    talent = (c["talent"]["name"], TALENT_BREAKTHROUGH.get(c["talent"]["name"], 0.0))
+    pill = BREAKTHROUGH_PILL_BONUS if use_pill else 0.0
+    raw = base + sum(b for _, b in personalities) + talent[1] + pill
+    return {"base": base, "realm": c["realm"], "personalities": personalities,
+            "talent": talent, "pill": pill, "total": round(min(1.0, raw), 4),
+            "capped": raw > 1.0}
+
+
+def breakthrough_lines(bd):
+    """The parts of a chance, as plain lines for the terminal and the window."""
+    pct = lambda x: f"{x * 100:g}%"
+    lines = [f"Base chance in {bd['realm']}: {pct(bd['base'])}"]
+    for name, bonus in bd["personalities"]:
+        lines.append(f"Personality ({name}): +{pct(bonus)}")
+    if bd["talent"][1]:
+        lines.append(f"Talent ({bd['talent'][0]}): +{pct(bd['talent'][1])}")
+    if bd["pill"]:
+        lines.append(f"Heaven-Defying Breakthrough Pill: +{pct(bd['pill'])}")
+    lines.append(f"Total: {pct(bd['total'])}" + (" (capped at 100%)" if bd["capped"] else ""))
+    return lines
+
+
+def breakthrough_status(c, now=None):
+    """Can c try to break through right now? Returns a dict with 'can', 'reason' (why not),
+    'current', 'next', the chance without and with a pill, the pills owned and the cooldown."""
+    now = time.time() if now is None else now
+    idx = c["realm_index"]
+    top = idx >= len(REALMS) - 1
+    st = {"can": False, "reason": "", "current": c["realm"],
+          "next": None if top else REALMS[idx + 1][1], "pills": c["pavilion"]["items"].get(
+              BREAKTHROUGH_PILL_ID, 0), "cooldown_left": 0,
+          "chance": None if top else breakthrough_chance(c),
+          "chance_pill": None if top else breakthrough_chance(c, True)}
+    if c["death"]:
+        st["reason"] = (f"{c['name']} died in Year {c['death']['year']} of the Heavenly "
+                        f"Calendar. The dead cannot break through.")
+    elif top:
+        st["reason"] = f"{c['name']} already stands in the highest realm, {c['realm']}."
+    elif c["eligible_realm_index"] <= idx:
+        need = REALMS[idx + 1][0]
+        st["reason"] = (f"Not ready yet: {REALMS[idx + 1][1]} needs a power score of {need:,}, "
+                        f"and {c['name']} has {c['score']:,.0f}.")
+    else:
+        failed = c.get("last_breakthrough_fail")
+        left = int(failed + BREAKTHROUGH_COOLDOWN_MINUTES * 60 - now) if failed else 0
+        if left > 0:
+            st["cooldown_left"] = left
+            st["reason"] = (f"{c['name']} is still recovering from the failed attempt and must "
+                            f"rest for another {left // 60 + 1} minute(s).")
+        else:
+            st["can"] = True
+    return st
+
+
+def attempt_breakthrough(steamid, c, use_pill=False, rng=random, now=None):
+    """Tries the breakthrough for cultivator c (loaded for steamid). Saves the new realm on
+    success, the failure time on failure, uses up the pill if one was swallowed and records
+    it all in the history. Raises SteamError if it is not allowed."""
+    now = time.time() if now is None else now
+    st = breakthrough_status(c, now)
+    if not st["can"]:
+        raise SteamError(st["reason"])
+    if use_pill and st["pills"] <= 0:
+        raise SteamError(f"{c['name']} owns no Heaven-Defying Breakthrough Pill. "
+                         f"One can be bought at the Martial Pavilion.")
+    bd = breakthrough_chance(c, use_pill)
+    success = rng.random() < bd["total"]
+    if use_pill:
+        goods = dict(c["pavilion"]["items"])
+        goods[BREAKTHROUGH_PILL_ID] -= 1
+        write_pavilion(steamid, goods, c["pavilion"]["spent"],
+                       {"at": now, "type": "pill used", "item": PAVILION_BY_ID[BREAKTHROUGH_PILL_ID]["name"],
+                        "other": None})
+    write_realm_state(steamid, c["realm_index"] + (1 if success else 0),
+                      None if success else now)
+    add_activity(steamid, {"at": now, "type": "breakthrough", "success": success,
+                           "from": st["current"], "to": st["next"], "chance": bd["total"],
+                           "pill": bool(use_pill)})
+    RUN_LOG.note(f"breakthrough: {c['name']} ({steamid}) {'broke through to ' + st['next'] if success else 'failed the breakthrough to ' + st['next']} "
+                 f"({bd['total'] * 100:g}% chance{', pill used' if use_pill else ''})")
+    return {"success": success, "chance": bd["total"], "from": st["current"], "to": st["next"],
+            "pill_used": bool(use_pill)}
+
+
+def breakthrough_target(key, profiles, session):
+    """(steamid, freshly loaded cultivator) of the latest looked-up profile."""
+    steamid = session.get("latest")
+    if not steamid:
+        raise SteamError("No cultivator has been selected yet. Look up a Steam profile first.")
+    return steamid, build_cultivator(steamid, key, profiles)[3]
+
+
+def run_breakthrough(args, key, profiles, session):
+    """The "breakthrough" command for the latest cultivator: shows the chance and asks."""
+    if args:
+        raise SteamError("breakthrough takes no arguments: look up a profile, then type it.")
+    steamid, c = breakthrough_target(key, profiles, session)
+    st = breakthrough_status(c)
+    if not st["can"]:
+        raise SteamError(st["reason"])
+    line = "=" * 64
+    print("\n" + line)
+    wrap_words("  ", f"BREAKTHROUGH  -  {c['name']}: {st['current']} to {st['next']}")
+    print(line)
+    use_pill = False
+    for ln in breakthrough_lines(st["chance"]):
+        wrap_words("  ", ln)
+    if st["pills"]:
+        pill = PAVILION_BY_ID[BREAKTHROUGH_PILL_ID]["name"]
+        answer = input(f"  Swallow a {pill} (+{BREAKTHROUGH_PILL_BONUS * 100:g}%, you own "
+                       f"{st['pills']})? [y/N]: ").strip().lower()
+        use_pill = answer in ("y", "yes")
+        if use_pill:
+            for ln in breakthrough_lines(st["chance_pill"]):
+                wrap_words("  ", ln)
+    chance = (st["chance_pill"] if use_pill else st["chance"])["total"]
+    if input(f"  Attempt the breakthrough at {chance * 100:g}%? [y/N]: ").strip().lower() \
+            not in ("y", "yes"):
+        print("  The cultivator decides to wait.\n")
+        return
+    r = attempt_breakthrough(steamid, c, use_pill)
+    if r["success"]:
+        wrap_words("  ", f"SUCCESS! Heavenly lightning rolls across the sky. {c['name']} "
+                         f"breaks through to {r['to']}!")
+    else:
+        wrap_words("  ", f"FAILED. The Qi turns on {c['name']}, who must rest for "
+                         f"{BREAKTHROUGH_COOLDOWN_MINUTES} minutes before trying again."
+                         + (" The pill is gone." if r["pill_used"] else ""))
+    print(line + "\n")
+
+
+def run_history(args, key, profiles, session):
+    """The "history" command: what the latest cultivator did recently."""
+    steamid, c = breakthrough_target(key, profiles, session)
+    entries = history_entries(steamid, 20)
+    print(f"\n  Recent history of {c['name']}")
+    print("  " + "-" * 62)
+    if not entries:
+        print("  Nothing yet: no duels, purchases or breakthroughs.")
+    for e in entries:
+        wrap_words(f"  {stamp(e['at'])[:16]}  ", e["text"])
+    print()
 
 
 # ---------------------------------------------------------------------------
@@ -3136,9 +3425,14 @@ def build_cultivator(steamid, key, profiles, refresh=False):
     friend_ids, note = get_friends(steamid, key, refresh)
     saved = read_inventory(steamid)          # None on the very first load of this profile
     duel_points, _ = read_duel_rep(steamid)
+    state = read_realm_state(steamid)
     cultivator = generate_cultivator(info, steamid, friend_ids,
                                      inventory=saved[0] if saved else None,
-                                     duel_points=duel_points, pavilion=read_pavilion(steamid))
+                                     duel_points=duel_points, pavilion=read_pavilion(steamid),
+                                     realm_index=state["realm_index"])
+    if state["realm_index"] is None:         # first load: they start in the realm their stats give
+        write_realm_state(steamid, cultivator["realm_index"])
+    cultivator["last_breakthrough_fail"] = state["last_failed"]
     if saved is None:                        # first load: the starting treasure becomes the inventory
         start = {"at": time.time(), "type": "start", "item": cultivator["base_treasure"],
                  "other": None}
@@ -3193,6 +3487,13 @@ def perform_battle(ids, key, profiles):
     story = battle_story(a, b, result, loot, change)
     apply_loot(ids, a, b, result, loot)                  # written to the inventory files
     apply_reputation(ids, a, b, result, change)          # ...and the reputation points
+    now = time.time()
+    for me, other, cid, p, won in ((a, b, ids[0], result["p_a"], result["winner"] is a),
+                                   (b, a, ids[1], result["p_b"], result["winner"] is b)):
+        rep = (change["gain"] if won else -change["loss"]) if change["kind"] == "upset" else 0
+        add_activity(cid, {"at": now, "type": "duel", "won": won, "other": other["name"],
+                           "other_realm": other["realm"], "p": p, "rep": rep,
+                           "upset": bool(result["upset"]) and won})
     return {"a": a, "b": b, "info_a": info_a, "info_b": info_b, "result": result,
             "story": story, "loot": loot, "change": change}
 
@@ -3208,6 +3509,7 @@ def main():
     print("Welcome, seeker of the Dao. Press Ctrl+C to leave.")
     print("Tip: type 'mocb' to make two profiles duel (or 'mocb <profile1> <profile2>').")
     print("Tip: type 'pavilion' to spend the sect points of the last cultivator you looked up.")
+    print("Tip: type 'breakthrough' to try for the next realm, 'history' to see what they did.")
     print("Tip: type 'refresh <profile>' to ignore all saved Steam data.\n")
     refresh_first = "--refresh" in sys.argv[1:]   # refresh each profile's first lookup this run
     profiles = {}
@@ -3239,7 +3541,7 @@ def main():
 def describe_command(text):
     """What the log says was run, e.g. 'mocb a b', 'refresh lookup of x' or 'lookup of x'."""
     parts = text.split()
-    if parts[0].lower() in ("mocb", "pavilion"):
+    if parts[0].lower() in ("mocb", "pavilion", "breakthrough", "history"):
         return parts[0].lower() + (" " + " ".join(parts[1:]) if parts[1:] else "")
     if text.lower().startswith("refresh "):
         return f"refresh lookup of {text[len('refresh '):].strip()}"
@@ -3253,6 +3555,12 @@ def run_command(text, key, profiles, refresh_first, session=None):
     parts = text.split()
     if parts[0].lower() == "pavilion":
         run_pavilion(parts[1:], key, profiles, session)
+        return
+    if parts[0].lower() == "breakthrough":
+        run_breakthrough(parts[1:], key, profiles, session)
+        return
+    if parts[0].lower() == "history":
+        run_history(parts[1:], key, profiles, session)
         return
     if parts[0].lower() == "mocb":
         if len(parts) > 3:
