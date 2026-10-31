@@ -41,6 +41,19 @@ element, one attack of their path and one defense. Duels use all of them.
 If the achievement check keeps failing for the same game (3 visits in a row), that game
 is not asked about any more, and the log says which games failed and which were given
 up. "refresh <profile>" tries them again.
+Treasures are an inventory saved in the profile's JSON file in the "cache" folder
+(cache/<SteamID>.profile.json). A new profile starts with the one treasure its SteamID
+gives it. In a duel, a Demonic winner steals the loser's prized (best) treasure, which is
+removed from the loser's file and added to the winner's; if the loser owns nothing, the
+story says so. Every winner also has a 5% chance of finding a random new treasure. The
+changes show on the next profile load. "refresh" never touches the inventory, but deleting
+the cache folder (or a profile's JSON file) resets it to the starting treasure.
+Duels also change reputation, by realm only: when the winner is in a lower realm than the
+loser, the winner gains 25 reputation per realm of difference and the loser loses 20 per
+realm (only 10 per realm if both are Righteous). Same realm, or the stronger realm winning,
+changes nothing. The points are saved in the profile's JSON file and shown as "Duels" in
+the card's fame boosts; reputation never goes below 0. The dead cannot duel: a cultivator
+who died in their fate cannot be used in "mocb".
 Your Steam badges build your reputation, from "Unknown Nobody" up to "Universal
 Legend". Personalities, earned from your friends, badges, achievements and games,
 add reputation (some only by chance) and a few also change power and death risk,
@@ -185,7 +198,7 @@ REFRESH_HOURS = {
 CACHE_VERSION = 1
 GIVE_UP_AFTER_FAILURES = 3    # a game whose achievement check failed this many visits in a row
                               # is no longer asked about ("refresh <profile>" tries it again)
-OUTAGE_MIN_GAMES = 5          # if this many or more games are asked in one scan and ALL fail,
+OUTAGE_MIN_GAMES = 12         # if this many or more games are asked in one scan and ALL fail,
                               # it looks like a Steam outage, so those failures are not counted
 RECHECK_AFTER_DAYS = 30       # re-check a saved game after this long even if nothing changed
                               # (set to 0 to trust the cache until playtime changes)
@@ -253,6 +266,50 @@ TREASURES_MID = ["a flying sword of the sixth rank", "a purple-gold gourd", "a t
                  "a jade slip with an ancient inheritance"]
 TREASURES_HIGH = ["a Heaven-Grade artifact", "a fragment of the Primordial Chaos Bell",
                   "a stolen divine artifact", "a Dao-seeking lantern older than the heavens"]
+
+# ---------------------------------------------------------------------------
+# Treasures and the inventory. Everyone starts with the one treasure their SteamID gives
+# them. From then on the inventory saved in the profile's JSON file (cache/<SteamID>.profile.json)
+# is what counts: a Demonic winner steals the prized treasure of the loser, and every winner
+# has a DROP_CHANCE of finding a random new treasure. FALLBACK_TREASURE is only what the
+# stories call the belongings of someone who owns nothing; it is not in the inventory.
+# ---------------------------------------------------------------------------
+DROP_CHANCE = 0.05
+FALLBACK_TREASURE = "a plain wooden token"
+INVENTORY_HISTORY_LIMIT = 25
+ALL_TREASURES = [TREASURES_LOW, TREASURES_MID, TREASURES_HIGH]
+
+
+def treasure_rank(item):
+    """0 for a low treasure, 1 for a middle one, 2 for a high one."""
+    for rank in (2, 1, 0):
+        if item in ALL_TREASURES[rank]:
+            return rank
+    return 0
+
+
+def prized_treasure(items):
+    """The best treasure in a list (the earliest one among equals), or None if it is empty.
+    It is the treasure the stories talk about, and the one a Demonic winner steals."""
+    best = None
+    for item in items:
+        if best is None or treasure_rank(item) > treasure_rank(best):
+            best = item
+    return best
+
+
+def treasures_of(c):
+    """What a cultivator owns, as a list (older cultivator dicts only have one 'treasure')."""
+    return list(c["treasures"]) if "treasures" in c else [c["treasure"]]
+
+
+def describe_treasures(items):
+    """'a jade slip, a tripod furnace (x2)': duplicates are counted instead of repeated."""
+    counts = {}
+    for item in items:
+        counts[item] = counts.get(item, 0) + 1
+    return ", ".join(f"{k} (x{v})" if v > 1 else k for k, v in counts.items())
+
 
 # ---------------------------------------------------------------------------
 # Battle arsenal. Besides the unique signature technique (named after the most played game),
@@ -818,6 +875,66 @@ def load_profile_cache(steamid):
 
 def save_profile_cache(pc):
     return store_json(profile_cache_path(pc["steamid"]), pc)
+
+
+def inventory_valid(inv):
+    return (isinstance(inv, dict) and isinstance(inv.get("treasures"), list)
+            and all(isinstance(t, str) for t in inv["treasures"])
+            and isinstance(inv.get("history"), list))
+
+
+def read_inventory(steamid):
+    """(treasures, history) saved for this profile, or None if it has no inventory yet."""
+    inv = load_profile_cache(steamid).get("inventory")
+    if not inventory_valid(inv):
+        return None
+    return list(inv["treasures"]), [e for e in inv["history"] if isinstance(e, dict)]
+
+
+def write_inventory(steamid, treasures, events=()):
+    """Saves the treasures and adds events ({'at','type','item','other'}) to the history.
+    Lives next to the cached Steam data, but it is not part of it: 'refresh' and the refresh
+    times never touch it."""
+    pc = load_profile_cache(steamid)
+    inv = pc.get("inventory")
+    if not inventory_valid(inv):
+        inv = {"treasures": [], "history": []}
+    inv["treasures"] = list(treasures)
+    inv["history"] = (inv["history"] + list(events))[-INVENTORY_HISTORY_LIMIT:]
+    pc["inventory"] = inv
+    return save_profile_cache(pc)
+
+
+def read_duel_rep(steamid):
+    """(points, history) of the fame or shame this profile won in duels; (0, []) if none."""
+    d = load_profile_cache(steamid).get("duel_reputation")
+    if (isinstance(d, dict) and isinstance(d.get("points"), int) and not isinstance(d["points"], bool)
+            and isinstance(d.get("history"), list)):
+        return d["points"], [e for e in d["history"] if isinstance(e, dict)]
+    return 0, []
+
+
+def write_duel_rep(steamid, points, event=None):
+    """Saves the duel reputation points and adds an event to the history."""
+    pc = load_profile_cache(steamid)
+    _, history = read_duel_rep(steamid)
+    pc["duel_reputation"] = {"points": int(points),
+                             "history": (history + ([event] if event else []))[-INVENTORY_HISTORY_LIMIT:]}
+    return save_profile_cache(pc)
+
+
+def describe_event(e):
+    """One line about an inventory event, for the card."""
+    when = stamp(e["at"])[:10] if isinstance(e.get("at"), (int, float)) else "?"
+    who, item = e.get("other") or "someone", e.get("item", "a treasure")
+    kind = e.get("type")
+    if kind == "robbed":
+        return f"robbed of {item} by {who} ({when})"
+    if kind == "stole":
+        return f"took {item} from {who} ({when})"
+    if kind == "found":
+        return f"found {item} after a duel ({when})"
+    return f"{kind} ({when})"
 
 
 def section_fresh(pc, name, now):
@@ -1394,7 +1511,7 @@ def reputation_rank(points):
     return idx
 
 
-def roll_reputation(steamid, info, personalities, path=None):
+def roll_reputation(steamid, info, personalities, path=None, duel_points=0):
     """Badges give the base reputation; personalities and the path add to it. A
     personality with a rep_chance below 1.0 rolls for its points; the roll comes from the
     SteamID, and every group in the table draws in a fixed order, so results never shift."""
@@ -1406,9 +1523,13 @@ def roll_reputation(steamid, info, personalities, path=None):
                if p["rep"] and rolls[p.get("roll_group", p["name"])] < p["rep_chance"]]
     if path and path["rep"]:
         bonuses.append((f"{path['name']} Path", path["rep"]))
-    points = max(0, badge_points + sum(amount for _, amount in bonuses))
+    base_points = max(0, badge_points + sum(amount for _, amount in bonuses))
+    if duel_points:                      # fame or shame won in duels (saved in the profile's file)
+        bonuses.append(("Duels", duel_points))
+    points = max(0, base_points + duel_points)
     idx = reputation_rank(points)
     return {"points": points, "badge_points": badge_points, "bonuses": bonuses,
+            "base_points": base_points, "duel_points": duel_points,
             "rank_index": idx, "rank": REPUTATION_RANKS[idx][1]}
 
 
@@ -1512,7 +1633,7 @@ def describe_death(c, info, friend):
     return label, pool[d["scene"] % len(pool)].format(**fmt)
 
 
-def generate_cultivator(info, steamid, friend_ids=None):
+def generate_cultivator(info, steamid, friend_ids=None, inventory=None, duel_points=0):
     rng = random.Random(int(steamid))  # same profile -> same cultivator
     talent = roll_talent(steamid)      # rolled first: it changes both power and death risk
     personalities = get_personalities(info, len(friend_ids or []))   # second: same reason
@@ -1532,7 +1653,9 @@ def generate_cultivator(info, steamid, friend_ids=None):
     sect = f"{rng.choice(SECT_ADJ)} {rng.choice(SECT_NOUN)}"
     title = rng.choice(titles)
     element = rng.choice(ELEMENTS)
-    treasure = rng.choice(treasures)
+    treasure = rng.choice(treasures)    # the treasure they start with
+    owned = list(inventory) if inventory is not None else [treasure]   # what they own now
+    main_treasure = prized_treasure(owned) or FALLBACK_TREASURE
 
     game = info["top_game"] or "the Void"
     technique = f"{rng.choice(MOVE_ADJ)} {game} {rng.choice(MOVE_NOUN)}"
@@ -1544,7 +1667,7 @@ def generate_cultivator(info, steamid, friend_ids=None):
     age = cultivator_age(years, lifespan)    # None if Steam did not give the account's age
     fate = roll_fate(steamid, idx, lifespan, friend_ids or [], death_chance, age)
     age = fate["death"]["age"] if fate["death"] else age
-    reputation = roll_reputation(steamid, info, personalities, path)
+    reputation = roll_reputation(steamid, info, personalities, path, duel_points)
 
     # Sect missions: every unlocked achievement counts, and each one pays sect points
     missions = info["achievements"]
@@ -1568,13 +1691,14 @@ def generate_cultivator(info, steamid, friend_ids=None):
         personality=personality_phrase(personalities), reputation=rep_text,
         steam=info["name"], name=name, sect=sect, a_title=f"{article} {title}",
         talent=talent["blurb"], dao=dao, meditation=meditation, treasury=treasury,
-        missions=mission_text, treasure=treasure, element=element, technique=technique,
+        missions=mission_text, treasure=main_treasure, element=element, technique=technique,
         game=game, realm=realm)
 
     return {
         "name": name, "sect": sect, "title": title, "realm": realm, "realm_flavor": realm_flavor,
         "realm_index": idx, "element": element, "technique": technique, "lifespan": lifespan,
-        "lightning": lightning, "treasure": treasure, "backstory": backstory, "score": score,
+        "lightning": lightning, "treasure": main_treasure, "treasures": owned,
+        "base_treasure": treasure, "inventory_history": [], "backstory": backstory, "score": score,
         "birth_year": fate["birth_year"], "death": fate["death"], "talent": talent,
         "age": age, "account_years": years,
         "arsenal": build_arsenal(steamid, element, path["name"]),
@@ -1664,14 +1788,18 @@ def print_cultivator(c, info):
     rep = c["reputation"]
     print(f"  Reputation  : {rep['rank']} ({rep['points']:,} points)")
     if rep["bonuses"]:
-        print("  Fame boosts : " + ", ".join(f"{n} +{a}" for n, a in rep["bonuses"]))
+        print("  Fame boosts : " + ", ".join(f"{n} {a:+d}" for n, a in rep["bonuses"]))
     print(f"  Death risk  : {c['death_chance'] * 100:g}%")
     print(f"  Affinity    : {c['element']}")
     print(f"  Matchups    : strong vs {', '.join(ELEMENT_BEATS.get(c['element'], []))}; "
           f"weak vs {', '.join(element_weak_to(c['element']))}")
     print(f"  Signature   : {c['technique']}")
     wrap_field("Arsenal", arsenal_text(c))
-    print(f"  Treasure    : {c['treasure']}")
+    owned = treasures_of(c)
+    wrap_field("Treasures", describe_treasures(owned) if owned else "none (robbed of everything)")
+    events = [e for e in c.get("inventory_history", []) if e.get("type") != "start"]
+    if events:
+        wrap_words("  Recent      : ", describe_event(events[-1]))
     if info["achievements_hidden"]:
         print("  Missions    : 0 (Steam is hiding your achievements)")
     else:
@@ -1727,6 +1855,17 @@ def print_items(head, items, width=64):
             print(line.rstrip())
             line = pad
         line += piece + " "
+    print(line.rstrip())
+
+
+def wrap_words(head, text, width=64):
+    """Word-wraps text after a label, lining the continuation lines up under the text."""
+    pad, line = " " * len(head), head
+    for word in text.split():
+        if len(line) + len(word) > width and line.strip() != head.strip():
+            print(line.rstrip())
+            line = pad
+        line += word + " "
     print(line.rstrip())
 
 
@@ -1884,7 +2023,7 @@ BATTLE_TURNS = {
 BATTLE_ENDINGS = {
     ("Righteous", "Righteous"): [
         "{w} stepped back and offered {l} a healing pill. 'You fought well,' {w} said, and "
-        "neither of them ever mentioned {l_treasure} again.",
+        "neither of them ever mentioned the stakes of the duel again.",
         "{l} yielded with a bow, and {w} returned it. Word of the duel spread through the "
         "{w_sect}, and everyone agreed it had been an honorable one.",
         "Afterwards the two sat down to share a pot of spirit tea, arguing happily about who "
@@ -1893,27 +2032,191 @@ BATTLE_ENDINGS = {
     ("Righteous", "Demonic"): [
         "{w} sealed {l}'s Qi with a talisman and carried {l} off to the {w_sect} for judgment, "
         "as the Righteous Path demanded.",
-        "Ignoring {l}'s pleas, {w} shattered {l_treasure} and warned {l} never to return.",
+        "Ignoring {l}'s pleas, {w} sealed {l}'s Qi and warned {l} never to return.",
         "{w} broke {l}'s demonic cultivation with a single palm. 'Walk a better road,' {w} "
         "said, and left.",
     ],
     ("Demonic", "Righteous"): [
-        "{w} smiled coldly, plucked {l_treasure} from the dust, and left {l} to crawl home with "
-        "a broken pride.",
-        "Showing no mercy, {w} drained the last of {l}'s Qi and strolled away with "
-        "{l_treasure}, humming a cheerful tune.",
-        "{l} spoke of honor and mercy. {w} laughed, took {l_treasure} as the price of the "
-        "lesson, and vanished into the night.",
+        "{w} smiled coldly and left {l} to crawl home with a broken pride.",
+        "Showing no mercy, {w} drained the last of {l}'s Qi and strolled away, humming a "
+        "cheerful tune.",
+        "{l} spoke of honor and mercy. {w} laughed and vanished into the night.",
     ],
     ("Demonic", "Demonic"): [
         "{w} finished the duel with a flick of the wrist. By morning the {l_sect} was missing "
-        "one cultivator, and {w} was wearing {l_treasure}.",
-        "{w} wiped a drop of blood from a thumb, claimed {l_treasure}, and left {l} as a "
-        "warning to every other demonic cultivator in the region.",
-        "{l} begged for mercy. {w} considered it, took {l_treasure} as the price, and let {l} "
-        "live, for the moment.",
+        "one cultivator, and {w} was in a very good mood.",
+        "{w} wiped a drop of blood from a thumb and left {l} as a warning to every other "
+        "demonic cultivator in the region.",
+        "{l} begged for mercy. {w} considered it, and let {l} live, for the moment.",
     ],
 }
+
+# After a duel won by a Demonic cultivator: the winner steals the loser's prized treasure,
+# or finds there is nothing to steal. Placeholders: {w} {l} {stolen}
+BATTLE_LOOT = [
+    "{w} did not leave empty-handed: {stolen} was torn from {l}'s belt and vanished into "
+    "{w}'s sleeve.",
+    "Before {l} could rise, {w} had already taken {stolen}, the treasure {l} valued most.",
+    "{w} claimed {stolen} as the price of victory, and {l} could only watch it go.",
+    "With a cold smile, {w} pocketed {stolen}. It was, after all, what Demonic cultivators "
+    "do.",
+]
+BATTLE_NO_LOOT = [
+    "{w} searched {l} from head to toe for treasure, but {l} owned nothing worth taking. "
+    "{w} left in a worse mood than before.",
+    "'Where is your treasure?' {w} demanded. {l} turned out two empty pockets. There was "
+    "nothing to steal, which only made {w} angrier.",
+    "{w} reached for {l}'s treasure and grasped at air. {l} had nothing of value left, and "
+    "even {w} felt a little embarrassed.",
+]
+# A lucky find for the winner (DROP_CHANCE). Placeholders: {w} {found}
+BATTLE_FINDS = [
+    "As {w} left the battlefield, something glittered in the rubble: {found}. Fortune "
+    "favors the victor.",
+    "Heaven rewarded the winner. In a crack in the ground, {w} discovered {found}.",
+    "Walking away, {w} stumbled over {found}, half buried in the dust. A lucky find.",
+]
+
+
+def resolve_loot(w, l, rng=random):
+    """What the winner w takes or finds after beating l. Returns {'stolen': treasure or None,
+    'nothing': True if a Demonic winner had nothing to steal, 'found': treasure or None}.
+    A Demonic winner steals the loser's prized treasure; any winner has a DROP_CHANCE of
+    finding a random treasure that suits their realm and that they do not own yet."""
+    loot = {"stolen": None, "nothing": False, "found": None}
+    if w["path"]["name"] == "Demonic":
+        prize = prized_treasure(treasures_of(l))
+        if prize:
+            loot["stolen"] = prize
+        else:
+            loot["nothing"] = True
+    if rng.random() < DROP_CHANCE:
+        owned = treasures_of(w) + ([loot["stolen"]] if loot["stolen"] else [])
+        tier = 0 if w["realm_index"] <= 2 else 1 if w["realm_index"] <= 6 else 2
+        pool = [t for t in ALL_TREASURES[tier] if t not in owned] or \
+               [t for pool_ in ALL_TREASURES for t in pool_ if t not in owned]
+        if pool:
+            loot["found"] = rng.choice(pool)
+    return loot
+
+
+# ---------------------------------------------------------------------------
+# Reputation from duels. Only the realm decides. If the winner is in a LOWER realm than the
+# loser, the winner gains REP_GAIN_PER_REALM for every realm of difference and the loser
+# loses REP_LOSS_PER_REALM for every realm. If both are on the same realm, or the stronger
+# realm won as expected, nothing changes. When both cultivators are Righteous the loser loses
+# only REP_LOSS_RIGHTEOUS_FACTOR of that (the righteous forgive more easily); Righteous vs
+# Demonic and Demonic vs Demonic cost the full amount. Reputation never goes below 0.
+# ---------------------------------------------------------------------------
+REP_GAIN_PER_REALM = 25
+REP_LOSS_PER_REALM = 20
+REP_LOSS_RIGHTEOUS_FACTOR = 0.5
+
+# Placeholders: {w} {l} {w_realm} {l_realm} {l_sect}
+BATTLE_REP_GAIN = [
+    "News that {w}, a mere {w_realm} cultivator, had beaten a master of {l_realm} spread "
+    "across the region by nightfall.",
+    "Everyone who saw it would remember the day {w} of {w_realm} brought down a cultivator "
+    "of {l_realm}.",
+    "From that day on, the tea houses told of how {w} of {w_realm} humbled a {l_realm} "
+    "expert.",
+]
+BATTLE_REP_LOSS_HEAVY = [
+    "For {l}, a cultivator of {l_realm}, losing to someone of {w_realm} was a disgrace that "
+    "no excuse could soften.",
+    "The {l_sect} whispered about it for months: a {l_realm} expert, beaten by a {w_realm} "
+    "cultivator.",
+    "From then on {l}'s name was spoken with a sneer, for a {l_realm} cultivator had fallen "
+    "to {w_realm}.",
+]
+BATTLE_REP_LOSS_LIGHT = [
+    "Among the righteous such a defeat was forgiven quickly, though {l} still felt the sting "
+    "of losing to someone of a lower realm.",
+    "{l} accepted the loss with grace, and the righteous elders only shook their heads "
+    "kindly.",
+]
+
+
+def reputation_change(w, l):
+    """What a duel does to the two reputations: {'kind': 'upset' | 'same' | 'expected',
+    'gap': realms of difference, 'gain': for the winner, 'loss': for the loser, 'light':
+    True if the loss is the lighter Righteous-vs-Righteous one}."""
+    gap = l["realm_index"] - w["realm_index"]
+    if gap == 0:
+        return {"kind": "same", "gap": 0, "gain": 0, "loss": 0, "light": False}
+    if gap < 0:
+        return {"kind": "expected", "gap": gap, "gain": 0, "loss": 0, "light": False}
+    light = w["path"]["name"] == "Righteous" and l["path"]["name"] == "Righteous"
+    loss = round(gap * REP_LOSS_PER_REALM * (REP_LOSS_RIGHTEOUS_FACTOR if light else 1))
+    return {"kind": "upset", "gap": gap, "gain": gap * REP_GAIN_PER_REALM, "loss": loss,
+            "light": light}
+
+
+def with_duel_points(rep, duel_points):
+    """A reputation dict with the duel points changed: new points, rank and Duels entry."""
+    base = rep.get("base_points", rep["points"] - rep.get("duel_points", 0))
+    bonuses = [(n, amount) for n, amount in rep["bonuses"] if n != "Duels"]
+    if duel_points:
+        bonuses.append(("Duels", duel_points))
+    points = max(0, base + duel_points)
+    idx = reputation_rank(points)
+    return dict(rep, points=points, base_points=base, duel_points=duel_points, bonuses=bonuses,
+                rank_index=idx, rank=REPUTATION_RANKS[idx][1])
+
+
+def apply_reputation(ids, a, b, result, change):
+    """Saves the reputation won and lost in the two profiles' files and updates the two
+    cultivators. Fills change with what really happened (change['w_rank'], ['l_rank'] as
+    (before, after), and the actual 'gain' and 'loss': the loss stops at 0 reputation)."""
+    if change["kind"] != "upset":
+        return
+    w, l = result["winner"], result["loser"]
+    w_id, l_id = (ids[0], ids[1]) if w is a else (ids[1], ids[0])
+    now = time.time()
+    for c, cid, delta, other, won in ((w, w_id, change["gain"], l, True),
+                                      (l, l_id, -change["loss"], w, False)):
+        rep = c["reputation"]
+        old = read_duel_rep(cid)[0]
+        base = rep.get("base_points", rep["points"] - rep.get("duel_points", 0))
+        new = max(-base, old + delta)                    # never below 0 reputation in total
+        write_duel_rep(cid, new, {"at": now, "points": new - old, "won": won, "other": other["name"],
+                                  "realm": c["realm"], "other_realm": other["realm"]})
+        before = rep["rank"]
+        c["reputation"] = with_duel_points(rep, new)
+        change["w_rank" if won else "l_rank"] = (before, c["reputation"]["rank"])
+        change["gain" if won else "loss"] = abs(new - old)
+        RUN_LOG.note(f"reputation: {c['name']} ({cid}) {new - old:+d} for the duel against "
+                     f"{other['name']} ({c['realm']} vs {other['realm']}), now {c['reputation']['points']}")
+
+
+def apply_loot(ids, a, b, result, loot):
+    """Saves what changed hands in the two profiles' inventory files and updates the two
+    cultivators to match. ids are the SteamIDs of a and b."""
+    if not (loot["stolen"] or loot["found"]):
+        return
+    w, l = result["winner"], result["loser"]
+    w_id, l_id = (ids[0], ids[1]) if w is a else (ids[1], ids[0])
+    now = time.time()
+    w_items, l_items = treasures_of(w), treasures_of(l)
+    w_events, l_events = [], []
+    if loot["stolen"]:
+        l_items.remove(loot["stolen"])
+        w_items.append(loot["stolen"])
+        w_events.append({"at": now, "type": "stole", "item": loot["stolen"], "other": l["name"]})
+        l_events.append({"at": now, "type": "robbed", "item": loot["stolen"], "other": w["name"]})
+        write_inventory(l_id, l_items, l_events)
+    if loot["found"]:
+        w_items.append(loot["found"])
+        w_events.append({"at": now, "type": "found", "item": loot["found"], "other": None})
+    write_inventory(w_id, w_items, w_events)
+    for c, items, events in ((w, w_items, w_events), (l, l_items, l_events)):
+        c["treasures"] = items
+        c["treasure"] = prized_treasure(items) or FALLBACK_TREASURE
+        c["inventory_history"] = c.get("inventory_history", []) + events
+    if loot["stolen"]:
+        RUN_LOG.note(f"loot: {w['name']} ({w_id}) stole {loot['stolen']} from {l['name']} ({l_id})")
+    if loot["found"]:
+        RUN_LOG.note(f"loot: {w['name']} ({w_id}) found {loot['found']} (the {DROP_CHANCE:.0%} drop)")
 
 
 # ---------------------------------------------------------------------------
@@ -2112,7 +2415,7 @@ def move_fields(tag, c):
             f"{tag}_path": a["path_attack"], f"{tag}_def": a["defense"]}
 
 
-def battle_story(a, b, result):
+def battle_story(a, b, result, loot=None, change=None):
     """A short story of the duel. The winner is fixed by fight(); the telling is random,
     so asking again gives the same result told in a different way."""
     x, y = a, b
@@ -2123,6 +2426,8 @@ def battle_story(a, b, result):
     edge = element_edge(a["element"], b["element"])
     adv, dis = (a, b) if edge > 0 else (b, a)            # only used when edge != 0
     big_gap = tier in ("large", "vast")
+    loot = loot or {}
+    change = change or {"kind": "same"}
     fmt = dict(
         x=x["name"], y=y["name"], x_sect=x["sect"], y_sect=y["sect"],
         x_tech=x["technique"], y_tech=y["technique"], x_elem=x["element"], y_elem=y["element"],
@@ -2134,7 +2439,9 @@ def battle_story(a, b, result):
         gap="" if big_gap else realm_gap_text(w, l),
         strong=strong["name"], weak=weak["name"],
         strong_power=f"{strong['score']:,.0f}", weak_power=f"{weak['score']:,.0f}",
-        adv=adv["name"], dis=dis["name"], adv_elem=adv["element"], dis_elem=dis["element"])
+        adv=adv["name"], dis=dis["name"], adv_elem=adv["element"], dis_elem=dis["element"],
+        stolen=loot.get("stolen") or "", found=loot.get("found") or "",
+        w_realm=w["realm"], l_realm=l["realm"])
     parts = [random.choice(BATTLE_OPENINGS[(x["path"]["name"], y["path"]["name"])])]
     if tier:                                             # the stronger fighter shows off
         parts.append(random.choice(BATTLE_GAP_SETUPS[tier]))
@@ -2146,15 +2453,24 @@ def battle_story(a, b, result):
         parts.append(random.choice(BATTLE_ELEMENT_LINES))
     parts.append(random.choice(BATTLE_TURNS[kind]))
     parts.append(random.choice(BATTLE_ENDINGS[(w["path"]["name"], l["path"]["name"])]))
+    if loot.get("stolen"):                               # a Demonic winner takes the treasure...
+        parts.append(random.choice(BATTLE_LOOT))
+    elif loot.get("nothing"):                            # ...or finds there is none
+        parts.append(random.choice(BATTLE_NO_LOOT))
     if big_gap:                                          # arrogance paid off, or did not
         parts.append(random.choice(BATTLE_GAP_AFTERMATH[(tier, w is strong)]))
+    if loot.get("found"):                                # a lucky find after the fight
+        parts.append(random.choice(BATTLE_FINDS))
+    if change["kind"] == "upset":                        # a weaker realm won: fame and shame
+        parts.append(random.choice(BATTLE_REP_GAIN))
+        parts.append(random.choice(BATTLE_REP_LOSS_LIGHT if change["light"] else BATTLE_REP_LOSS_HEAVY))
     text = " ".join(p.format(**fmt) for p in parts)
     if w["personalities"]:
         text += f" As ever, {w['name']} {random.choice(w['personalities'])['trait']}."
     return text
 
 
-def print_battle(a, b, info_a, info_b, result, story):
+def print_battle(a, b, info_a, info_b, result, story, loot=None, change=None):
     line = "=" * 64
     print("\n" + line)
     print("  MOCB  -  Clash of Cultivators")
@@ -2204,6 +2520,33 @@ def print_battle(a, b, info_a, info_b, result, story):
                    f"({result['p_winner'] * 100:.1f}% chance) and wins the duel.")
     else:
         wrap_print(f"Result : {winner['name']} wins the duel.")
+    if loot:
+        loser = result["loser"]
+        if loot["stolen"]:
+            wrap_print(f"Loot : {winner['name']} stole {loot['stolen']} from {loser['name']}.")
+        elif loot["nothing"]:
+            wrap_print(f"Loot : {winner['name']} tried to rob {loser['name']}, but there was "
+                       f"no treasure to steal.")
+        if loot["found"]:
+            wrap_print(f"Lucky find : {winner['name']} found {loot['found']}.")
+        if loot["stolen"] or loot["found"]:
+            wrap_print(f"Treasures : {a['name']} now owns {len(treasures_of(a))}, "
+                       f"{b['name']} now owns {len(treasures_of(b))}.")
+    if change:
+        w, l = winner, result["loser"]
+        if change["kind"] == "upset":
+            def rank(side, who):          # 'Familiar Face -> Sect Favorite' (or just the rank)
+                before, after = change.get(side, (who["reputation"]["rank"],) * 2)
+                return before if before == after else f"{before} -> {after}"
+            lost = (f"-{change['loss']} ({rank('l_rank', l)})" if change["loss"]
+                    else "has no reputation left to lose")
+            wrap_print(f"Reputation : {w['name']} ({w['realm']}) +{change['gain']} "
+                       f"({rank('w_rank', w)}); {l['name']} ({l['realm']}) {lost}"
+                       f"{', a lighter blow among the righteous' if change['light'] else ''}.")
+        elif change["kind"] == "same":
+            wrap_print("Reputation : same realm, so nobody gains or loses reputation.")
+        else:
+            wrap_print("Reputation : the stronger realm won as expected, so nothing changes.")
     print(line + "\n")
 
 
@@ -2222,7 +2565,17 @@ def build_cultivator(steamid, key, profiles, refresh=False):
     """Returns (info, friend_ids, friends_note, cultivator) for one profile."""
     info = get_info(steamid, key, profiles, refresh)
     friend_ids, note = get_friends(steamid, key, refresh)
-    cultivator = generate_cultivator(info, steamid, friend_ids)
+    saved = read_inventory(steamid)          # None on the very first load of this profile
+    duel_points, _ = read_duel_rep(steamid)
+    cultivator = generate_cultivator(info, steamid, friend_ids,
+                                     inventory=saved[0] if saved else None,
+                                     duel_points=duel_points)
+    if saved is None:                        # first load: the starting treasure becomes the inventory
+        start = {"at": time.time(), "type": "start", "item": cultivator["base_treasure"],
+                 "other": None}
+        write_inventory(steamid, cultivator["treasures"], [start])
+        saved = (cultivator["treasures"], [start])
+    cultivator["inventory_history"] = saved[1]
     RUN_LOG.note(f"{len(friend_ids)} friends{' (' + note + ')' if note else ''}; cultivator "
                  f"{cultivator['name']}, {cultivator['realm']}, age {cultivator['age']}, "
                  f"{'died' if cultivator['death'] else 'alive'}")
@@ -2245,8 +2598,18 @@ def run_battle(args, key, profiles):
     if ids[0] == ids[1]:
         raise SteamError("Pick two different profiles: a cultivator cannot duel themselves.")
     (info_a, _, _, a), (info_b, _, _, b) = [build_cultivator(i, key, profiles) for i in ids]
+    dead = [(c, inf) for c, inf in ((a, info_a), (b, info_b)) if c["death"]]
+    if dead:                                             # the dead cannot duel
+        who = "; ".join(f"{c['name']} (Steam: {inf['name']}) died in Year {c['death']['year']} "
+                        f"of the Heavenly Calendar, aged {c['death']['age']:,}" for c, inf in dead)
+        raise SteamError(f"{who}. The dead cannot duel, so there is no duel.")
     result = fight(a, b, ids[0], ids[1])
-    print_battle(a, b, info_a, info_b, result, battle_story(a, b, result))
+    loot = resolve_loot(result["winner"], result["loser"])
+    change = reputation_change(result["winner"], result["loser"])
+    story = battle_story(a, b, result, loot, change)
+    apply_loot(ids, a, b, result, loot)                  # written to the inventory files
+    apply_reputation(ids, a, b, result, change)          # ...and the reputation points
+    print_battle(a, b, info_a, info_b, result, story, loot, change)
 
 
 # ---------------------------------------------------------------------------
