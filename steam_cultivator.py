@@ -43,7 +43,7 @@ is not asked about any more, and the log says which games failed and which were 
 up. "refresh <profile>" tries them again.
 Treasures are an inventory saved in the profile's JSON file in the "cache" folder
 (cache/<SteamID>.profile.json). A new profile starts with the one treasure its SteamID
-gives it. In a duel, a Demonic winner steals the loser's prized (best) treasure, which is
+gives it. In a duel, a Demonic winner has a 25% chance to steal the loser's prized (best) treasure, which is
 removed from the loser's file and added to the winner's; if the loser owns nothing, the
 story says so. Every winner also has a 5% chance of finding a random new treasure. The
 changes show on the next profile load. "refresh" never touches the inventory, but deleting
@@ -60,6 +60,9 @@ weapons, treasures and the Spatial Escape Talisman cost sect points and are save
 cultivator's JSON file. A talisman stops one Demonic theft, then is used up. The dead cannot
 shop, and "pavilion" is refused until a cultivator has been looked up. Reputation ranks
 now rise gradually: the first ranks come quickly, the later ones need far more points.
+Level, paid games, hours in the top game and badges are remembered at their highest ever in
+the profile's JSON file: a dip in Steam's data or a refresh never takes power or reputation
+away, and only genuinely new levels, games, hours or badges add to it.
 Your Steam badges build your reputation, from "Unknown Nobody" up to "Universal
 Legend". Personalities, earned from your friends, badges, achievements and games,
 add reputation (some only by chance) and a few also change power and death risk,
@@ -266,6 +269,26 @@ SECT_NOUN = ["Cloud Sect", "Sword Pavilion", "Lotus Temple", "Dao Palace", "Thun
 TITLES_LOW = ["Outer Disciple", "Wandering Rogue", "Herb Gatherer", "Gate Sweeper", "Spirit Stone Beggar"]
 TITLES_MID = ["Inner Disciple", "Elder", "Alchemist", "Sword Cultivator", "Array Master"]
 TITLES_HIGH = ["Sect Master", "Ancestor", "Supreme Elder", "Sovereign", "Dao Lord"]
+# More titles. The first lists above are what the main random generator always drew from;
+# the pick from the complete lists (TITLES_*_ALL) uses its own generator seeded by the
+# SteamID, so every other trait of a cultivator stays exactly as it was.
+TITLES_LOW_MORE = ["Errand Runner", "Stable Keeper", "Spirit Beast Feeder", "Scripture Copier",
+                   "Lantern Lighter", "Kitchen Hand of the Sect", "Mortal Turned Cultivator",
+                   "Alley Pill Peddler", "Rain-Soaked Wanderer", "Tea House Apprentice",
+                   "Pagoda Guard", "Broken Sword Collector", "Failed Alchemy Assistant",
+                   "Mountain Path Sweeper"]
+TITLES_MID_MORE = ["Core Disciple", "Formation Instructor", "Pill Refiner", "Talisman Master",
+                   "Arena Champion", "Law Enforcement Elder", "Beast Tamer", "Blade Saint",
+                   "Sect Treasurer", "Thunder Tribulation Survivor", "Spirit Vein Warden",
+                   "Mountain-Splitting Swordsman", "Phoenix Flame Refiner", "Sect Envoy",
+                   "Ghost Market Broker"]
+TITLES_HIGH_MORE = ["Heavenly Sovereign", "Patriarch", "Grand Elder", "Immortal Emperor",
+                    "Void Monarch", "Lord of Ten Thousand Peaks", "Great Dao Ancestor",
+                    "Heaven-Piercing Sage", "Overlord of the Nine Provinces",
+                    "Star-River Ancestor", "Keeper of the Heavenly Gate", "Lord of the Endless Sea",
+                    "Eternal Sword Immortal", "Throne of the Ten Thousand Dao"]
+TITLES_ALL = [TITLES_LOW + TITLES_LOW_MORE, TITLES_MID + TITLES_MID_MORE,
+              TITLES_HIGH + TITLES_HIGH_MORE]
 ELEMENTS = ["Fire", "Water", "Wood", "Metal", "Earth", "Lightning", "Wind", "Ice", "Shadow"]
 MOVE_NOUN = ["Palm", "Fist", "Sword Art", "Finger", "Heavenly Scripture", "Divine Step",
              "Annihilation Technique", "Soul Seal", "Dao Formation", "Pill Formula"]
@@ -286,9 +309,30 @@ TREASURES_HIGH = ["a Heaven-Grade artifact", "a fragment of the Primordial Chaos
 # stories call the belongings of someone who owns nothing; it is not in the inventory.
 # ---------------------------------------------------------------------------
 DROP_CHANCE = 0.05
+STEAL_CHANCE = 0.25      # a Demonic winner steals the loser's prized treasure in 1 duel out of 4
 FALLBACK_TREASURE = "a plain wooden token"
 INVENTORY_HISTORY_LIMIT = 25
-ALL_TREASURES = [TREASURES_LOW, TREASURES_MID, TREASURES_HIGH]
+TREASURES_LOW_MORE = ["a chipped jade bracelet", "a bamboo flute that hums by itself",
+                      "a bag of slightly damp spirit grass", "a rooster-shaped copper talisman",
+                      "a nameless beggar's bowl", "a bent ironwood hairpin",
+                      "a cracked turtle-shell divination tool", "a lucky copper coin with a hole",
+                      "a wooden sword carved by a childhood friend", "a map to a sect long forgotten",
+                      "a spirit-grass pouch that never fully empties"]
+TREASURES_MID_MORE = ["a thousand-year ginseng root", "a mirror that shows a person's past life",
+                      "a seven-star formation flag", "a blood-jade prayer bead",
+                      "a bronze mask of the Nine Hells", "a cauldron that never cools",
+                      "a lantern that burns the soul-light of the dead", "a jade token of a fallen sect",
+                      "a pair of boots that walk a thousand li a day", "a bottle of ten-year thunder dew",
+                      "a puppet carved from lightning-struck wood"]
+TREASURES_HIGH_MORE = ["the Nine-Dragon Imperial Seal", "a pearl from the Eastern Sea Dragon King",
+                       "a scroll written by the first Dao Ancestor",
+                       "the last drop of the Primordial Spring", "a banner that commands ten "
+                       "thousand ghosts", "a sliver of the Heaven-Splitting Sword",
+                       "a seed of the World Tree", "the crown of a forgotten celestial emperor",
+                       "a sealed demon-king's eye", "a star map that rewrites itself",
+                       "the bell that tolled at the birth of the first Dao"]
+ALL_TREASURES = [TREASURES_LOW + TREASURES_LOW_MORE, TREASURES_MID + TREASURES_MID_MORE,
+                 TREASURES_HIGH + TREASURES_HIGH_MORE]
 
 
 def treasure_rank(item):
@@ -981,27 +1025,87 @@ def write_inventory(steamid, treasures, events=()):
 
 
 def read_pavilion(steamid):
-    """{'items': {id: count}, 'spent': sect points spent, 'history': [...]} saved for this
-    profile; all empty if nothing was ever bought here (or the saved data is damaged)."""
+    """{'items': {id: count}, 'spent': sect points spent, 'earned': the most sect points ever
+    credited, 'history': [...]} saved for this profile; all empty if nothing was ever bought
+    here (or the saved data is damaged)."""
     d = load_profile_cache(steamid).get("pavilion")
-    empty = {"items": {}, "spent": 0, "history": []}
+    empty = {"items": {}, "spent": 0, "earned": 0, "history": []}
     def whole(v, low):
         return isinstance(v, int) and not isinstance(v, bool) and v >= low
     if (isinstance(d, dict) and whole(d.get("spent"), 0) and isinstance(d.get("items"), dict)
             and all(isinstance(k, str) and whole(v, 1) for k, v in d["items"].items())
             and isinstance(d.get("history"), list)):
         return {"items": dict(d["items"]), "spent": d["spent"],
+                "earned": d["earned"] if whole(d.get("earned"), 0) else 0,
                 "history": [e for e in d["history"] if isinstance(e, dict)]}
     return empty
 
 
-def write_pavilion(steamid, items, spent, event=None):
-    """Saves the goods bought in the pavilion and the sect points spent on them."""
+def write_pavilion(steamid, items, spent, event=None, earned=None):
+    """Saves the goods bought in the pavilion and the sect points spent on them. 'earned' is
+    the most sect points ever credited from achievements; left out, the saved one is kept."""
     pc = load_profile_cache(steamid)
-    history = read_pavilion(steamid)["history"] + ([event] if event else [])
+    old = read_pavilion(steamid)
+    history = old["history"] + ([event] if event else [])
     pc["pavilion"] = {"items": {k: v for k, v in items.items() if v > 0}, "spent": int(spent),
+                      "earned": int(old["earned"] if earned is None else earned),
                       "history": history[-INVENTORY_HISTORY_LIMIT:]}
     return save_profile_cache(pc)
+
+
+# Steam numbers that only ever go up. The level, paid games, hours in the top game and badges a
+# profile has ever shown are remembered in its file (key "peaks"). Later lookups use the higher of
+# the saved and the current number, so a dip in Steam's data (hidden badges, a refunded game, a
+# glitchy answer) or a refresh can never take power or reputation away: only genuinely new
+# levels, games, hours and badges add to it.
+PEAK_FIELDS = ("level", "game_count", "top_hours", "badges")
+
+
+def read_peaks(steamid):
+    d = load_profile_cache(steamid).get("peaks")
+    if not isinstance(d, dict):
+        return {}
+    good = {}
+    for f in PEAK_FIELDS:
+        v = d.get(f)
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0:
+            good[f] = v
+    if isinstance(d.get("top_game"), str):
+        good["top_game"] = d["top_game"]
+    return good
+
+
+def apply_peaks(steamid, info):
+    """Returns a copy of info where every number in PEAK_FIELDS is at least the highest ever
+    seen for this profile, and saves any new high. The Steam data cached in the profile file is
+    left as Steam reported it."""
+    saved = read_peaks(steamid)
+    new, eff, raised = dict(saved), dict(info), []
+    for f in PEAK_FIELDS:
+        cur, old = info.get(f) or 0, saved.get(f)
+        if old is not None and old > cur:
+            eff[f] = old
+            if f == "top_hours" and saved.get("top_game"):
+                eff["top_game"] = saved["top_game"]      # the hours belong to that game
+        elif old is None or cur > old:
+            new[f] = cur
+            if f == "top_hours":
+                new["top_game"] = info.get("top_game") or ""
+            if old is not None:
+                raised.append(f)
+    if eff["badges"] > 0:
+        eff["badges_hidden"] = False
+    if new != saved:
+        pc = load_profile_cache(steamid)
+        pc["peaks"] = new
+        save_profile_cache(pc)
+    if raised:
+        RUN_LOG.note(f"peaks: new highs saved for {', '.join(raised)}")
+    kept = [f for f in PEAK_FIELDS if saved.get(f) is not None and saved[f] > (info.get(f) or 0)]
+    if kept:
+        RUN_LOG.note(f"peaks: Steam now shows less {', '.join(kept)} than ever before; "
+                     f"the highest known values are kept")
+    return eff
 
 
 def read_duel_rep(steamid):
@@ -1382,6 +1486,18 @@ def lookup_game(appid, steamid, key, watch):
     return result
 
 
+# The window version of the program sets this to a function(done, total) so it can draw a
+# progress bar; the terminal version leaves it None and prints "Counting achievements...".
+PROGRESS_HOOK = None
+
+
+def report_progress(done, total):
+    if PROGRESS_HOOK is not None:
+        PROGRESS_HOOK(done, total)
+    else:
+        print(f"\r  Counting achievements... {done}/{total} games", end="", flush=True)
+
+
 def count_achievements(steamid, key, games, refresh=False):
     """Total unlocked achievements over every game you have played (free ones too), using
     the cache wherever the saved result is still valid. Returns a dict:
@@ -1424,8 +1540,7 @@ def count_achievements(steamid, key, games, refresh=False):
         try:
             for f in as_completed(futures):
                 results[str(futures[f]["appid"])] = f.result()
-                print(f"\r  Counting achievements... {len(results)}/{len(todo)} games",
-                      end="", flush=True)
+                report_progress(len(results), len(todo))
         except BaseException:
             # Interrupted (Ctrl+C): keep every game that finished, so the next run only has
             # to do the rest. last_total stays as it was, because the scan is incomplete.
@@ -1439,10 +1554,14 @@ def count_achievements(steamid, key, games, refresh=False):
             tracked = track_failures(cache, todo, results, now)
             if apply_results(cache, todo, results, now) or tracked["changed"] or dirty:
                 save_cache(cache)
-            print()
+            if PROGRESS_HOOK is None:
+                print()
             raise
         pool.shutdown()
-        print("\r" + " " * 48 + "\r", end="", flush=True)
+        if PROGRESS_HOOK is None:
+            print("\r" + " " * 48 + "\r", end="", flush=True)
+        else:
+            PROGRESS_HOOK(len(todo), len(todo))
 
     for g in todo:
         k = str(g["appid"])
@@ -1744,18 +1863,17 @@ def generate_cultivator(info, steamid, friend_ids=None, inventory=None, duel_poi
                         + path["power"])
     idx, (_, realm, realm_flavor) = get_realm(score)
 
-    if idx <= 2:
-        titles, treasures = TITLES_LOW, TREASURES_LOW
-    elif idx <= 6:
-        titles, treasures = TITLES_MID, TREASURES_MID
-    else:
-        titles, treasures = TITLES_HIGH, TREASURES_HIGH
+    tier_no = 0 if idx <= 2 else 1 if idx <= 6 else 2
+    titles, treasures = (TITLES_LOW, TITLES_MID, TITLES_HIGH)[tier_no], \
+                        (TREASURES_LOW, TREASURES_MID, TREASURES_HIGH)[tier_no]
 
     name = make_name(rng)
     sect = f"{rng.choice(SECT_ADJ)} {rng.choice(SECT_NOUN)}"
-    title = rng.choice(titles)
+    rng.choice(titles)                  # drawn exactly as before, so later draws do not move
     element = rng.choice(ELEMENTS)
-    treasure = rng.choice(treasures)    # the treasure they start with
+    rng.choice(treasures)               # (same here)
+    title = random.Random(f"title-{steamid}").choice(TITLES_ALL[tier_no])
+    treasure = random.Random(f"treasure-{steamid}").choice(ALL_TREASURES[tier_no])  # starting treasure
     owned = list(inventory) if inventory is not None else [treasure]   # what they own now
     main_treasure = prized_treasure(owned) or FALLBACK_TREASURE
 
@@ -1773,8 +1891,11 @@ def generate_cultivator(info, steamid, friend_ids=None, inventory=None, duel_poi
 
     # Sect missions: every unlocked achievement counts, and each one pays sect points
     missions = info["achievements"]
-    sect_points_earned = missions * SECT_POINTS_PER_MISSION
-    pavilion = pavilion or {"items": {}, "spent": 0, "history": []}
+    # Sect points are a ledger: what was ever credited minus what was spent. New achievements
+    # add to the balance; a lower or missing count later (Steam hiding them, a failing game)
+    # never takes credited points away, and spending is never "reset" by a new lookup.
+    pavilion = pavilion or {"items": {}, "spent": 0, "earned": 0, "history": []}
+    sect_points_earned = max(missions * SECT_POINTS_PER_MISSION, pavilion.get("earned", 0))
     sect_points = max(0, sect_points_earned - pavilion["spent"])    # what is left to spend
 
     # Backstory built from the real stats (variants and template picked from the SteamID)
@@ -2088,28 +2209,37 @@ def buy_pavilion_item(steamid, c, number):
     else:
         items[item["id"]] = items.get(item["id"], 0) + 1
     history = (pav["history"] + [event])[-INVENTORY_HISTORY_LIMIT:]
-    pc["pavilion"] = {"items": items, "spent": spent, "history": history}
+    pc["pavilion"] = {"items": items, "spent": spent, "earned": c["sect_points_earned"],
+                      "history": history}
     save_profile_cache(pc)
-    c["pavilion"] = {"items": items, "spent": spent, "history": history}
+    c["pavilion"] = dict(pc["pavilion"])
     c["sect_points"] = max(0, c["sect_points_earned"] - spent)
     RUN_LOG.note(f"pavilion: {c['name']} ({steamid}) bought {item['name']} for {item['price']} "
                  f"sect points, {c['sect_points']} left")
     return item
 
 
-def run_pavilion(args, key, profiles, session):
-    """The "pavilion" command: 'pavilion' lists the goods and asks what to buy, 'pavilion 7'
-    buys item 7 straight away."""
+def pavilion_target(key, profiles, session):
+    """The cultivator the pavilion serves: the latest one looked up, freshly loaded so the
+    current sect points are used. Returns (steamid, cultivator); raises SteamError if nobody
+    has been selected yet or the cultivator is dead."""
     steamid = session.get("latest")
     if not steamid:
         raise SteamError("No cultivator has been selected yet. Look up a Steam profile first, "
                          "then type 'pavilion' to shop for that cultivator.")
-    if len(args) > 1:
-        raise SteamError("pavilion takes one optional item number, for example: pavilion 3")
     info, _, _, c = build_cultivator(steamid, key, profiles)
     if c["death"]:
         raise SteamError(f"{c['name']} died in Year {c['death']['year']} of the Heavenly "
                          f"Calendar. The dead have no use for the Martial Pavilion.")
+    return steamid, c
+
+
+def run_pavilion(args, key, profiles, session):
+    """The "pavilion" command: 'pavilion' lists the goods and asks what to buy, 'pavilion 7'
+    buys item 7 straight away."""
+    if len(args) > 1:
+        raise SteamError("pavilion takes one optional item number, for example: pavilion 3")
+    steamid, c = pavilion_target(key, profiles, session)
     if args:
         choice = args[0]
     else:
@@ -2155,18 +2285,42 @@ BATTLE_OPENINGS = {
         "cultivator. Neither intended to hold back.",
         "Two upright cultivators, {x} and {y}, met at {place}. Bows were exchanged, then the "
         "Qi began to rise, because both were far too proud to yield.",
+        "The elders of the {x_sect} and the {y_sect} had argued for a whole season about whose "
+        "disciple was better. In the end they sent {x} and {y} to {place} to answer it.",
+        "{x} had sworn to protect the weak, and {y} had sworn the very same thing. At {place} "
+        "they discovered that a shared vow is no reason not to fight.",
+        "A crowd of junior disciples gathered at {place} to watch {x} of the {x_sect} face {y} "
+        "of the {y_sect}. Both walked the Righteous Path, and both wished to look good doing it.",
+        "It began as a polite match at {place}. By the third exchange of bows, {x} and {y} had "
+        "quietly decided that politeness was over.",
     ],
     ("Demonic", "Demonic"): [
         "At {place}, {x} and {y}, two walkers of the Demonic Path, reached for the same prize. "
         "Demonic cultivators do not share, and they certainly do not talk it over.",
         "{x} of the {x_sect} and {y} of the {y_sect} met at {place}, and the air turned bitter "
         "with killing intent. On the Demonic Path, only one of them was walking away.",
+        "Nobody at {place} dared to breathe loudly. {x} and {y}, both Demonic, had just spotted "
+        "each other across the ruins, and each one was already smiling.",
+        "{y} had stolen from {x} once, and {x} had never forgotten. When they met again at "
+        "{place}, no words were wasted, and the ground began to crack.",
+        "The {x_sect} and the {y_sect} were rivals in everything, so when {x} and {y} met at "
+        "{place}, the Demonic arts on both sides were released without a single warning.",
+        "Birds fled the sky above {place}. {x} and {y}, two cultivators who trusted nobody, had "
+        "agreed to a duel precisely because neither trusted the other to stay away.",
     ],
     ("Righteous", "Demonic"): [
         "At {place}, {x} of the {x_sect}, a champion of the Righteous Path, finally cornered "
         "{y} of the {y_sect}, whose Demonic arts had troubled the region for years.",
         "{y}, a Demonic cultivator, was trespassing near {place} when {x} of the Righteous Path "
         "appeared and demanded they leave. {y} laughed, and the sky darkened.",
+        "Villagers near {place} had begged the {x_sect} for help, and the sect had sent {x}. "
+        "{y} of the {y_sect} was waiting for them with a grin and an unfinished ritual.",
+        "{x} walked into {place} with a spotless robe and a clear conscience. {y}, wrapped in "
+        "the dark Qi of the Demonic Path, found both of those things very funny.",
+        "'The Righteous Path ends at this valley,' {y} announced from the shadows of {place}. "
+        "{x} drew a weapon and answered that it would be happy to finish the road.",
+        "Rumor said {y} of the {y_sect} was hiding at {place}. {x} of the {x_sect} came alone, "
+        "and rumor, for once, was correct.",
     ],
 }
 
@@ -2252,6 +2406,49 @@ BATTLE_TURNS = {
     ],
 }
 
+BATTLE_OPENINGS[("Righteous", "Righteous")] += [
+    "A drizzle began over {place} just as {x} of the {x_sect} bowed to {y} of the {y_sect}. "
+    "Neither asked to postpone it; both walked the Righteous Path, and both loved a good duel.",
+    "The sect rankings had listed {x} and {y} one place apart for years. At {place} they "
+    "finally agreed to settle which of them deserved the higher line.",
+    "'No killing, no crippling, no sulking afterwards,' {x} said at {place}. {y} promised, "
+    "and the first sword-light split the morning mist.",
+    "Tea was poured, cups were raised, and then {x} and {y} walked out to {place} to see "
+    "which of their masters had taught them better.",
+    "Two lanterns lit {place} that night: {x}'s from the {x_sect}, {y}'s from the {y_sect}. "
+    "By the time they burned low, the whole region would know who had won.",
+    "A wager between two sect elders had put {x} and {y} against each other at {place}. "
+    "Both disciples bore the burden of their masters' pride, and both stood straight under it.",
+]
+BATTLE_OPENINGS[("Demonic", "Demonic")] += [
+    "At {place}, {x} and {y} each arrived hours early to set traps for the other. Both traps "
+    "were found, and both cultivators were very impressed and very angry.",
+    "A blood moon rose over {place}. {x} of the {x_sect} and {y} of the {y_sect} had waited "
+    "years for this night, and neither planned to see another.",
+    "The two Demonic cultivators met at {place} and exchanged a single word of greeting, which "
+    "was a curse. After that, the fighting felt almost friendly.",
+    "Rumor said the loser at {place} would be devoured by the other's sect. {x} and {y} "
+    "found the rumor flattering and made no effort to deny it.",
+    "{x} had a bounty on {y}'s head, and {y} had one on {x}'s. At {place} they discovered "
+    "each other holding the other's wanted poster, and laughed, briefly.",
+    "Ghost fire lit {place} from every side. {x} and {y}, two cultivators with a long list "
+    "of enemies, had picked a battlefield where nobody would hear the screaming.",
+]
+BATTLE_OPENINGS[("Righteous", "Demonic")] += [
+    "The bells of the {x_sect} rang three times, and {x} rode out to {place} to face {y}. "
+    "{y} of the {y_sect} had been expecting company, and had brought refreshments: poison.",
+    "{x} had followed the trail of burned villages to {place}. At the end of it, {y} sat "
+    "calmly on a stone throne and asked whether {x} had come to talk or to die.",
+    "A child had once been saved by {x}, and the child's village now begged for protection "
+    "from {y}. At {place}, the Righteous Path and the Demonic Path met, and neither blinked.",
+    "'You are late,' {y} said at {place}. {x} of the {x_sect} replied that justice was never "
+    "late, merely thorough, and the ground trembled beneath their feet.",
+    "Seven sects had sworn to bring {y} to justice, and all seven had sent {x} as their "
+    "champion. At {place}, {y} bowed with exaggerated courtesy and drew a dark blade.",
+    "At the crossroads of {place}, {x} and {y} stood on opposite sides of an old stone "
+    "marker that read 'Turn back.' Neither of them did.",
+]
+
 # Endings by (winner's path, loser's path).
 # Placeholders: {w} {l} {w_sect} {l_sect} {w_treasure} {l_treasure}
 BATTLE_ENDINGS = {
@@ -2262,6 +2459,14 @@ BATTLE_ENDINGS = {
         "{w_sect}, and everyone agreed it had been an honorable one.",
         "Afterwards the two sat down to share a pot of spirit tea, arguing happily about who "
         "had really been the stronger.",
+        "{w} helped {l} to their feet and brushed the dust off {l}'s robe. 'Again next year?' "
+        "{w} asked. {l} agreed, and meant it.",
+        "The elders of the {w_sect} nodded with approval. Not a single life was in danger, and "
+        "{w} had shown both skill and restraint.",
+        "{l} laughed through the pain and admitted that {w} had earned it. The disciples "
+        "watching applauded both of them, and the argument was forgotten.",
+        "'I learned more from losing than you did from winning,' {l} said with a smile. {w} "
+        "was not sure that was true, but did not argue.",
     ],
     ("Righteous", "Demonic"): [
         "{w} sealed {l}'s Qi with a talisman and carried {l} off to the {w_sect} for judgment, "
@@ -2269,12 +2474,28 @@ BATTLE_ENDINGS = {
         "Ignoring {l}'s pleas, {w} sealed {l}'s Qi and warned {l} never to return.",
         "{w} broke {l}'s demonic cultivation with a single palm. 'Walk a better road,' {w} "
         "said, and left.",
+        "{w} bound {l} in a net of golden light and dragged them back toward the {w_sect}, "
+        "while villagers who had feared {l} for years cheered along the road.",
+        "'Justice has been served,' {w} said quietly, and the dark clouds above {l} finally "
+        "began to part.",
+        "{l} spat blood and cursed {w}'s name. {w} only sighed, left a pill beside them, and "
+        "walked away, hoping {l} would think about the offer.",
+        "The {w_sect} would record that {w} brought down a demonic cultivator that day. {w} "
+        "would record only that {l} was tired, wounded, and, at last, quiet.",
     ],
     ("Demonic", "Righteous"): [
         "{w} smiled coldly and left {l} to crawl home with a broken pride.",
         "Showing no mercy, {w} drained the last of {l}'s Qi and strolled away, humming a "
         "cheerful tune.",
         "{l} spoke of honor and mercy. {w} laughed and vanished into the night.",
+        "{w} let {l} see the sunrise, only so that {l} would remember what it cost to look at "
+        "it from the ground.",
+        "'Righteousness is such a heavy burden,' {w} said, pressing a heel against {l}'s "
+        "back. 'Let me lighten it for you.' Then {w} was gone.",
+        "By the time anyone from the {l_sect} arrived, {w} was far away, and {l}'s sword was "
+        "the only thing left standing in the dust.",
+        "{w} bowed mockingly to {l}, to the watching crowd, and to the sky, and walked off "
+        "whistling a funeral song.",
     ],
     ("Demonic", "Demonic"): [
         "{w} finished the duel with a flick of the wrist. By morning the {l_sect} was missing "
@@ -2282,8 +2503,65 @@ BATTLE_ENDINGS = {
         "{w} wiped a drop of blood from a thumb and left {l} as a warning to every other "
         "demonic cultivator in the region.",
         "{l} begged for mercy. {w} considered it, and let {l} live, for the moment.",
+        "{w} drank the last of {l}'s spirit wine over {l}'s wounded body and called it a fair "
+        "trade, then left before {l} could object.",
+        "'Betray me again and I will not stop at your Qi,' {w} said. {l} nodded, already "
+        "planning exactly that.",
+        "Both of them knew the {l_sect} would send someone to take revenge. {w} found this "
+        "delightful, and left a very clear trail to follow.",
+        "{w} carved a small mark into the nearest rock to remind {l} who had won, then left "
+        "{l} to explain the defeat to the {l_sect}.",
     ],
 }
+
+BATTLE_ENDINGS[("Righteous", "Righteous")] += [
+    "{w} and {l} bowed once more. The disciples of both sects agreed that the duel had been "
+    "closer than the results said, and each argued for their own favorite until dawn.",
+    "'Let us not tell the elders how close that was,' {l} whispered. {w} grinned, and the "
+    "secret stayed between them.",
+    "{w} offered the victory to {l}'s sect with a deep bow, saying the real winner was the "
+    "Righteous Path itself. {l} thought this a very elegant way to avoid gloating.",
+    "{l} took the defeat without bitterness and asked {w} to teach the technique that had "
+    "decided it. {w} agreed, and the two cultivators were friends from that day.",
+    "That evening {w} and {l} shared one bowl of noodles at the foot of the mountain, bruises "
+    "and all, while the sun set behind them.",
+]
+BATTLE_ENDINGS[("Righteous", "Demonic")] += [
+    "{w} did not strike the final blow. 'I leave that to the Heavens,' {w} said, and walked "
+    "away as {l}'s dark Qi dispersed into the wind.",
+    "The villagers lit incense at {w}'s name that night. {l}, bound in golden chains, "
+    "listened to them from the cart and, for the first time in years, said nothing.",
+    "{w} cut the black banner in half and set {l}'s ritual circle ablaze. 'The road ends "
+    "here,' {w} said, and meant it kindly.",
+    "'I will return,' {l} promised. {w} nodded politely. 'Then I will be waiting, and you "
+    "will have a better teacher by then.' With that, {w} bowed and walked away.",
+    "A single white feather drifted down over {l}, who lay laughing in the dust. 'A good "
+    "fight,' {l} wheezed, 'for a righteous bore.' {w} left without answering.",
+]
+BATTLE_ENDINGS[("Demonic", "Righteous")] += [
+    "{w} wrote a poem about the duel on the clean stone beside {l}, mocking the Righteous "
+    "Path in four elegant lines, and strolled off with the dawn.",
+    "{l} swore to the Heavens that justice would find {w}. {w} thanked them for the "
+    "promise and said it would look forward to the meeting.",
+    "'Every hero needs a lesson in humility,' {w} said, wiping blood from a blade. 'Consider "
+    "this yours.' The wind carried the laughter far into the hills.",
+    "The Righteous disciples arrived too late to see anything but {w}'s shadow vanishing into "
+    "the woods and {l} kneeling quietly in the ashes.",
+    "{w} left {l} alive on purpose: a defeated champion walking home was worth more "
+    "than a corpse, and far more embarrassing to the {l_sect}.",
+]
+BATTLE_ENDINGS[("Demonic", "Demonic")] += [
+    "{l} fled into the darkness, swearing revenge for the next three hundred years. "
+    "{w} did not bother to give chase; there would be plenty of time.",
+    "{w} sat on the broken throne of {l}'s ruined hall and invited the frightened servants to "
+    "bring wine. The servants did. They were not stupid.",
+    "'You fought well,' {w} said, 'which is why I will not kill you today.' {l} understood "
+    "perfectly: today was a loan, and the interest would be terrible.",
+    "The earth around {l} was scorched black. {w} stepped over the edge of it and "
+    "left without turning around. A Demonic duel never really ends; it only pauses.",
+    "{w} took the sect token from {l}'s belt as a trophy, tied it to a string, and wore it "
+    "like a necklace. The {l_sect} did not enjoy hearing about this.",
+]
 
 # After a duel won by a Demonic cultivator: the winner steals the loser's prized treasure,
 # or finds there is nothing to steal. Placeholders: {w} {l} {stolen}
@@ -2304,6 +2582,22 @@ BATTLE_TALISMAN = [
     "A Spatial Escape Talisman burned to ash on {l}'s chest, and with it went every chance "
     "of {w} stealing a single thing. {w} cursed for a full minute.",
 ]
+# A Demonic winner who could have robbed the loser but did not get the chance (STEAL_CHANCE).
+# Placeholders: {w} {l} {l_treasure}
+BATTLE_STEAL_MISS = [
+    "{w} eyed {l}'s {l_treasure} all through the fight, but {l} guarded it too closely, "
+    "and the moment to snatch it never came.",
+    "Just as {w} reached for {l}'s {l_treasure}, a tremor split the ground between them. "
+    "By the time the dust settled, the chance was gone.",
+    "'Next time,' {w} muttered, watching {l}'s {l_treasure} glitter out of reach. Even a "
+    "Demonic cultivator cannot rob everyone, every time.",
+    "{l} had hidden {l_treasure} in a place {w} never thought to look. {w} searched, "
+    "swore, and left with nothing but a sore pride.",
+    "{w} considered taking {l}'s {l_treasure}, then heard the elders of the {l_sect} "
+    "approaching and decided that today was not the day.",
+    "A crowd of witnesses had gathered, and {w} could not rob {l} of {l_treasure} without "
+    "being seen. For once, patience won out over greed.",
+]
 BATTLE_NO_LOOT = [
     "{w} searched {l} from head to toe for treasure, but {l} owned nothing worth taking. "
     "{w} left in a worse mood than before.",
@@ -2323,19 +2617,23 @@ BATTLE_FINDS = [
 
 def resolve_loot(w, l, rng=random):
     """What the winner w takes or finds after beating l. Returns {'stolen': treasure or None,
-    'nothing': True if a Demonic winner had nothing to steal, 'blocked': True if the loser's
+    'nothing': True if a Demonic winner had nothing to steal, 'missed': True if the winner
+    had something to steal but the STEAL_CHANCE roll failed, 'blocked': True if the loser's
     Spatial Escape Talisman stopped the theft, 'found': treasure or None}.
-    A Demonic winner steals the loser's prized treasure; any winner has a DROP_CHANCE of
+    A Demonic winner has a STEAL_CHANCE (25%) of stealing the loser's prized treasure in a duel
+    (a talisman is only used up when that roll succeeds); any winner has a DROP_CHANCE of
     finding a random treasure that suits their realm and that they do not own yet."""
-    loot = {"stolen": None, "nothing": False, "found": None, "blocked": False}
+    loot = {"stolen": None, "nothing": False, "found": None, "blocked": False, "missed": False}
     if w["path"]["name"] == "Demonic":
         prize = prized_treasure(treasures_of(l))
-        if prize and talisman_count(l) > 0:          # a Spatial Escape Talisman saves it
-            loot["blocked"] = True
-        elif prize:
-            loot["stolen"] = prize
-        else:
+        if not prize:
             loot["nothing"] = True
+        elif rng.random() >= STEAL_CHANCE:           # this time the winner does not get the chance
+            loot["missed"] = True
+        elif talisman_count(l) > 0:                  # a Spatial Escape Talisman saves it
+            loot["blocked"] = True
+        else:
+            loot["stolen"] = prize
     if rng.random() < DROP_CHANCE:
         owned = treasures_of(w) + ([loot["stolen"]] if loot["stolen"] else [])
         tier = 0 if w["realm_index"] <= 2 else 1 if w["realm_index"] <= 6 else 2
@@ -2718,6 +3016,8 @@ def battle_story(a, b, result, loot=None, change=None):
         parts.append(random.choice(BATTLE_LOOT))
     elif loot.get("nothing"):                            # ...or finds there is none
         parts.append(random.choice(BATTLE_NO_LOOT))
+    elif loot.get("missed"):                             # ...or does not get the chance this time
+        parts.append(random.choice(BATTLE_STEAL_MISS))
     if big_gap:                                          # arrogance paid off, or did not
         parts.append(random.choice(BATTLE_GAP_AFTERMATH[(tier, w is strong)]))
     if loot.get("found"):                                # a lucky find after the fight
@@ -2793,6 +3093,9 @@ def print_battle(a, b, info_a, info_b, result, story, loot=None, change=None):
         elif loot["nothing"]:
             wrap_print(f"Loot : {winner['name']} tried to rob {loser['name']}, but there was "
                        f"no treasure to steal.")
+        elif loot.get("missed"):
+            wrap_print(f"Loot : {winner['name']} could not get at {loser['name']}'s treasure "
+                       f"this time (a Demonic winner steals in {STEAL_CHANCE:.0%} of duels).")
         if loot["found"]:
             wrap_print(f"Lucky find : {winner['name']} found {loot['found']}.")
         if loot["stolen"] or loot["found"]:
@@ -2829,7 +3132,7 @@ def get_info(steamid, key, profiles, refresh=False):
 
 def build_cultivator(steamid, key, profiles, refresh=False):
     """Returns (info, friend_ids, friends_note, cultivator) for one profile."""
-    info = get_info(steamid, key, profiles, refresh)
+    info = apply_peaks(steamid, get_info(steamid, key, profiles, refresh))
     friend_ids, note = get_friends(steamid, key, refresh)
     saved = read_inventory(steamid)          # None on the very first load of this profile
     duel_points, _ = read_duel_rep(steamid)
@@ -2842,6 +3145,12 @@ def build_cultivator(steamid, key, profiles, refresh=False):
         write_inventory(steamid, cultivator["treasures"], [start])
         saved = (cultivator["treasures"], [start])
     cultivator["inventory_history"] = saved[1]
+    stored = cultivator["pavilion"]
+    if cultivator["sect_points_earned"] != stored.get("earned", 0):    # new achievements: credit them
+        write_pavilion(steamid, stored["items"], stored["spent"], earned=cultivator["sect_points_earned"])
+        RUN_LOG.note(f"sect points: credited up to {cultivator['sect_points_earned']} earned, "
+                     f"{stored['spent']} spent, {cultivator['sect_points']} left")
+        cultivator["pavilion"] = read_pavilion(steamid)
     RUN_LOG.note(f"{len(friend_ids)} friends{' (' + note + ')' if note else ''}; cultivator "
                  f"{cultivator['name']}, {cultivator['realm']}, age {cultivator['age']}, "
                  f"{'died' if cultivator['death'] else 'alive'}")
@@ -2861,6 +3170,15 @@ def run_battle(args, key, profiles):
             print("  Duel cancelled.\n")
             return
         ids.append(resolve_steamid(text, key))
+    duel = perform_battle(ids, key, profiles)
+    print_battle(duel["a"], duel["b"], duel["info_a"], duel["info_b"], duel["result"],
+                 duel["story"], duel["loot"], duel["change"])
+
+
+def perform_battle(ids, key, profiles):
+    """Runs one duel between the two SteamIDs in ids: loads both cultivators, refuses dead
+    ones, fights, saves loot and reputation. Returns everything a front end needs to show it
+    (a, b, info_a, info_b, result, story, loot, change). Nothing is printed here."""
     if ids[0] == ids[1]:
         raise SteamError("Pick two different profiles: a cultivator cannot duel themselves.")
     (info_a, _, _, a), (info_b, _, _, b) = [build_cultivator(i, key, profiles) for i in ids]
@@ -2875,7 +3193,8 @@ def run_battle(args, key, profiles):
     story = battle_story(a, b, result, loot, change)
     apply_loot(ids, a, b, result, loot)                  # written to the inventory files
     apply_reputation(ids, a, b, result, change)          # ...and the reputation points
-    print_battle(a, b, info_a, info_b, result, story, loot, change)
+    return {"a": a, "b": b, "info_a": info_a, "info_b": info_b, "result": result,
+            "story": story, "loot": loot, "change": change}
 
 
 # ---------------------------------------------------------------------------
