@@ -198,6 +198,7 @@ def cultivator_view(c, info):
     the detail rows and the Steam source rows."""
     t, rep = c["talent"], c["reputation"]
     rows = [("Realm", f"{c['realm']} ({c['realm_flavor']})"),
+            ("Gender", c["gender"].capitalize()),
             ("Talent", f"{t['name']} (power {t['power']:+d})"),
             ("Personality", ", ".join(sc.personality_label(p) for p in c["personalities"])
              if c["personalities"] else "none (a quiet temperament)"),
@@ -233,7 +234,9 @@ def cultivator_view(c, info):
     goods = sc.describe_goods(c.get("pavilion", {}).get("items", {}))
     if goods:
         rows.append(("Pavilion", goods))
-    rows.append(("Lifespan", f"{c['lifespan']:,} years" + (" (cut short)" if c["death"] else "")))
+    lost = c.get("lifespan_lost", 0)
+    rows.append(("Lifespan", f"{c['lifespan']:,} years" + (" (cut short)" if c["death"] else "")
+                 + (f" ({lost:,} lost to failed breakthroughs)" if lost else "")))
     rows.append(("Born", f"Year {c['birth_year']} of the Heavenly Calendar"))
     if c.get("age") is not None:
         yrs = c.get("account_years")
@@ -285,7 +288,10 @@ def breakthrough_view(c):
     st = sc.breakthrough_status(c)
     out = {"name": c["name"], "can": st["can"], "reason": st["reason"], "current": st["current"],
            "next": st["next"], "pills": st["pills"], "cooldown_left": st["cooldown_left"],
-           "pill_bonus": sc.BREAKTHROUGH_PILL_BONUS, "plain": None, "with_pill": None}
+           "pill_bonus": sc.BREAKTHROUGH_PILL_BONUS, "plain": None, "with_pill": None,
+           "risk": "", "fatal": False, "penalty": st["penalty"]}
+    if st["chance"]:
+        out["risk"], out["fatal"] = sc.breakthrough_risk_text(st), st["fatal"]
     if st["chance"]:
         out["plain"] = {"lines": sc.breakthrough_lines(st["chance"]), "total": st["chance"]["total"]}
         out["with_pill"] = {"lines": sc.breakthrough_lines(st["chance_pill"]),
@@ -573,7 +579,8 @@ class App:
         if data["death"]:
             label, text = data["death"]
             self.section(body, "The end of the road", color=BAD)
-            self.paragraph(body, f"Slain by: {label}")
+            self.paragraph(body, ("Cause: " if data["c"]["death"]["killer"] == "lifespan"
+                                  else "Slain by: ") + label)
             self.paragraph(body, text)
         self.status.configure(text=f"Loaded {v['name']}.", text_color=GOOD)
 
@@ -632,7 +639,7 @@ class App:
         dlg = ctk.CTkToplevel(self.root)
         self.bt_dialog = dlg
         dlg.title("Breakthrough")
-        dlg.geometry("560x560")
+        dlg.geometry("560x640")
         dlg.configure(fg_color=PANEL)
         try:
             dlg.transient(self.root)
@@ -678,8 +685,10 @@ class App:
             ctk.CTkLabel(dlg, text="A Heaven-Defying Breakthrough Pill (+30%) can be bought in the "
                          "Pavilion for 5,000 sect points.", font=self.small_font, text_color=MUTED,
                          wraplength=470).pack(pady=(12, 0))
+        ctk.CTkLabel(dlg, text=info["risk"], font=self.body_font, wraplength=480, justify="left",
+                     text_color=BAD if info["fatal"] else MUTED).pack(padx=30, pady=(12, 0))
         result = ctk.CTkLabel(dlg, text="", font=self.body_font, wraplength=480, justify="left")
-        result.pack(padx=30, pady=(12, 0))
+        result.pack(padx=30, pady=(8, 0))
         row = ctk.CTkFrame(dlg, fg_color="transparent")
         row.pack(pady=18)
         attempt = ctk.CTkButton(row, text="Attempt breakthrough", fg_color="#7b5fd1",
@@ -694,13 +703,8 @@ class App:
                 if not self.widget_alive(dlg):
                     return
                 r = res["result"]
-                result.configure(
-                    text=(f"SUCCESS! Heavenly lightning rolls across the sky. {info['name']} breaks "
-                          f"through to {r['to']}!") if r["success"] else
-                         (f"FAILED. The Qi turns on {info['name']}, who must rest for "
-                          f"{sc.BREAKTHROUGH_COOLDOWN_MINUTES} minutes before trying again."
-                          + (" The pill is gone." if r["pill_used"] else "")),
-                    text_color=GOOD if r["success"] else BAD)
+                result.configure(text=sc.breakthrough_result_text(info["name"], r),
+                                 text_color=GOOD if r["success"] else BAD)
                 close.configure(text="Close")
                 self.show_cultivator(res["data"])
 

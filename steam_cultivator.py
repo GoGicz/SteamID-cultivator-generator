@@ -63,6 +63,9 @@ now rise gradually: the first ranks come quickly, the later ones need far more p
 Type "breakthrough" when the power score reaches the next realm: the chance depends on the
 realm, the personality, the talent and an optional Heaven-Defying Breakthrough Pill (+30%,
 5,000 sect points). Type "history" to see recent duels, purchases and breakthroughs.
+A failed breakthrough costs lifespan (5 years in the lowest realm, 250 in Void Refinement, up
+to 480): if the lifespan falls to the cultivator's age, they die. Immortals live 60,000 to
+90,000 years, and their age is a share of that. Every cultivator is male or female by SteamID.
 Level, paid games, hours in the top game and badges are remembered at their highest ever in
 the profile's JSON file: a dip in Steam's data or a refresh never takes power or reputation
 away, and only genuinely new levels, games, hours or badges add to it.
@@ -265,6 +268,19 @@ SURNAMES = ["Li", "Wang", "Zhang", "Liu", "Chen", "Yang", "Huang", "Zhao", "Wu",
 GIVEN = ["Tian", "Feng", "Yun", "Hao", "Ming", "Xuan", "Yu", "Jian", "Long", "Chen",
          "Wei", "Lei", "Qing", "Han", "Yan", "Zhi", "Ruo", "Shuo", "Jun", "Xiao",
          "Bai", "Mo", "Ling", "Heng", "Wuji"]
+# Female cultivators draw their given names from their own list. Male ones keep the list above,
+# so every male cultivator keeps the name they always had.
+FEMALE_GIVEN = ["Yue", "Lian", "Xue", "Mei", "Hua", "Rou", "Shan", "Ning", "Xia", "Lan",
+                "Fang", "Zhu", "Ying", "Ru", "Shu", "Wan", "Jing", "Bing", "Meng", "Xiu",
+                "Zi", "Qiu", "Die", "Fei", "Luo"]
+# Titles that have a female form (everything else is the same for both).
+FEMALE_TITLES = {"Sect Master": "Sect Mistress", "Array Master": "Array Mistress",
+                 "Talisman Master": "Talisman Mistress", "Dao Lord": "Dao Lady",
+                 "Patriarch": "Matriarch", "Immortal Emperor": "Immortal Empress",
+                 "Mountain-Splitting Swordsman": "Mountain-Splitting Swordswoman",
+                 "Lord of Ten Thousand Peaks": "Lady of Ten Thousand Peaks",
+                 "Overlord of the Nine Provinces": "Empress of the Nine Provinces",
+                 "Lord of the Endless Sea": "Lady of the Endless Sea"}
 SECT_ADJ = ["Azure", "Crimson", "Nine-Heaven", "Void", "Thousand-Peak", "Jade", "Black Tortoise",
             "Eternal", "Ninefold", "Starfall", "Hidden Moon", "Celestial", "Boundless"]
 SECT_NOUN = ["Cloud Sect", "Sword Pavilion", "Lotus Temple", "Dao Palace", "Thunder Hall",
@@ -598,6 +614,20 @@ DEATH_ROGUE = [
     "even bother to send thunder.",
 ]
 
+# Died because a failed breakthrough used up the last of the lifespan. Placeholders: {me} {sect} {realm}
+DEATH_LIFESPAN = [
+    "The failed breakthrough had taken the last of {me}'s years. At dawn the {sect} found "
+    "{me} sitting upright in the meditation hall, as peaceful as stone, and the lamp beside "
+    "{me} had burned out at the very same moment.",
+    "{me} had been warned that another failure would cost more than the {sect} could pay. "
+    "The Qi turned back, the years drained away like water from a cracked bowl, and the "
+    "{realm} cultivator whispered one last word: 'Almost.'",
+    "Nobody doubted {me}'s courage, only the arithmetic. The backlash of the failed "
+    "breakthrough consumed what little lifespan remained, and the {sect} rang its bells "
+    "for three days.",
+    "The heavens do not forgive a breakthrough that fails at the end of a life. {me}'s hair "
+    "turned white in a single breath, and the {realm} cultivator was dust before sunset.",
+]
 DEATH_BANDITS = [
     "While travelling a lonely mountain road, {me} was surrounded by {bandits}. {technique} "
     "felled many of them, but in the end numbers won.",
@@ -1116,8 +1146,14 @@ def read_realm_state(steamid):
     """{'realm_index': the realm they hold (None if never saved), 'last_failed': time of the
     last failed breakthrough or None}. The realm only changes through a breakthrough."""
     d = load_profile_cache(steamid).get("realm_state")
-    out = {"realm_index": None, "last_failed": None}
+    out = {"realm_index": None, "last_failed": None, "lifespan_lost": 0, "born_realm": None}
     if isinstance(d, dict):
+        b = d.get("born_realm")
+        if isinstance(b, int) and not isinstance(b, bool) and 0 <= b < len(REALMS):
+            out["born_realm"] = b
+        lost = d.get("lifespan_lost")
+        if isinstance(lost, int) and not isinstance(lost, bool) and lost > 0:
+            out["lifespan_lost"] = lost
         i = d.get("realm_index")
         if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < len(REALMS):
             out["realm_index"] = i
@@ -1127,9 +1163,20 @@ def read_realm_state(steamid):
     return out
 
 
-def write_realm_state(steamid, realm_index, last_failed=None):
+def write_realm_state(steamid, realm_index, last_failed=None, lifespan_lost=None):
+    """Saves the realm held, the time of the last failed breakthrough and the years of lifespan
+    lost to failed breakthroughs (left out: the saved number is kept)."""
+    old = read_realm_state(steamid)
+    lost = old["lifespan_lost"] if lifespan_lost is None else lifespan_lost
+    # born_realm: the realm they were generated in (an immortal born as one has a different age
+    # rule from one who ascended). Profiles saved before this existed count as born in the realm
+    # they held until now.
+    born = old["born_realm"]
+    if born is None:
+        born = old["realm_index"] if old["realm_index"] is not None else realm_index
     pc = load_profile_cache(steamid)
-    pc["realm_state"] = {"realm_index": int(realm_index), "last_failed": last_failed}
+    pc["realm_state"] = {"realm_index": int(realm_index), "last_failed": last_failed,
+                         "lifespan_lost": int(lost), "born_realm": int(born)}
     return save_profile_cache(pc)
 
 
@@ -1182,8 +1229,11 @@ def history_entries(steamid, limit=80):
                 add(e["at"], "breakthrough_ok",
                     f"Broke through from {e.get('from')} to {e.get('to')}{how}")
             else:
+                lost = e.get("lost", 0)
                 add(e["at"], "breakthrough_fail",
-                    f"The breakthrough to {e.get('to')} failed{how}")
+                    f"The breakthrough to {e.get('to')} failed{how}"
+                    + (f" and cost {lost:,} years of lifespan" if lost else "")
+                    + (". The lifespan ran out and they died" if e.get("fatal") else ""))
     pav = pc.get("pavilion")
     for e in (pav.get("history", []) if isinstance(pav, dict) else []):
         if not isinstance(e, dict) or not isinstance(e.get("at"), (int, float)):
@@ -1875,14 +1925,31 @@ def get_realm(score):
     return idx, REALMS[idx]
 
 
-def make_name(rng):
-    return f"{rng.choice(SURNAMES)} {rng.choice(GIVEN)}{rng.choice(GIVEN).lower()}"
+def roll_gender(steamid):
+    """'male' or 'female', by luck from the SteamID only (own generator, so nothing else moves)."""
+    return "male" if random.Random(f"gender-{steamid}").random() < 0.5 else "female"
+
+
+def gender_title(title, gender):
+    return FEMALE_TITLES.get(title, title) if gender == "female" else title
+
+
+def cultivator_name(steamid):
+    """The name of the cultivator of this SteamID (a friend's name in a story is this too)."""
+    if roll_gender(steamid) == "female":
+        return make_name(random.Random(f"fname-{steamid}"), "female")
+    return make_name(random.Random(int(steamid)))
+
+
+def make_name(rng, gender="male"):
+    given = FEMALE_GIVEN if gender == "female" else GIVEN
+    return f"{rng.choice(SURNAMES)} {rng.choice(given)}{rng.choice(given).lower()}"
 
 
 def generate_story(c, info, friend):
     # The friend's cultivator name is seeded from their SteamID, so it stays the same;
     # the story itself is picked at random, so every run can give a new one.
-    friend_name = make_name(random.Random(int(friend["steamid"])))
+    friend_name = cultivator_name(friend["steamid"])
     pool = list(STORIES_COMMON)
     if c["realm_index"] <= 3:
         pool += STORIES_WEAK
@@ -1908,6 +1975,24 @@ def account_years(created, now=None):
     if not isinstance(created, (int, float)) or created <= 0:
         return None
     return max(0.0, ((time.time() if now is None else now) - created) / SECONDS_PER_YEAR)
+
+
+IMMORTAL_INDEX = len(REALMS) - 1
+IMMORTAL_LIFESPAN = (60000, 90000)      # immortals are the pinnacle: ten times a Mahayana and more
+
+
+def immortal_age(steamid, lifespan):
+    """Age of an immortal: usually around half of the great lifespan (44-56%), but some are
+    nearly at its end (85-97%) and some are young for an immortal (3-15%). By SteamID only."""
+    r = random.Random(f"immortal-age-{steamid}")
+    pick = r.random()
+    if pick < 0.70:
+        share = r.uniform(0.44, 0.56)
+    elif pick < 0.85:
+        share = r.uniform(0.85, 0.97)
+    else:
+        share = r.uniform(0.03, 0.15)
+    return max(16, int(lifespan * share))
 
 
 def cultivator_age(years, lifespan):
@@ -1956,10 +2041,13 @@ def describe_death(c, info, friend):
     fmt = dict(me=c["name"], sect=c["sect"], technique=c["technique"], treasure=c["treasure"],
                realm=c["realm"], game=info["top_game"] or "the Void", rogue=rogue, bandits=bandits)
     if d["friend_id"] and friend and friend["steamid"] == d["friend_id"]:
-        friend_name = make_name(random.Random(int(friend["steamid"])))
+        friend_name = cultivator_name(friend["steamid"])
         fmt.update(friend=friend_name, friend_steam=friend["name"])
         pool = DEATH_FRIEND
         label = f"{friend_name} (Steam: {friend['name']}), a trusted friend"
+    elif d["killer"] == "lifespan":
+        pool, label = DEATH_LIFESPAN, "a failed breakthrough that used up their lifespan"
+        return label, pool[sum(map(ord, c["name"])) % len(pool)].format(**fmt)
     elif d["killer"] == "rogue":
         pool, label = DEATH_ROGUE, rogue
     else:
@@ -1968,7 +2056,7 @@ def describe_death(c, info, friend):
 
 
 def generate_cultivator(info, steamid, friend_ids=None, inventory=None, duel_points=0,
-                        pavilion=None, realm_index=None):
+                        pavilion=None, realm_index=None, lifespan_lost=0, born_realm=None):
     rng = random.Random(int(steamid))  # same profile -> same cultivator
     talent = roll_talent(steamid)      # rolled first: it changes both power and death risk
     personalities = get_personalities(info, len(friend_ids or []))   # second: same reason
@@ -1985,12 +2073,15 @@ def generate_cultivator(info, steamid, friend_ids=None, inventory=None, duel_poi
     titles, treasures = (TITLES_LOW, TITLES_MID, TITLES_HIGH)[tier_no], \
                         (TREASURES_LOW, TREASURES_MID, TREASURES_HIGH)[tier_no]
 
-    name = make_name(rng)
+    gender = roll_gender(steamid)
+    name = make_name(rng)               # always drawn, so every later draw stays where it was...
+    if gender == "female":              # ...and a woman's name then comes from her own generator
+        name = cultivator_name(steamid)
     sect = f"{rng.choice(SECT_ADJ)} {rng.choice(SECT_NOUN)}"
     rng.choice(titles)                  # drawn exactly as before, so later draws do not move
     element = rng.choice(ELEMENTS)
     rng.choice(treasures)               # (same here)
-    title = random.Random(f"title-{steamid}").choice(TITLES_ALL[tier_no])
+    title = gender_title(random.Random(f"title-{steamid}").choice(TITLES_ALL[tier_no]), gender)
     treasure = random.Random(f"treasure-{steamid}").choice(ALL_TREASURES[tier_no])  # starting treasure
     owned = list(inventory) if inventory is not None else [treasure]   # what they own now
     main_treasure = prized_treasure(owned) or FALLBACK_TREASURE
@@ -1998,12 +2089,28 @@ def generate_cultivator(info, steamid, friend_ids=None, inventory=None, duel_poi
     game = info["top_game"] or "the Void"
     technique = f"{rng.choice(MOVE_ADJ)} {game} {rng.choice(MOVE_NOUN)}"
 
-    lifespan = 80 + idx * rng.randint(150, 400)
+    lifespan_roll = rng.randint(150, 400)            # always drawn, as before
+    if idx == IMMORTAL_INDEX:                         # immortals live far longer than anyone else
+        base_lifespan = random.Random(f"immortal-{steamid}").randint(*IMMORTAL_LIFESPAN)
+    else:
+        base_lifespan = 80 + idx * lifespan_roll
+    if idx == IMMORTAL_INDEX:
+        lifespan_lost = 0                             # ascending renews the body: the losses are gone
+    lifespan = max(1, base_lifespan - lifespan_lost)  # years lost to failed breakthroughs
     lightning = max(0, idx - 5) * 3 + (9 if idx == 9 else 0)
     death_chance = min(1.0, talent["death"] + sum(p["death"] for p in personalities))
     years = account_years(info.get("account_created"))
-    age = cultivator_age(years, lifespan)    # None if Steam did not give the account's age
+    born_immortal = idx == IMMORTAL_INDEX and born_realm in (None, IMMORTAL_INDEX)
+    if born_immortal:                        # generated as an immortal: a share of the great lifespan
+        age = immortal_age(steamid, base_lifespan)
+    elif idx == IMMORTAL_INDEX:              # ascended: keeps the age they had before (Steam account
+        age = cultivator_age(years, 80 + (IMMORTAL_INDEX - 1) * lifespan_roll)   # age, as in the realm below)
+    else:                                    # others: from the Steam account age (None if unknown)
+        age = cultivator_age(years, base_lifespan)
     fate = roll_fate(steamid, idx, lifespan, friend_ids or [], death_chance, age)
+    if age is not None and age >= lifespan:  # the years ran out (a failed breakthrough took them)
+        fate["death"] = {"killer": "lifespan", "friend_id": None, "scene": 0, "age": lifespan,
+                         "year": fate["birth_year"] + lifespan}
     age = fate["death"]["age"] if fate["death"] else age
     reputation = roll_reputation(steamid, info, personalities, path, duel_points)
 
@@ -2038,9 +2145,10 @@ def generate_cultivator(info, steamid, friend_ids=None, inventory=None, duel_poi
         game=game, realm=realm)
 
     return {
-        "name": name, "sect": sect, "title": title, "realm": realm, "realm_flavor": realm_flavor,
+        "name": name, "gender": gender, "sect": sect, "title": title, "realm": realm, "realm_flavor": realm_flavor,
         "realm_index": idx, "eligible_realm_index": eligible, "element": element,
-        "technique": technique, "lifespan": lifespan,
+        "technique": technique, "lifespan": lifespan, "base_lifespan": base_lifespan,
+        "lifespan_lost": lifespan_lost,
         "lightning": lightning, "treasure": main_treasure, "treasures": owned,
         "base_treasure": treasure, "inventory_history": [], "backstory": backstory, "score": score,
         "birth_year": fate["birth_year"], "death": fate["death"], "talent": talent,
@@ -2122,6 +2230,7 @@ def print_cultivator(c, info):
     print(f"  {c['name']}  -  {c['title']} of the {c['sect']}")
     print(line)
     print(f"  Realm       : {c['realm']} ({c['realm_flavor']})")
+    print(f"  Gender      : {c['gender'].capitalize()}")
     print(f"  Power       : {power_bar(c['realm_index'])}   (score {c['score']:,.0f})")
     t = c["talent"]
     print(f"  Talent      : {t['name']} (power {t['power']:+d})")
@@ -2161,7 +2270,9 @@ def print_cultivator(c, info):
     if goods:
         wrap_field("Pavilion", goods)
     cut = " (cut short)" if c["death"] else ""
-    print(f"  Lifespan    : {c['lifespan']:,} years{cut}")
+    lost = c.get("lifespan_lost", 0)
+    print(f"  Lifespan    : {c['lifespan']:,} years{cut}"
+          + (f" ({lost:,} lost to failed breakthroughs)" if lost else ""))
     print(f"  Born        : Year {c['birth_year']} of the Heavenly Calendar")
     if c.get("age") is not None:
         when = " at death" if c["death"] else ""
@@ -2246,7 +2357,7 @@ def print_death(c, info, friend):
     label, text = describe_death(c, info, friend)
     print("  The end of the road")
     print("  " + "-" * 62)
-    print(f"  Slain by : {label}")
+    print(f"  {'Cause   ' if c['death']['killer'] == 'lifespan' else 'Slain by'} : {label}")
     print()
     wrap_print(text)
     print("=" * 64 + "\n")
@@ -2404,6 +2515,9 @@ PERSONALITY_BREAKTHROUGH = {"Fearless": 0.05, "Brave": 0.02}
 BREAKTHROUGH_PILL_ID = "breakthrough_pill"
 BREAKTHROUGH_PILL_BONUS = 0.30
 BREAKTHROUGH_COOLDOWN_MINUTES = 60
+# Years of lifespan a FAILED breakthrough costs, by the realm the cultivator is in (Void
+# Refinement: 250). If the lifespan then falls to their age or below, they die of it.
+LIFESPAN_PENALTY = [5, 12, 30, 60, 110, 170, 250, 350, 480]
 
 
 def breakthrough_chance(c, use_pill=False):
@@ -2433,6 +2547,26 @@ def breakthrough_lines(bd):
     return lines
 
 
+def breakthrough_risk_text(st):
+    """What failing would cost, for the terminal and the window."""
+    text = f"If it fails: {st['penalty']:,} years of lifespan are lost ({st['lifespan']:,} -> " \
+           f"{max(0, st['lifespan'] - st['penalty']):,} years)."
+    if st["fatal"]:
+        text += (f" WARNING: the cultivator is {st['age']:,} years old, so a failure would use up "
+                 f"the whole lifespan and END THEIR LIFE.")
+    return text
+
+
+def breakthrough_result_text(name, r):
+    if r["success"]:
+        return (f"SUCCESS! Heavenly lightning rolls across the sky. {name} breaks through to "
+                f"{r['to']}!")
+    text = (f"FAILED. The Qi turns on {name}, who loses {r['lost']:,} years of lifespan"
+            + (" and dies of it." if r["died"] else
+               f" and must rest for {BREAKTHROUGH_COOLDOWN_MINUTES} minutes before trying again."))
+    return text + (" The pill is gone." if r["pill_used"] else "")
+
+
 def breakthrough_status(c, now=None):
     """Can c try to break through right now? Returns a dict with 'can', 'reason' (why not),
     'current', 'next', the chance without and with a pill, the pills owned and the cooldown."""
@@ -2443,7 +2577,11 @@ def breakthrough_status(c, now=None):
           "next": None if top else REALMS[idx + 1][1], "pills": c["pavilion"]["items"].get(
               BREAKTHROUGH_PILL_ID, 0), "cooldown_left": 0,
           "chance": None if top else breakthrough_chance(c),
-          "chance_pill": None if top else breakthrough_chance(c, True)}
+          "chance_pill": None if top else breakthrough_chance(c, True),
+          "penalty": 0 if top else LIFESPAN_PENALTY[idx], "lifespan": c["lifespan"],
+          "age": c.get("age"), "fatal": False}
+    if not top and st["age"] is not None:
+        st["fatal"] = st["age"] >= c["lifespan"] - st["penalty"]    # failing would end their life
     if c["death"]:
         st["reason"] = (f"{c['name']} died in Year {c['death']['year']} of the Heavenly "
                         f"Calendar. The dead cannot break through.")
@@ -2484,15 +2622,21 @@ def attempt_breakthrough(steamid, c, use_pill=False, rng=random, now=None):
         write_pavilion(steamid, goods, c["pavilion"]["spent"],
                        {"at": now, "type": "pill used", "item": PAVILION_BY_ID[BREAKTHROUGH_PILL_ID]["name"],
                         "other": None})
+    lost = 0 if success else st["penalty"]
     write_realm_state(steamid, c["realm_index"] + (1 if success else 0),
-                      None if success else now)
+                      None if success else now,
+                      read_realm_state(steamid)["lifespan_lost"] + lost)
     add_activity(steamid, {"at": now, "type": "breakthrough", "success": success,
                            "from": st["current"], "to": st["next"], "chance": bd["total"],
-                           "pill": bool(use_pill)})
+                           "pill": bool(use_pill), "lost": lost,
+                           "fatal": bool(not success and st["fatal"])})
     RUN_LOG.note(f"breakthrough: {c['name']} ({steamid}) {'broke through to ' + st['next'] if success else 'failed the breakthrough to ' + st['next']} "
-                 f"({bd['total'] * 100:g}% chance{', pill used' if use_pill else ''})")
+                 f"({bd['total'] * 100:g}% chance{', pill used' if use_pill else ''})"
+                 + (f", lost {lost} years of lifespan" if lost else "")
+                 + (", and died of it" if not success and st["fatal"] else ""))
     return {"success": success, "chance": bd["total"], "from": st["current"], "to": st["next"],
-            "pill_used": bool(use_pill)}
+            "pill_used": bool(use_pill), "lost": lost,
+            "died": bool(not success and st["fatal"])}
 
 
 def breakthrough_target(key, profiles, session):
@@ -2518,6 +2662,7 @@ def run_breakthrough(args, key, profiles, session):
     use_pill = False
     for ln in breakthrough_lines(st["chance"]):
         wrap_words("  ", ln)
+    wrap_words("  ", breakthrough_risk_text(st))
     if st["pills"]:
         pill = PAVILION_BY_ID[BREAKTHROUGH_PILL_ID]["name"]
         answer = input(f"  Swallow a {pill} (+{BREAKTHROUGH_PILL_BONUS * 100:g}%, you own "
@@ -2532,13 +2677,7 @@ def run_breakthrough(args, key, profiles, session):
         print("  The cultivator decides to wait.\n")
         return
     r = attempt_breakthrough(steamid, c, use_pill)
-    if r["success"]:
-        wrap_words("  ", f"SUCCESS! Heavenly lightning rolls across the sky. {c['name']} "
-                         f"breaks through to {r['to']}!")
-    else:
-        wrap_words("  ", f"FAILED. The Qi turns on {c['name']}, who must rest for "
-                         f"{BREAKTHROUGH_COOLDOWN_MINUTES} minutes before trying again."
-                         + (" The pill is gone." if r["pill_used"] else ""))
+    wrap_words("  ", breakthrough_result_text(c["name"], r))
     print(line + "\n")
 
 
@@ -3429,7 +3568,9 @@ def build_cultivator(steamid, key, profiles, refresh=False):
     cultivator = generate_cultivator(info, steamid, friend_ids,
                                      inventory=saved[0] if saved else None,
                                      duel_points=duel_points, pavilion=read_pavilion(steamid),
-                                     realm_index=state["realm_index"])
+                                     realm_index=state["realm_index"],
+                                     lifespan_lost=state["lifespan_lost"],
+                                     born_realm=state["born_realm"])
     if state["realm_index"] is None:         # first load: they start in the realm their stats give
         write_realm_state(steamid, cultivator["realm_index"])
     cultivator["last_breakthrough_fail"] = state["last_failed"]
