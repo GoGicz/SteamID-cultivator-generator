@@ -1,9 +1,28 @@
-**Added:**
+**changed:** split the modules for easier understanding of the code
 
-1.*Genders, now you are generated as either female or male, this is 50/50 chance and depends on your SteamID*
+**How to use it:**
 
-**changed:**
+*Put all the .py files in one folder, replacing the old steam_cultivator.py and steam_cultivator_gui.py. The zip has the same 14 files if you’d rather download one thing.
+Run python steam_cultivator.py or python steam_cultivator_gui.py as before.
+The top of steam_cultivator.py now lists what each file is for.*
 
-1.*Immortals now have between 60000-90000 lifespan, those that get generated as immortal already will have advanced age usually between 65000-85000 years but there is 15% chance on both sides to either get young or old one*
 
-2.*Previously breakthrough only gave you a cooldown before another use but this time it can actually damage your lifespan if failed*
+**The modules:**
+
+*steam_cultivator.py is the command line, with the command routing and prompts.*
+
+*steam_cultivator_gui.py is the window.*
+
+*logs.py, steam_api.py, storage.py, achievements.py and steam_profile.py cover logging, Steam requests, saved profiles, achievement counting and assembling a profile.*
+
+*gamedata.py and gametext.py hold the static content: realms, talents, treasures, and all the story and battle templates.*
+
+*generator.py builds the cultivator.*
+
+*combat.py covers duels, theft and duel reputation.*
+
+*pavilion_shop.py covers buying and selling.*
+
+*progress.py covers breakthrough, adventure and rebirth.*
+
+*display.py handles terminal printing.*
