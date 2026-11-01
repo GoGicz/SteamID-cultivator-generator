@@ -39,7 +39,7 @@ Features
     **pip install customtkinter**  
     **pip install requests**  
     
-  **Run: python steam_cultivator_gui.py (steam_cultivator.py must be next to it):**
+  **Run: python steam_cultivator_gui.py (steam_cultivator.py and every other module must be next to it):**
 
     Windows (cmd):   set STEAM_API_KEY=yourkey
     Linux / macOS:   export STEAM_API_KEY=yourkey
@@ -56,7 +56,7 @@ Features
     or just paste it when the program asks.
 
 **Run:
-    python steam_cultivator.py**
+    python steam_cultivator.py but keep other modules next to it as well**
 
 *Your Steam profile's "Game details" must be set to Public,
 otherwise Steam will not give out the data.
