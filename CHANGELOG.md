@@ -1,7 +1,9 @@
 **Added:**
 
-1.Breakthrough system which allow people who reached the realm threshold to attempt breakthrough which is based on your personality or pills
+1.*Genders, now you are generated as either female or male, this is 50/50 chance and depends on your SteamID*
 
-2.heavenly defying breakthrough pill now actually gives 30% breakthrough chance and can be bought for 5000 sect points
+**changed:**
 
-3.History tab, now you can see what your selected cultivator did recently, it display basically everything from what you bought to who you fought and if you won and also breakthroughs
+1.*Immortals now have between 60000-90000 lifespan, those that get generated as immortal already will have advanced age usually between 65000-85000 years but there is 15% chance on both sides to either get young or old one*
+
+2.*Previously breakthrough only gave you a cooldown before another use but this time it can actually damage your lifespan if failed*
