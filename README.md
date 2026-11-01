@@ -16,11 +16,14 @@ Features
 - Sect martial pavilion let's you buy treasures and talismans for protection
 - Both Gui and Terminal modes so you can choose which one to use
 - breakthrough system and events you made are logged in the "history" tab
+- go on adventures with possibility to trigger one of many events
 
   **example:**
-  <img width="1920" height="861" alt="obrazek" src="https://github.com/user-attachments/assets/5fb88fe7-cdac-43ec-bb5f-cd032eeab14e" />
+  <img width="1923" height="1036" alt="obrazek" src="https://github.com/user-attachments/assets/59997b23-b054-4aae-adad-f57fe03a1089" />
 
-  <img width="1918" height="831" alt="obrazek" src="https://github.com/user-attachments/assets/526bd267-0b05-4fde-89aa-2cf8b5d59f83" />
+
+  <img width="1922" height="1038" alt="obrazek" src="https://github.com/user-attachments/assets/55357a8e-7db8-4a14-b744-5048c6833c0a" />
+
 
   **example of the mock battle in GUI mode:**
   <img width="1041" height="811" alt="obrazek" src="https://github.com/user-attachments/assets/704a823d-9e65-413a-9e6a-8ffca190ef0a" />
