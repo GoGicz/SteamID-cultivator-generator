@@ -3,7 +3,7 @@
 Steam Cultivator - window version (dark theme, CustomTkinter)
 --------------------------------------------------------------
 Needs:  pip install customtkinter
-Run:    python steam_cultivator_gui.py        (steam_cultivator.py must be next to it)
+Run:    python steam_cultivator_gui.py        (the engine modules, steam_cultivator.py and the other .py files, must be next to it)
 
 Tabs: Cultivator (with the Breakthrough button), Pavilion, Duel, History and Log.
 
@@ -25,7 +25,17 @@ import sys
 import threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import steam_cultivator as sc
+import time
+import achievements
+import combat
+import display
+import gamedata
+import generator
+import logs
+import pavilion_shop
+import progress
+import steam_api
+import storage
 
 
 # ---------------------------------------------------------------------------
@@ -33,35 +43,35 @@ import steam_cultivator as sc
 # ---------------------------------------------------------------------------
 class Controller:
     """Holds the Steam key, the in-memory profile cache and which cultivator was looked up
-    last (for the pavilion). Every method either returns plain data or raises sc.SteamError
+    last (for the pavilion). Every method either returns plain data or raises logs.SteamError
     with a message that is fit to show to the user."""
 
     def __init__(self, key):
         if not key:
-            raise sc.SteamError("An API key is required (https://steamcommunity.com/dev/apikey).")
+            raise logs.SteamError("An API key is required (https://steamcommunity.com/dev/apikey).")
         self.key = key
         self.profiles = {}
         self.session = {}
         self.busy = threading.Lock()
-        sc.RUN_LOG.secret = key
+        logs.RUN_LOG.secret = key
 
     # -- running one command with logging --------------------------------------------------
     def _run(self, command, fn):
         if not self.busy.acquire(blocking=False):
-            raise sc.SteamError("Please wait, the previous action is still running.")
-        sc.RUN_LOG.begin(command)
+            raise logs.SteamError("Please wait, the previous action is still running.")
+        logs.RUN_LOG.begin(command)
         status = "ok"
         try:
             with contextlib.redirect_stdout(io.StringIO()):     # nothing may print into a window
                 return fn()
-        except sc.SteamError as e:
+        except logs.SteamError as e:
             status = f"error: {e}"
             raise
         except BaseException as e:
             status = f"crashed: {type(e).__name__}: {e}"
             raise
         finally:
-            sc.RUN_LOG.finish(status)
+            logs.RUN_LOG.finish(status)
             self.busy.release()
 
     # -- the cultivator tab ----------------------------------------------------------------
@@ -70,22 +80,22 @@ class Controller:
         if text.lower().startswith("refresh "):
             refresh, text = True, text[len("refresh "):].strip()
         if not text:
-            raise sc.SteamError("Type a Steam profile URL, custom name or SteamID64 first.")
+            raise logs.SteamError("Type a Steam profile URL, custom name or SteamID64 first.")
 
         def work():
-            steamid = sc.resolve_steamid(text, self.key, refresh)
+            steamid = steam_api.resolve_steamid(text, self.key, refresh)
             return self._view_data(steamid, refresh)
         return self._run(("refresh lookup of " if refresh else "lookup of ") + text, work)
 
     def _view_data(self, steamid, refresh=False):
         """Loads a cultivator, makes it the selected one and gathers what the card shows.
         (Called from inside _run, so it takes no lock itself.)"""
-        info, friend_ids, note, c = sc.build_cultivator(steamid, self.key, self.profiles, refresh)
+        info, friend_ids, note, c = generator.build_cultivator(steamid, self.key, self.profiles, refresh)
         self.session["latest"] = steamid
-        friend = sc.resolve_friend(c, friend_ids, self.key)
+        friend = steam_api.resolve_friend(c, friend_ids, self.key)
         out = {"steamid": steamid, "info": info, "c": c, "friend": friend, "note": note,
-               "story": sc.generate_story(c, info, friend) if friend else None,
-               "death": sc.describe_death(c, info, friend) if c["death"] else None}
+               "story": generator.generate_story(c, info, friend) if friend else None,
+               "death": generator.describe_death(c, info, friend) if c["death"] else None}
         out["view"] = cultivator_view(c, info)
         return out
 
@@ -93,7 +103,7 @@ class Controller:
     def breakthrough_info(self):
         """What the breakthrough dialog shows for the selected cultivator."""
         def work():
-            steamid, c = sc.breakthrough_target(self.key, self.profiles, self.session)
+            steamid, c = progress.breakthrough_target(self.key, self.profiles, self.session)
             return breakthrough_view(c)
         return self._run("breakthrough", work)
 
@@ -101,18 +111,31 @@ class Controller:
         """Attempts the breakthrough. Returns {'result', 'info', 'data'}: what happened, the
         dialog data afterwards and the refreshed card data."""
         def work():
-            steamid, c = sc.breakthrough_target(self.key, self.profiles, self.session)
-            result = sc.attempt_breakthrough(steamid, c, use_pill)
+            steamid, c = progress.breakthrough_target(self.key, self.profiles, self.session)
+            result = progress.attempt_breakthrough(steamid, c, use_pill)
             data = self._view_data(steamid)
             return {"result": result, "info": breakthrough_view(data["c"]), "data": data}
         return self._run("breakthrough attempt" + (" (with a pill)" if use_pill else ""), work)
+
+    # -- adventure -------------------------------------------------------------------------
+    def adventure(self):
+        """Sends the selected cultivator on an adventure (a dead one gets the rebirth roll
+        instead). Returns {'result': what happened, 'data': the refreshed card data}."""
+        def work():
+            steamid = self.selected()
+            if not steamid:
+                raise logs.SteamError("Look up a cultivator first.")
+            info, friend_ids, _, c = generator.build_cultivator(steamid, self.key, self.profiles)
+            result = progress.perform_adventure(steamid, c, info, friend_ids, self.key)
+            return {"result": result, "data": self._view_data(steamid)}
+        return self._run("adventure", work)
 
     # -- history ---------------------------------------------------------------------------
     def history(self):
         """{'name', 'entries'} for the selected cultivator; each entry has when/kind/text."""
         def work():
-            steamid, c = sc.breakthrough_target(self.key, self.profiles, self.session)
-            entries = [dict(e, when=sc.stamp(e["at"])[:16]) for e in sc.history_entries(steamid, 100)]
+            steamid, c = progress.breakthrough_target(self.key, self.profiles, self.session)
+            entries = [dict(e, when=logs.stamp(e["at"])[:16]) for e in storage.history_entries(steamid, 100)]
             return {"name": c["name"], "entries": entries}
         return self._run("history", work)
 
@@ -125,32 +148,43 @@ class Controller:
         """{'steamid', 'c', 'rows'} for the pavilion; raises SteamError if nobody is selected
         or the cultivator is dead."""
         def work():
-            steamid, c = sc.pavilion_target(self.key, self.profiles, self.session)
-            return {"steamid": steamid, "c": c, "rows": shop_rows(c)}
+            steamid, c = pavilion_shop.pavilion_target(self.key, self.profiles, self.session)
+            return {"steamid": steamid, "c": c, "rows": shop_rows(c), "sells": pavilion_shop.sell_rows(c)}
         return self._run("pavilion", work)
+
+    def sell(self, number):
+        """Sells treasure number `number` (as listed in the 'sells' rows) for half its value.
+        Returns the shop data plus 'sold' (the row sold)."""
+        def work():
+            steamid, c = pavilion_shop.pavilion_target(self.key, self.profiles, self.session, "sell")
+            row = pavilion_shop.sell_treasure(steamid, c, number)
+            return {"steamid": steamid, "c": c, "rows": shop_rows(c), "sells": pavilion_shop.sell_rows(c),
+                    "sold": row}
+        return self._run(f"sell {number}", work)
 
     def buy(self, number):
         """Buys item number `number` (as listed in shop rows). Returns the receipt dict."""
         def work():
-            steamid, c = sc.pavilion_target(self.key, self.profiles, self.session)
-            item = sc.buy_pavilion_item(steamid, c, number)
+            steamid, c = pavilion_shop.pavilion_target(self.key, self.profiles, self.session)
+            item = pavilion_shop.buy_pavilion_item(steamid, c, number)
             return {"item": item, "c": c, "rows": shop_rows(c), "steamid": steamid,
-                    "goods": sc.describe_goods(c["pavilion"]["items"]) or "nothing yet",
-                    "treasures": sc.describe_treasures(sc.treasures_of(c)) or "none"}
+                    "sells": pavilion_shop.sell_rows(c),
+                    "goods": generator.describe_goods(c["pavilion"]["items"]) or "nothing yet",
+                    "treasures": generator.describe_treasures(generator.treasures_of(c)) or "none"}
         return self._run(f"pavilion {number}", work)
 
     # -- the duel tab ----------------------------------------------------------------------
     def duel(self, text1, text2):
         text1, text2 = (text1 or "").strip(), (text2 or "").strip()
         if not text1 or not text2:
-            raise sc.SteamError("Type both profiles to make them duel.")
+            raise logs.SteamError("Type both profiles to make them duel.")
 
         def work():
-            ids = [sc.resolve_steamid(t, self.key) for t in (text1, text2)]
-            d = sc.perform_battle(ids, self.key, self.profiles)
+            ids = [steam_api.resolve_steamid(t, self.key) for t in (text1, text2)]
+            d = combat.perform_battle(ids, self.key, self.profiles)
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
-                sc.print_battle(d["a"], d["b"], d["info_a"], d["info_b"], d["result"],
+                display.print_battle(d["a"], d["b"], d["info_a"], d["info_b"], d["result"],
                                 d["story"], d["loot"], d["change"])
             d["ids"] = ids
             d["report"] = buf.getvalue()
@@ -161,8 +195,8 @@ class Controller:
     # -- the log tab -----------------------------------------------------------------------
     def log_text(self):
         """Today's log file, or a note if there is none yet."""
-        path = os.path.join(sc.LOG_DIR, "steam_cultivator_"
-                            + sc.stamp(sc.time.time())[:10] + ".log")
+        path = os.path.join(logs.LOG_DIR, "steam_cultivator_"
+                            + logs.stamp(time.time())[:10] + ".log")
         try:
             with open(path, encoding="utf-8") as f:
                 return f.read()
@@ -184,7 +218,7 @@ def realm_color(index):
 
 def reputation_progress(rep):
     """(fraction 0..1 toward the next rank, caption)."""
-    ranks = sc.REPUTATION_RANKS
+    ranks = gamedata.REPUTATION_RANKS
     i, pts = rep["rank_index"], rep["points"]
     if i >= len(ranks) - 1:
         return 1.0, "highest rank reached"
@@ -200,24 +234,24 @@ def cultivator_view(c, info):
     rows = [("Realm", f"{c['realm']} ({c['realm_flavor']})"),
             ("Gender", c["gender"].capitalize()),
             ("Talent", f"{t['name']} (power {t['power']:+d})"),
-            ("Personality", ", ".join(sc.personality_label(p) for p in c["personalities"])
+            ("Personality", ", ".join(display.personality_label(p) for p in c["personalities"])
              if c["personalities"] else "none (a quiet temperament)"),
-            ("Path", sc.path_label(c["path"])),
+            ("Path", generator.path_label(c["path"])),
             ("Reputation", f"{rep['rank']} ({rep['points']:,} points)")]
     if rep["bonuses"]:
         rows.append(("Fame boosts", ", ".join(f"{n} {a:+d}" for n, a in rep["bonuses"])))
     rows += [("Death risk", f"{c['death_chance'] * 100:g}%"),
              ("Affinity", c["element"]),
-             ("Matchups", f"strong vs {', '.join(sc.ELEMENT_BEATS.get(c['element'], []))}; "
-                          f"weak vs {', '.join(sc.element_weak_to(c['element']))}"),
+             ("Matchups", f"strong vs {', '.join(gamedata.ELEMENT_BEATS.get(c['element'], []))}; "
+                          f"weak vs {', '.join(combat.element_weak_to(c['element']))}"),
              ("Signature", c["technique"]),
-             ("Arsenal", sc.arsenal_text(c))]
-    owned = sc.treasures_of(c)
-    rows.append(("Treasures", sc.describe_treasures(owned) if owned
+             ("Arsenal", generator.arsenal_text(c))]
+    owned = generator.treasures_of(c)
+    rows.append(("Treasures", generator.describe_treasures(owned) if owned
                  else "none (robbed of everything)"))
     events = [e for e in c.get("inventory_history", []) if e.get("type") != "start"]
     if events:
-        rows.append(("Recent", sc.describe_event(events[-1])))
+        rows.append(("Recent", storage.describe_event(events[-1])))
     if info["achievements_hidden"]:
         rows.append(("Missions", "0 (Steam is hiding your achievements)"))
     else:
@@ -226,12 +260,12 @@ def cultivator_view(c, info):
         new = info.get("achievements_new")
         if new and new > 0:
             rows.append(("Since last", f"+{new:,} new mission{'' if new == 1 else 's'} "
-                                       f"(+{new * sc.SECT_POINTS_PER_MISSION:,} sect points) "
+                                       f"(+{new * gamedata.SECT_POINTS_PER_MISSION:,} sect points) "
                                        f"since your last visit"))
-    spent = c.get("pavilion", {}).get("spent", 0)
-    rows.append(("Sect points", f"{c['sect_points']:,}" + (
-        f" (earned {c['sect_points_earned']:,}, spent {spent:,})" if spent else "")))
-    goods = sc.describe_goods(c.get("pavilion", {}).get("items", {}))
+    rows.append(("Sect points", generator.sect_points_text(c)))
+    if c.get("incarnation"):
+        rows.append(("Rebirth", f"Reborn into a new body (incarnation {c['incarnation']})"))
+    goods = generator.describe_goods(c.get("pavilion", {}).get("items", {}))
     if goods:
         rows.append(("Pavilion", goods))
     lost = c.get("lifespan_lost", 0)
@@ -268,33 +302,35 @@ def cultivator_view(c, info):
         "dead": bool(c["death"]), "path": c["path"]["name"],
         "path_color": PATH_COLORS.get(c["path"]["name"], "#999999"),
         "realm": c["realm"], "realm_color": realm_color(c["realm_index"]),
-        "power_fraction": (c["realm_index"] + 1) / len(sc.REALMS),
-        "power_caption": f"realm {c['realm_index'] + 1}/{len(sc.REALMS)}, score {c['score']:,.0f}",
+        "power_fraction": (c["realm_index"] + 1) / len(gamedata.REALMS),
+        "power_caption": f"realm {c['realm_index'] + 1}/{len(gamedata.REALMS)}, score {c['score']:,.0f}",
         "rep_fraction": rep_frac, "rep_caption": rep_caption, "rep_rank": rep["rank"],
         "rows": rows, "source": source, "backstory": c["backstory"],
-        "breakthrough_ready": sc.breakthrough_status(c)["can"],
+        "breakthrough_ready": progress.breakthrough_status(c)["can"],
     }
 
 
 HISTORY_KINDS = {"duel_win": ("Victory", "#6fcf97"), "duel_loss": ("Defeat", "#eb6b6b"),
                  "bought": ("Bought", "#c8a24a"), "treasure": ("Treasure", "#c667d8"),
                  "talisman": ("Talisman", "#5fb3ff"), "breakthrough_ok": ("Breakthrough", "#6fcf97"),
-                 "breakthrough_fail": ("Failed", "#eb6b6b"), "start": ("Start", "#9aa3b5")}
+                 "breakthrough_fail": ("Failed", "#eb6b6b"), "start": ("Start", "#9aa3b5"),
+                 "sold": ("Sold", "#c8a24a"), "adventure": ("Adventure", "#5fb3ff"),
+                 "reborn": ("Reborn", "#a98bff")}
 
 
 def breakthrough_view(c):
     """What the breakthrough dialog needs: whether it can be tried, why not, the realms, the
     chance with its parts (without and with a pill) and the pills owned."""
-    st = sc.breakthrough_status(c)
+    st = progress.breakthrough_status(c)
     out = {"name": c["name"], "can": st["can"], "reason": st["reason"], "current": st["current"],
            "next": st["next"], "pills": st["pills"], "cooldown_left": st["cooldown_left"],
-           "pill_bonus": sc.BREAKTHROUGH_PILL_BONUS, "plain": None, "with_pill": None,
+           "pill_bonus": progress.BREAKTHROUGH_PILL_BONUS, "plain": None, "with_pill": None,
            "risk": "", "fatal": False, "penalty": st["penalty"]}
     if st["chance"]:
-        out["risk"], out["fatal"] = sc.breakthrough_risk_text(st), st["fatal"]
+        out["risk"], out["fatal"] = progress.breakthrough_risk_text(st), st["fatal"]
     if st["chance"]:
-        out["plain"] = {"lines": sc.breakthrough_lines(st["chance"]), "total": st["chance"]["total"]}
-        out["with_pill"] = {"lines": sc.breakthrough_lines(st["chance_pill"]),
+        out["plain"] = {"lines": progress.breakthrough_lines(st["chance"]), "total": st["chance"]["total"]}
+        out["with_pill"] = {"lines": progress.breakthrough_lines(st["chance_pill"]),
                             "total": st["chance_pill"]["total"]}
     return out
 
@@ -302,14 +338,14 @@ def breakthrough_view(c):
 def shop_rows(c):
     """One dict per pavilion item for the shop list. 'number' is what buy() takes."""
     rows = []
-    for n, item in enumerate(sc.PAVILION_ITEMS, 1):
+    for n, item in enumerate(gamedata.PAVILION_ITEMS, 1):
         owned = c["pavilion"]["items"].get(item["id"], 0)
         weapon_owned = item["kind"] == "Weapon" and owned > 0
         affordable = item["price"] <= c["sect_points"]
         rows.append({"number": n, "id": item["id"], "kind": item["kind"], "name": item["name"],
                      "price": item["price"], "blurb": item["blurb"], "owned": owned,
                      "can_buy": affordable and not weapon_owned,
-                     "status": sc.pavilion_status(c, item)})
+                     "status": pavilion_shop.pavilion_status(c, item)})
     return rows
 
 
@@ -352,12 +388,14 @@ class App:
         self.working = False
         self.selected = False            # has a cultivator been looked up yet?
         self.bt_dialog = None
+        self.adv_button = None
+        self.adv_dialog = None
         self.title_font = ctk.CTkFont(size=24, weight="bold")
         self.head_font = ctk.CTkFont(size=15, weight="bold")
         self.body_font = ctk.CTkFont(size=13)
         self.small_font = ctk.CTkFont(size=12)
         self.mono_font = ctk.CTkFont(family="Courier New", size=12)
-        sc.PROGRESS_HOOK = lambda done, total: self.events.put(("progress", done, total))
+        achievements.PROGRESS_HOOK = lambda done, total: self.events.put(("progress", done, total))
         self.root.after(80, self.poll)
         if key:
             self.start(key)
@@ -446,7 +484,7 @@ class App:
         def worker():
             try:
                 self.events.put(("done", on_done, fn()))
-            except sc.SteamError as e:
+            except logs.SteamError as e:
                 self.events.put(("error", on_error, str(e)))
             except BaseException as e:                      # never let a thread die silently
                 self.events.put(("error", on_error, f"Something unexpected went wrong: "
@@ -489,6 +527,12 @@ class App:
         for b in (self.look_button, self.fight_button, self.log_button):
             b.configure(state=state)
         self.bt_button.configure(state=state if self.selected else "disabled")
+        adv = getattr(self, "adv_button", None)
+        if adv is not None and self.widget_alive(adv):
+            try:
+                adv.configure(state=state)
+            except Exception:
+                pass
         for b in self.buy_buttons:
             b.configure(state=state if state == "disabled" else b.intended_state)
 
@@ -555,6 +599,13 @@ class App:
         self.chip(chips, v["path"], v["path_color"])
         self.chip(chips, v["realm"], v["realm_color"])
         self.chip(chips, "Fallen" if v["dead"] else "Alive", BAD if v["dead"] else GOOD)
+        # the Adventure button: top right of this box, under the Look up button
+        self.adv_button = ctk.CTkButton(head, text="Seek rebirth" if v["dead"] else "Adventure",
+                                        command=self.do_adventure, width=110, height=36,
+                                        fg_color="#a98bff" if v["dead"] else "#3f9f7a",
+                                        hover_color="#7d62cc" if v["dead"] else "#2f7a5d",
+                                        text_color="#101010")
+        self.adv_button.place(relx=1.0, x=-16, y=12, anchor="ne")
         if v["breakthrough_ready"]:
             self.chip(chips, "Ready to break through", "#a98bff")
         self.selected = True
@@ -583,6 +634,37 @@ class App:
                                   else "Slain by: ") + label)
             self.paragraph(body, text)
         self.status.configure(text=f"Loaded {v['name']}.", text_color=GOOD)
+
+    def do_adventure(self):
+        self.run_async("Out on an adventure...", self.controller.adventure,
+                       self.show_adventure, self.show_adventure_error)
+
+    def show_adventure_error(self, message):
+        self.status.configure(text=message, text_color=BAD)
+
+    def show_adventure(self, res):
+        r = res["result"]
+        self.show_cultivator(res["data"])
+        ctk = self.ctk
+        if getattr(self, "adv_dialog", None) is not None and self.widget_alive(self.adv_dialog):
+            self.adv_dialog.destroy()
+        dlg = ctk.CTkToplevel(self.root)
+        self.adv_dialog = dlg
+        dlg.title(r["title"])
+        dlg.geometry("560x340")
+        dlg.configure(fg_color=PANEL)
+        try:
+            dlg.transient(self.root)
+        except Exception:
+            pass
+        good = r["kind"] in ("treasure", "friend", "gain", "reborn")
+        color = {"loss": BAD, "rebirth_fail": BAD}.get(r["kind"], ACCENT if good else MUTED)
+        ctk.CTkLabel(dlg, text=r["title"], font=self.title_font, text_color=color
+                     ).pack(padx=24, pady=(22, 8))
+        ctk.CTkLabel(dlg, text=r["text"], font=self.body_font, wraplength=490, justify="left"
+                     ).pack(padx=30, pady=8)
+        ctk.CTkButton(dlg, text="Close", command=dlg.destroy, width=140).pack(pady=20)
+        self.focus_dialog(dlg)
 
     def chip(self, parent, text, color):
         self.ctk.CTkLabel(parent, text=f"  {text}  ", fg_color=color, text_color="#101010",
@@ -703,7 +785,7 @@ class App:
                 if not self.widget_alive(dlg):
                     return
                 r = res["result"]
-                result.configure(text=sc.breakthrough_result_text(info["name"], r),
+                result.configure(text=progress.breakthrough_result_text(info["name"], r),
                                  text_color=GOOD if r["success"] else BAD)
                 close.configure(text="Close")
                 self.show_cultivator(res["data"])
@@ -790,12 +872,17 @@ class App:
         self.pav_msg.configure(text=message, text_color=BAD)
 
     def show_shop(self, data, receipt=None):
+        sold = data.get("sold")
         ctk, c = self.ctk, data["c"]
         body = self.fresh(self.pav_list)
         self.buy_buttons = []
         self.pav_head.configure(text=f"Sect Martial Pavilion - {c['name']} of the {c['sect']}"
                                      f"     Sect points: {c['sect_points']:,}")
-        if receipt:
+        if sold:
+            self.pav_msg.configure(
+                text=f"{c['name']} sold {sold['name']} for {sold['price']:,} sect points "
+                     f"(half of its {sold['value']:,} value).", text_color=GOOD)
+        elif receipt:
             self.pav_msg.configure(
                 text=f"{c['name']} bought {receipt['item']['name']} for "
                      f"{receipt['item']['price']:,} sect points.  Goods: {receipt['goods']}",
@@ -825,6 +912,25 @@ class App:
             b.intended_state = "normal" if r["can_buy"] else "disabled"
             b.pack(side="right", padx=10)
             self.buy_buttons.append(b)
+        self.section(body, "Sell treasures (the pavilion pays half the value)")
+        if not data.get("sells"):
+            self.paragraph(body, "No treasures to sell.", muted=True)
+        for r in data.get("sells", []):
+            row = ctk.CTkFrame(body, fg_color=PANEL_2, corner_radius=8)
+            row.pack(fill="x", padx=6, pady=3)
+            ctk.CTkLabel(row, text=f"{r['name']}   -   pays {r['price']:,}  (worth {r['value']:,})",
+                         font=self.body_font, anchor="w", justify="left", wraplength=WIDE - 160
+                         ).pack(side="left", fill="x", expand=True, padx=10, pady=8)
+            b = ctk.CTkButton(row, text="Sell", width=110, fg_color="#c667d8",
+                              hover_color="#9d4fad", text_color="#101010",
+                              command=lambda n=r["number"]: self.do_sell(n))
+            b.intended_state = "normal"
+            b.pack(side="right", padx=10)
+            self.buy_buttons.append(b)
+
+    def do_sell(self, number):
+        self.run_async("Selling...", lambda: self.controller.sell(number),
+                       self.show_shop, self.show_buy_error)
 
     def do_buy(self, number):
         self.run_async("Buying...", lambda: self.controller.buy(number),
