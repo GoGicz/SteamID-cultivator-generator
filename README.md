@@ -10,7 +10,7 @@ Features
 - Encounters with Steam friends
 - Achievements as sect missions
 - Personality and Reputation system based on your steam Stats
-- Mock Battle system which allow two different SteamID's to have dynamic battles between them
+- Battle system which allow two different SteamID's to have dynamic battles between them and there is also Team battle allowing 2v2 or 3v3 battles
 - full profile caching for better load time
 - Inventory and theft system based on your cached cultivator profile
 - Sect martial pavilion let's you buy treasures and talismans for protection
