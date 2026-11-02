@@ -1,28 +1,15 @@
-**changed:** split the modules for easier understanding of the code
+**Added:**
 
-**How to use it:**
+1. *Team battles, now you can fight alongside someone in either 2v2 or 3v3, good luck...*
+ 
+**Notes:**
 
-*Put all the .py files in one folder, replacing the old steam_cultivator.py and steam_cultivator_gui.py. The zip has the same 14 files if you’d rather download one thing.
-Run python steam_cultivator.py or python steam_cultivator_gui.py as before.
-The top of steam_cultivator.py now lists what each file is for.*
+**How a team battle works**
 
+**Winner:** *it’s based on the teams’ combined power plus the average element matchup. It’s fixed for the same two teams, whichever order you enter them in. Both teams need the same size, and nobody can appear twice or be dead.*
 
-**The modules:**
+**Story:** *it’s built from the paths of both teams (Righteous, Mixed or Demonic), the realm gap, and the fighters’ arsenal. It includes combined attacks, treasure and weapon moments, and personality lines. About 80 new templates cover all of this.*
 
-*steam_cultivator.py is the command line, with the command routing and prompts.*
+**Loot and reputation:** *loot follows the duel rules, paired strongest to strongest. Reputation changes by half of what a duel gives, and only when the lower-realm team wins.*
 
-*steam_cultivator_gui.py is the window.*
-
-*logs.py, steam_api.py, storage.py, achievements.py and steam_profile.py cover logging, Steam requests, saved profiles, achievement counting and assembling a profile.*
-
-*gamedata.py and gametext.py hold the static content: realms, talents, treasures, and all the story and battle templates.*
-
-*generator.py builds the cultivator.*
-
-*combat.py covers duels, theft and duel reputation.*
-
-*pavilion_shop.py covers buying and selling.*
-
-*progress.py covers breakthrough, adventure and rebirth.*
-
-*display.py handles terminal printing.*
+**History:** *each fighter gets a “team battle” entry in their History.*
