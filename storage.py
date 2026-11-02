@@ -322,7 +322,8 @@ def history_entries(steamid, limit=80):
     """Everything this cultivator did recently, newest first, as dicts {'at', 'kind', 'text'}.
     It merges the duel and breakthrough log with the inventory history (found, stolen, robbed,
     bought) and the pavilion history (purchases, talisman use). kind is one of: duel_win,
-    duel_loss, bought, treasure, talisman, breakthrough_ok, breakthrough_fail, start."""
+    duel_loss, bought, treasure, talisman, breakthrough_ok, breakthrough_fail, start, sold, adventure,
+    reborn, team_win, team_loss."""
     pc = load_profile_cache(steamid)
     entries, seen = [], set()
 
@@ -344,6 +345,16 @@ def history_entries(steamid, limit=80):
                     + (" - an upset!" if e.get("upset") else "")
                     + (f". Reputation {rep:+d}" if rep else ""))
             add(e["at"], "duel_win" if e.get("won") else "duel_loss", text)
+        elif e.get("type") == "team":
+            p, rep, allies = e.get("p"), e.get("rep", 0), e.get("allies") or []
+            size = e.get("size", len(allies) + 1)
+            text = (f"{'Won' if e.get('won') else 'Lost'} a {size} vs {size} team battle"
+                    + (f" with {', '.join(allies)}" if allies else "")
+                    + f" against {', '.join(e.get('enemies') or ['someone'])}"
+                    + (f" (win chance {p * 100:.0f}%)" if isinstance(p, (int, float)) else "")
+                    + (" - an upset!" if e.get("upset") else "")
+                    + (f". Reputation {rep:+d}" if rep else ""))
+            add(e["at"], "team_win" if e.get("won") else "team_loss", text)
         elif e.get("type") == "adventure" and e.get("summary"):
             add(e["at"], "adventure", e["summary"])
         elif e.get("type") == "reborn":
@@ -479,3 +490,29 @@ def write_json(path, data):
             _cache_warned = True
             print(f"\n  (Could not save the cache in '{CACHE_DIR}': {e}. Carrying on without it.)")
         return False
+
+
+# ---------------------------------------------------------------------------
+# The most recently looked-up cultivators (the window offers them when you build a team).
+# ---------------------------------------------------------------------------
+RECENT_LIMIT = 12
+
+
+def recent_path():
+    return os.path.join(CACHE_DIR, "recent_lookups.json")
+
+
+def read_recent():
+    """[{'steamid', 'name'}, ...], newest first. Damaged data counts as an empty list."""
+    d = read_json(recent_path())
+    items = d.get("recent") if isinstance(d, dict) else None
+    return [{"steamid": e["steamid"], "name": e["name"]} for e in (items if isinstance(items, list) else [])
+            if isinstance(e, dict) and isinstance(e.get("steamid"), str)
+            and isinstance(e.get("name"), str)][:RECENT_LIMIT]
+
+
+def add_recent(steamid, name):
+    """Puts this cultivator first in the recent list (and updates the name saved for it)."""
+    items = [e for e in read_recent() if e["steamid"] != steamid]
+    items.insert(0, {"steamid": steamid, "name": name})
+    store_json(recent_path(), {"recent": items[:RECENT_LIMIT]})

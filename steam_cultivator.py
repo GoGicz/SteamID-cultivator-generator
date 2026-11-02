@@ -27,7 +27,8 @@ with --refresh) to ignore all saved data and ask Steam for everything again.
 Every cultivator walks the Righteous Path (70% by default, +5 reputation) or the Demonic
 Path (+20 power), by luck from the SteamID. Type "mocb" (or "mocb <profile1> <profile2>")
 to make two cultivators duel: the program works out who is most likely to win and tells a
-short story of the battle. Affinity matters in duels: an element that is strong against
+short story of the battle. Type "team" for a team battle: 2 vs 2 or 3 vs 3 ("team <p> <p> vs
+<p> <p>"), told with combined attacks. Affinity matters in duels: an element that is strong against
 the other's gets +3% win chance (every element beats two and loses to two), and when one
 fighter's power towers over the other's, the story shows the stronger one's arrogance.
 The age of your Steam account sets the age of your cultivator: a brand-new account gives
@@ -104,6 +105,7 @@ Code layout (every .py file must sit in the same folder as this one):
     gametext.py              every story / battle / adventure text template
     generator.py             building the cultivator from the Steam data
     combat.py                duels (mocb), loot, theft, reputation from duels
+    teambattle.py            team battles (2 vs 2 and 3 vs 3)
     pavilion_shop.py         buying goods, selling treasures
     progress.py              breakthrough, adventure, rebirth
     display.py               printing to the terminal
@@ -121,6 +123,7 @@ import pavilion_shop
 import progress
 import steam_api
 import storage
+import teambattle
 
 
 def run_sell(args, key, profiles, session):
@@ -268,6 +271,36 @@ def run_battle(args, key, profiles):
                          duel["story"], duel["loot"], duel["change"])
 
 
+def run_team(args, key, profiles):
+    """The "team" command: 'team <a1> <a2> [<a3>] vs <b1> <b2> [<b3>]', or with no arguments it
+    asks for every fighter (blank answer cancels). Each team has 2 or 3 fighters."""
+    if args:
+        if "vs" not in [a.lower() for a in args]:
+            raise logs.SteamError("Write it as: team <profile> <profile> vs <profile> <profile> "
+                                  "(two or three fighters on each side).")
+        at = [a.lower() for a in args].index("vs")
+        texts_a, texts_b = args[:at], args[at + 1:]
+    else:
+        size_text = input("  Fighters per team (2 or 3, blank to cancel): ").strip()
+        if not size_text:
+            print("  Team battle cancelled.\n")
+            return
+        if size_text not in ("2", "3"):
+            raise logs.SteamError("A team battle is 2 vs 2 or 3 vs 3.")
+        texts_a, texts_b = [], []
+        for name, texts in (("Team One", texts_a), ("Team Two", texts_b)):
+            for n in range(int(size_text)):
+                text = input(f"  {name}, fighter {n + 1} (URL, name or SteamID64, blank to cancel): ").strip()
+                if not text:
+                    print("  Team battle cancelled.\n")
+                    return
+                texts.append(text)
+    teambattle.check_teams(texts_a, texts_b)     # the sizes are checked before Steam is asked anything
+    ids_a = [steam_api.resolve_steamid(t, key) for t in texts_a]
+    ids_b = [steam_api.resolve_steamid(t, key) for t in texts_b]
+    display.print_team_battle(teambattle.perform_team_battle(ids_a, ids_b, key, profiles))
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -276,8 +309,10 @@ def main():
     if not key:
         sys.exit("An API key is required (https://steamcommunity.com/dev/apikey).")
 
+    print(f"Steam Cultivator {gamedata.VERSION}")
     print("Welcome, seeker of the Dao. Press Ctrl+C to leave.")
     print("Tip: type 'mocb' to make two profiles duel (or 'mocb <profile1> <profile2>').")
+    print("Tip: type 'team' for a 2 vs 2 or 3 vs 3 team battle (team <p> <p> vs <p> <p>).")
     print("Tip: type 'pavilion' to spend the sect points of the last cultivator you looked up.")
     print("Tip: type 'breakthrough' to try for the next realm, 'history' to see what they did.")
     print("Tip: type 'adventure' to send the last cultivator out, 'sell' to sell treasures.")
@@ -312,7 +347,7 @@ def main():
 def describe_command(text):
     """What the log says was run, e.g. 'mocb a b', 'refresh lookup of x' or 'lookup of x'."""
     parts = text.split()
-    if parts[0].lower() in ("mocb", "pavilion", "breakthrough", "history", "adventure", "sell"):
+    if parts[0].lower() in ("mocb", "team", "pavilion", "breakthrough", "history", "adventure", "sell"):
         return parts[0].lower() + (" " + " ".join(parts[1:]) if parts[1:] else "")
     if text.lower().startswith("refresh "):
         return f"refresh lookup of {text[len('refresh '):].strip()}"
@@ -329,6 +364,9 @@ def run_command(text, key, profiles, refresh_first, session=None):
         return
     if parts[0].lower() == "breakthrough":
         run_breakthrough(parts[1:], key, profiles, session)
+        return
+    if parts[0].lower() == "team":
+        run_team(parts[1:], key, profiles)
         return
     if parts[0].lower() == "adventure":
         run_adventure(parts[1:], key, profiles, session)

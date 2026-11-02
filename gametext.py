@@ -795,3 +795,298 @@ BATTLE_ELEMENT_LINES = [
     "{dis} could feel {dis_elem} Qi struggle against {adv}'s {adv_elem}, like swimming against "
     "a gentle current.",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Team battles (2 vs 2 or 3 vs 3). In every template, t is a team tag: x and y are the two
+# teams as the story starts (x is the more righteous team), w and l are the winning and the
+# losing team. For each team:  {t_names} ("A and B" / "A, B and C"), {t_sect_text} ("the Azure
+# Lotus Temple" or "the A and the B"), {t_realm} (the strongest member's realm), and for the
+# members by strength {t1} {t2} {t3} with {t1_atk1} {t1_atk2} {t1_path} {t1_def} {t1_tech}
+# {t1_elem} {t1_treasure} {t1_weapon}. Also {place}. The 3-fighter lists are only used in 3 vs 3.
+# ---------------------------------------------------------------------------
+TEAM_OPENINGS = {
+    ("Righteous", "Righteous"): [
+        "At {place}, {x_names} stood against {y_names} in a team battle. Both teams walked the "
+        "Righteous Path, so the bows came first, the formalities second and the fighting third.",
+        "The elders of {x_sect_text} and {y_sect_text} had argued for years about whose disciples "
+        "were better. At {place}, {x_names} and {y_names} settled it the proper way: together, "
+        "team against team, and with a bow.",
+        "A crowd gathered at {place} to see {x_names} meet {y_names}. Every one of them followed "
+        "the Righteous Path, and every one hoped to win without insulting anybody.",
+    ],
+    ("Righteous", "Mixed"): [
+        "At {place}, {x_names} met {y_names}. The righteous side bowed. Someone on the other side "
+        "bowed too, a little late, and nobody could tell whether they meant it.",
+        "{y_names} arrived at {place} as a team of mixed loyalties, and {x_names} asked "
+        "politely whether they could agree on what they were fighting for. They could not.",
+        "The disciples of {x_sect_text} gathered at {place} to watch {x_names} take on {y_names}, "
+        "a team that had both honorable and shadowy methods up its sleeves.",
+    ],
+    ("Righteous", "Demonic"): [
+        "At {place}, the righteous {x_names} faced the Demonic {y_names}. Nobody had to explain "
+        "why this was a team battle: the old grudge between the two Paths was explanation enough.",
+        "{x_names} swore to stop {y_names} for the sake of the righteous sects, and {y_names} "
+        "laughed, because stopping them had been tried before. The battle at {place} began.",
+        "A cold wind crossed {place} as {x_names} formed their line against {y_names}, a team "
+        "from the Demonic Path that had not come to talk.",
+    ],
+    ("Mixed", "Mixed"): [
+        "{x_names} and {y_names} met at {place}. Both teams were an odd mix of Righteous and "
+        "Demonic cultivators, so nobody agreed on the rules and everybody fought dirty a little.",
+        "At {place}, two uneasy teams faced each other: {x_names} against {y_names}. Both had "
+        "friends who followed the Righteous Path and friends who did not, and the quarrels "
+        "started before the first strike.",
+        "The crowd at {place} could not tell who the good side was: {x_names} and {y_names} "
+        "each had saints and sinners in their ranks. They came for the fight anyway.",
+    ],
+    ("Mixed", "Demonic"): [
+        "At {place}, {x_names} met the Demonic {y_names}. The mixed team had a few righteous "
+        "members who hoped to keep this honorable, and the Demonic side had no such hopes.",
+        "{y_names} came to {place} smiling, the way the Demonic Path smiles before a fight, and "
+        "{x_names} answered with a nervous mix of vows and shadows.",
+        "The team of {x_names} did not fully trust itself, and {y_names} did not trust anyone. "
+        "The battle at {place} promised to be an ugly one.",
+    ],
+    ("Demonic", "Demonic"): [
+        "At {place}, {x_names} and {y_names}, two Demonic teams, met without the least trace of "
+        "courtesy. Betrayal was already planned by both sides, just not yet carried out.",
+        "No bows were exchanged at {place}. {x_names} and {y_names} both followed the Demonic "
+        "Path, and both teams watched their own backs as much as their enemies'.",
+        "A crowd of the curious kept a very safe distance as the Demonic teams of {x_names} and "
+        "{y_names} met at {place}. Every spectator expected a mess.",
+    ],
+}
+
+TEAM_CLASHES = [
+    "The first exchange shook the ground: {x1} struck with {x1_tech} while {y1} answered with "
+    "{y1_tech}, {x1_elem} against {y1_elem}, and the others circled for their own openings.",
+    "{x1} and {y1} met in the middle with {x1_tech} against {y1_tech}, and the rest of both teams "
+    "fanned out to find their own opponents.",
+    "{y1} struck first with {y1_atk1}, and {x1} caught it on {x1_def}. Behind them, {x2} and "
+    "{y2} were already testing each other.",
+    "The shouts of both teams rose at once. {x1_tech} lit the air on one side and {y1_tech} on "
+    "the other, and the whole field became one tangle of Qi.",
+    "{x2} opened with {x2_atk1}, and {y2} replied with {y2_atk1}. Neither backed down, and "
+    "both teams closed ranks around their strongest.",
+    "Both teams rushed forward. {x1}'s treasure, {x1_treasure}, glinted next to the treasure "
+    "of {y1}, {y1_treasure}, and for a moment the spectators could not tell who had struck whom.",
+]
+
+TEAM_WEAPON_LINES = [
+    "{who} drew the {weapon} and cut a bright arc toward {foe}.",
+    "The {weapon} in {who}'s hand sang as it flew at {foe}.",
+    "{who} threw the {weapon} forward, and {foe} had to leap aside.",
+    "With the {weapon} in hand, {who} pressed {foe} back several steps.",
+]
+
+TEAM_TREASURE_LINES = [
+    "The treasure of {who}, {treasure}, flared at the right moment and turned a blow that should "
+    "have landed.",
+    "{who} raised {treasure} and the Qi of the whole field bent around it.",
+    "{who} drew on {treasure}, and the strike that followed was much heavier than it had any "
+    "right to be.",
+]
+
+TEAM_COMBOS_WIN = {
+    2: [
+        "Then {w1} and {w2} moved as one: {w1_atk1} wrapped around {w2_atk1}, and the combined "
+        "strike split the opposing line.",
+        "{w1} and {w2} exchanged one glance. {w1} opened with {w1_path} while {w2} followed with "
+        "{w2_atk2}, and the two techniques arrived at the same instant.",
+        "{w2} drew the enemy's eyes with {w2_atk1}, and {w1} slid in behind it with {w1_atk2}. "
+        "It was a combined attack they had practiced for years.",
+        "Back to back, {w1} and {w2} spun and struck: {w1_path} and {w2_path}, one pouring into "
+        "the other until the Qi sang.",
+    ],
+    3: [
+        "Then {w1}, {w2} and {w3} struck together: {w1_atk1} in front, {w2_atk1} from the side "
+        "and {w3_atk1} from above, a three-way attack that left no gap.",
+        "{w1} shouted a single word, and {w2} and {w3} knew exactly what it meant. {w2_path} and "
+        "{w3_path} wrapped around {w1_atk1} and the line of enemies shook.",
+        "{w3} held the enemy with {w3_def} while {w1} and {w2} came in from both sides, "
+        "{w1_atk2} and {w2_atk2} meeting in the center like two halves of a clap.",
+        "The three of them, {w1}, {w2} and {w3}, formed a triangle. {w1_path} fed {w2_path}, "
+        "{w2_path} fed {w3_path}, and the combined technique came out as one huge blow.",
+    ],
+}
+
+TEAM_COMBOS_LOSE = {
+    2: [
+        "{l1} and {l2} answered with a combined attack of their own, {l1_atk1} woven into "
+        "{l2_atk1}, and for a moment the line of the other team bent.",
+        "{l2} covered {l1} with {l2_def} while {l1} struck with {l1_path}. It almost worked.",
+    ],
+    3: [
+        "{l1}, {l2} and {l3} came back with a triple strike, {l1_atk1}, {l2_atk1} and {l3_atk1} "
+        "meeting in the middle, and the ground cracked under it.",
+        "{l3} held the line with {l3_def}, {l2} struck with {l2_path} and {l1} finished the "
+        "chain with {l1_atk2}. It almost worked.",
+    ],
+}
+
+TEAM_EXCHANGES = {
+    "upset": [
+        "Nobody expected {l_names} to be pushed so hard. Every time the stronger team found an "
+        "opening, someone on the weaker team filled it with a clever step.",
+        "The favorites kept pressing, and the underdogs kept slipping away, as if they had "
+        "read the whole fight in advance.",
+        "The team that should have lost refused to break. Each fall was answered by a "
+        "counter, and each counter was cheered louder than the one before.",
+    ],
+    "close": [
+        "Neither team gave an inch. The fight swung back and forth, and the spectators lost "
+        "count of who was ahead.",
+        "It was a fight of inches: a step here, a strike there, and nobody on either team "
+        "could afford a single mistake.",
+        "Both teams traded blow for blow until the ground around them was torn open and the "
+        "air tasted of iron.",
+    ],
+    "clear": [
+        "The stronger team slowly took control, and the weaker one began to give ground.",
+        "{w_names} found their rhythm early, and the other team could only answer, never lead.",
+        "It was not a fast fight, but it was a one-sided one: every exchange went a little "
+        "more to {w_names}.",
+    ],
+    "crushing": [
+        "It was over almost before it began. {l_names} could barely follow the strikes of "
+        "{w_names}.",
+        "{w_names} were simply in another league, and every move of {l_names} was answered "
+        "before it was finished.",
+        "The spectators looked at each other. This was not a team battle anymore, it was a "
+        "lesson.",
+    ],
+}
+
+TEAM_TURNS = {
+    "upset": [
+        "Then {w1} saw the one hole in the enemy line, and the whole underdog team went through "
+        "it at once. The favorites never recovered.",
+        "At the decisive moment {w1} did the impossible and the favorites looked up too late. "
+        "{w_names} won against all prediction.",
+    ],
+    "close": [
+        "The turning point came when {w1} bought one heartbeat of space for the team, and "
+        "{w_names} used it to win.",
+        "A single mistake decided it, and it was not theirs. {w_names} took the opening and "
+        "never gave it back.",
+    ],
+    "clear": [
+        "When {l1} finally slipped, {w_names} did not hesitate, and the line of the other "
+        "team came apart.",
+        "{w1} led, the others followed, and the line of {l_names} could not hold any longer.",
+    ],
+    "crushing": [
+        "With one last combined strike {w_names} ended the fight. The line of {l_names} did not "
+        "so much break as vanish.",
+        "{l_names} tried once more, and {w_names} simply walked through it.",
+    ],
+}
+
+TEAM_REALM_LINES = {
+    "stronger": [
+        "The higher cultivation of {w_names} ({w_realm}) was simply too much for {l_names} "
+        "({l_realm}).",
+        "As {w_realm} cultivators, {w_names} had more Qi than {l_names} could answer, and Qi "
+        "settles many arguments.",
+    ],
+    "weaker": [
+        "{w_names} were only {w_realm} cultivators, yet they beat {l_names}, who stood at "
+        "{l_realm}. It will be talked about for a long time.",
+        "On paper, {l_names} ({l_realm}) should have crushed {w_names} ({w_realm}). The paper "
+        "was wrong.",
+    ],
+    "even": [
+        "Both teams stood at the same height of cultivation, so only skill and teamwork could "
+        "decide it.",
+    ],
+}
+
+TEAM_PERSONALITY_LINES = [
+    "In the thick of it, {name} {trait}.",
+    "Through the whole fight {name} {trait}.",
+    "As ever, {name} {trait}, even in the middle of a team battle.",
+    "Even now, {name} {trait}.",
+]
+
+TEAM_ENDINGS = {
+    ("Righteous", "Righteous"): [
+        "{l_names} yielded with a bow and {w_names} returned it. Both teams carried each other's "
+        "wounded off the field, and the elders agreed it had been an honorable team battle.",
+        "Handshakes and bows all around. By evening, {w_sect_text} and {l_sect_text} were "
+        "sharing tea and arguing about the rematch.",
+    ],
+    ("Righteous", "Mixed"): [
+        "{w_names} lowered their weapons first. Even those of {l_names} who did not follow the "
+        "Righteous Path bowed, grudgingly.",
+        "The victory of {w_names} was clean, and even the shadier members of {l_names} admitted it.",
+    ],
+    ("Righteous", "Demonic"): [
+        "{l_names} spat blood and a curse. {w_names} did not answer: they had won for the "
+        "righteous sects, and they knew the Demonic Path would come back.",
+        "{w_names} did not gloat. Behind them, the elders of {w_sect_text} breathed again, and "
+        "in front of them {l_names} vanished into the dark.",
+    ],
+    ("Mixed", "Righteous"): [
+        "{w_names} won, though some of them were not proud of how. {l_names} bowed anyway, "
+        "righteous to the end.",
+        "A mixed team beat a righteous one, and the righteous one forgave it faster than the "
+        "mixed one forgave itself.",
+    ],
+    ("Mixed", "Mixed"): [
+        "Nobody could say whether the winners or the losers were more relieved. {w_names} "
+        "limped away with the victory and {l_names} limped away with their pride.",
+        "Both teams had broken half the rules, so both agreed to forget the other half. "
+        "{w_names} took the win.",
+    ],
+    ("Mixed", "Demonic"): [
+        "{l_names} promised revenge in the way the Demonic Path does, which is to say sweetly. "
+        "{w_names} took the promise and left quickly.",
+        "{w_names} won, and the righteous among them insisted on helping the fallen {l_names} "
+        "up. The fallen {l_names} did not appreciate it.",
+    ],
+    ("Demonic", "Righteous"): [
+        "{l_names} yielded with a bow. {w_names} did not return it, which surprised nobody who "
+        "knew the Demonic Path.",
+        "{w_names} left the field laughing while {l_names} bowed to nobody in particular and "
+        "swore to train harder.",
+    ],
+    ("Demonic", "Mixed"): [
+        "{w_names} took what they came for, and {l_names} learned that mixed loyalties and "
+        "Demonic teamwork rarely meet well.",
+        "{l_names} yielded. {w_names} accepted, with the smile that made everyone in the crowd "
+        "check their pockets.",
+    ],
+    ("Demonic", "Demonic"): [
+        "Both teams cursed each other loudly. {w_names} had won, and the first thing they did "
+        "was check whether {l_names} had left any traps.",
+        "{w_names} won the team battle, and {l_names} had already started planning a rematch "
+        "full of poison and lies.",
+    ],
+}
+
+TEAM_LOOT_STOLEN = [
+    "In the confusion after the battle, {thief} took {stolen} from {victim}.",
+    "{thief} did not leave empty-handed: {stolen} had belonged to {victim} until that moment.",
+]
+TEAM_LOOT_BLOCKED = [
+    "{thief} reached for the treasure of {victim}, but a Spatial Escape Talisman folded space "
+    "around it, and {thief} grabbed only air.",
+]
+TEAM_LOOT_FOUND = [
+    "Afterwards, {finder} found {found} among the wreckage of the field.",
+    "Searching the field, {finder} came across {found}, a lucky find.",
+]
+TEAM_REP_GAIN = [
+    "News that {w_names} had beaten a team of higher realms spread across the region by "
+    "nightfall.",
+    "Storytellers had a new tale by the next market day: how {w_names} brought down a stronger team.",
+]
+TEAM_REP_LOSS_LIGHT = [
+    "Among the righteous such a defeat was forgiven quickly, though {l_names} felt the sting of "
+    "losing to a lower realm.",
+]
+TEAM_REP_LOSS_HEAVY = [
+    "{l_names} were laughed at in every tea house for losing to a lower realm.",
+    "The gossips will not forget that {l_names} lost to a team of lower cultivation.",
+]

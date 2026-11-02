@@ -8,6 +8,7 @@ import gamedata
 import generator
 import pavilion_shop
 import storage
+import teambattle
 
 
 def power_bar(idx):
@@ -290,3 +291,67 @@ def print_battle(a, b, info_a, info_b, result, story, loot=None, change=None):
 def print_moves(c):
     """The 'Moves' row of a duel fighter block, wrapped under its label."""
     print_items("      Moves      : ", generator.arsenal_text(c).split(", "))
+
+
+def print_team_battle(d):
+    """Prints a team battle as returned by teambattle.perform_team_battle."""
+    line = "=" * 64
+    result, change = d["result"], d["change"]
+    size = len(d["team_a"])
+    print("\n" + line)
+    print(f"  TEAM BATTLE  -  {size} vs {size}")
+    print(line)
+    for tag, team, infos, p in (("ONE", d["team_a"], d["infos_a"], result["p_a"]),
+                                ("TWO", d["team_b"], d["infos_b"], result["p_b"])):
+        print(f"  TEAM {tag}  ({teambattle.team_type(team)}, win chance {p * 100:.1f}%)")
+        for c, info in zip(team, infos):
+            print(f"    {c['name']} of the {c['sect']}  (Steam: {info['name']})")
+            print(f"        {c['realm']}, power {c['score']:,.0f}, {c['path']['name']}, "
+                  f"{c['element']}, {c['talent']['name']}")
+            print(f"        Technique: {c['technique']}")
+            weapon = teambattle.best_weapon(c)
+            if weapon:
+                print(f"        Weapon   : {weapon}")
+        print()
+    shift = result["element_shift_a"]
+    if shift:
+        side = "Team One" if shift > 0 else "Team Two"
+        wrap_print(f"Elements   : the matchups favor {side} ({abs(shift) * 100:.1f}% win chance; "
+                   f"power alone: {result['p_power_a'] * 100:.1f}% for Team One)")
+    else:
+        wrap_print("Elements   : the matchups cancel out")
+    fav = "Team One" if result["favorite_side"] == "a" else "Team Two"
+    if result["even"]:
+        wrap_print("Prediction : a perfectly even match, too close to call")
+    else:
+        wrap_print(f"Prediction : {fav} is most likely to win "
+                   f"({max(result['p_a'], result['p_b']) * 100:.1f}%)")
+    print(line + "\n")
+    wrap_print(d["story"])
+    print()
+    won_a = result["winner_side"] == "a"
+    winners = d["team_a"] if won_a else d["team_b"]
+    losers = d["team_b"] if won_a else d["team_a"]
+    word = "UPSET! " if result["upset"] else ""
+    wrap_print(f"Result : {word}Team {'One' if won_a else 'Two'} "
+               f"({teambattle.names_text(winners)}) wins the team battle"
+               + (f" against the odds ({result['p_winner'] * 100:.1f}% chance)." if result["upset"] else "."))
+    for p in d["pairs"]:
+        loot = p["loot"]
+        if loot["stolen"]:
+            wrap_print(f"Loot : {p['winner']['name']} stole {loot['stolen']} from {p['loser']['name']}.")
+        elif loot.get("blocked"):
+            wrap_print(f"Loot : {p['winner']['name']} tried to rob {p['loser']['name']}, but a Spatial "
+                       f"Escape Talisman saved the treasure.")
+        if loot["found"]:
+            wrap_print(f"Lucky find : {p['winner']['name']} found {loot['found']}.")
+    if change["kind"] == "upset":
+        wrap_print(f"Reputation : each of {teambattle.names_text(winners)} +{change['gain']}; "
+                   f"each of {teambattle.names_text(losers)} "
+                   + (f"-{change['loss']}" if change["loss"] else "has no reputation left to lose")
+                   + (", a lighter blow among the righteous" if change["light"] else "") + ".")
+    elif change["kind"] == "same":
+        wrap_print("Reputation : the teams are on the same realm, so nobody gains or loses reputation.")
+    else:
+        wrap_print("Reputation : the stronger realm won as expected, so nothing changes.")
+    print(line + "\n")

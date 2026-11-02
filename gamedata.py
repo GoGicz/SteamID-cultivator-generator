@@ -1,6 +1,8 @@
 """Static game content: realms, talents, paths, personalities, reputation ranks, names, titles,
 elements, treasures and pavilion goods, signature moves."""
 
+VERSION = "v0.2.4"        # shown in the window (top left) and when the command line starts
+
 
 SECT_POINTS_PER_MISSION = 5   # 1 unlocked achievement = 1 sect mission = 5 sect points
 

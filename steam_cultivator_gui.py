@@ -5,7 +5,8 @@ Steam Cultivator - window version (dark theme, CustomTkinter)
 Needs:  pip install customtkinter
 Run:    python steam_cultivator_gui.py        (the engine modules, steam_cultivator.py and the other .py files, must be next to it)
 
-Tabs: Cultivator (with the Breakthrough button), Pavilion, Duel, History and Log.
+Tabs: Cultivator (with Breakthrough and Adventure), Pavilion, Battles (Duel, Team Battle,
+Sect War), History and Log.
 
 It uses exactly the same engine, the same cache folder and the same Logs folder as the
 terminal program (python steam_cultivator.py), so both versions share every cultivator, treasure,
@@ -36,6 +37,7 @@ import pavilion_shop
 import progress
 import steam_api
 import storage
+import teambattle
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +94,7 @@ class Controller:
         (Called from inside _run, so it takes no lock itself.)"""
         info, friend_ids, note, c = generator.build_cultivator(steamid, self.key, self.profiles, refresh)
         self.session["latest"] = steamid
+        storage.add_recent(steamid, c["name"])
         friend = steam_api.resolve_friend(c, friend_ids, self.key)
         out = {"steamid": steamid, "info": info, "c": c, "friend": friend, "note": note,
                "story": generator.generate_story(c, info, friend) if friend else None,
@@ -191,6 +194,32 @@ class Controller:
             d["winner_side"] = "a" if d["result"]["winner"] is d["a"] else "b"
             return d
         return self._run(f"mocb {text1} {text2}", work)
+
+    def recent_list(self):
+        """Up to 5 recently looked-up cultivators for building teams, newest first. The one
+        that is selected right now is left out."""
+        current = self.selected()
+        return [e for e in storage.read_recent() if e["steamid"] != current][:5]
+
+    def team_battle(self, texts_a, texts_b):
+        """A team battle between two teams of profile texts (2 vs 2 or 3 vs 3). Returns the
+        battle data (see teambattle.perform_team_battle) plus 'report', the printed report."""
+        texts_a = [(t or "").strip() for t in texts_a]
+        texts_b = [(t or "").strip() for t in texts_b]
+        if "" in texts_a + texts_b:
+            raise logs.SteamError("Fill in every fighter slot of both teams first.")
+        teambattle.check_teams(texts_a, texts_b)
+
+        def work():
+            ids_a = [steam_api.resolve_steamid(t, self.key) for t in texts_a]
+            ids_b = [steam_api.resolve_steamid(t, self.key) for t in texts_b]
+            d = teambattle.perform_team_battle(ids_a, ids_b, self.key, self.profiles)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                display.print_team_battle(d)
+            d["report"] = buf.getvalue()
+            return d
+        return self._run(f"team battle {len(texts_a)} vs {len(texts_b)}", work)
 
     # -- the log tab -----------------------------------------------------------------------
     def log_text(self):
@@ -315,7 +344,8 @@ HISTORY_KINDS = {"duel_win": ("Victory", "#6fcf97"), "duel_loss": ("Defeat", "#e
                  "talisman": ("Talisman", "#5fb3ff"), "breakthrough_ok": ("Breakthrough", "#6fcf97"),
                  "breakthrough_fail": ("Failed", "#eb6b6b"), "start": ("Start", "#9aa3b5"),
                  "sold": ("Sold", "#c8a24a"), "adventure": ("Adventure", "#5fb3ff"),
-                 "reborn": ("Reborn", "#a98bff")}
+                 "reborn": ("Reborn", "#a98bff"),
+                 "team_win": ("Team win", "#6fcf97"), "team_loss": ("Team loss", "#eb6b6b")}
 
 
 def breakthrough_view(c):
@@ -379,7 +409,7 @@ class App:
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("dark-blue")
         self.root = ctk.CTk()
-        self.root.title("Steam Cultivator")
+        self.root.title(f"Steam Cultivator {gamedata.VERSION}")
         self.root.geometry("1040x780")
         self.root.minsize(860, 600)
         self.root.configure(fg_color=BG)
@@ -388,6 +418,9 @@ class App:
         self.working = False
         self.selected = False            # has a cultivator been looked up yet?
         self.bt_dialog = None
+        self.team_dialog = None
+        self.team_size = 2
+        self.team_entries = {"a": [], "b": []}
         self.adv_button = None
         self.adv_dialog = None
         self.title_font = ctk.CTkFont(size=24, weight="bold")
@@ -395,6 +428,10 @@ class App:
         self.body_font = ctk.CTkFont(size=13)
         self.small_font = ctk.CTkFont(size=12)
         self.mono_font = ctk.CTkFont(family="Courier New", size=12)
+        # the program version, always visible at the very top left
+        self.version_label = ctk.CTkLabel(self.root, text=gamedata.VERSION, font=self.small_font,
+                                          text_color=MUTED, anchor="w")
+        self.version_label.pack(side="top", anchor="w", padx=16, pady=(8, 0))
         achievements.PROGRESS_HOOK = lambda done, total: self.events.put(("progress", done, total))
         self.root.after(80, self.poll)
         if key:
@@ -444,11 +481,11 @@ class App:
                                    segmented_button_selected_color=ACCENT,
                                    segmented_button_selected_hover_color="#a8862f")
         self.tabs.pack(fill="both", expand=True, padx=14, pady=(14, 6))
-        for name in ("Cultivator", "Pavilion", "Duel", "History", "Log"):
+        for name in ("Cultivator", "Pavilion", "Battles", "History", "Log"):
             self.tabs.add(name)
         self.build_cultivator_tab(self.tabs.tab("Cultivator"))
         self.build_pavilion_tab(self.tabs.tab("Pavilion"))
-        self.build_duel_tab(self.tabs.tab("Duel"))
+        self.build_duel_tab(self.tabs.tab("Battles"))
         self.build_history_tab(self.tabs.tab("History"))
         self.build_log_tab(self.tabs.tab("Log"))
         bar = ctk.CTkFrame(self.root, fg_color="transparent")
@@ -535,6 +572,12 @@ class App:
                 pass
         for b in self.buy_buttons:
             b.configure(state=state if state == "disabled" else b.intended_state)
+        for b in (getattr(self, "team_start", None), getattr(self, "team_button", None)):
+            if b is not None and self.widget_alive(b):
+                try:
+                    b.configure(state=state)
+                except Exception:
+                    pass
 
     # -- tab: cultivator -------------------------------------------------------------------
     def build_cultivator_tab(self, tab):
@@ -634,6 +677,7 @@ class App:
                                   else "Slain by: ") + label)
             self.paragraph(body, text)
         self.status.configure(text=f"Loaded {v['name']}.", text_color=GOOD)
+        self.refresh_team_recent()
 
     def do_adventure(self):
         self.run_async("Out on an adventure...", self.controller.adventure,
@@ -941,7 +985,22 @@ class App:
 
     # -- tab: duel -------------------------------------------------------------------------
     def build_duel_tab(self, tab):
+        """The Battles tab: three buttons (Duel, Team Battle, Sect War), and the duel below."""
         ctk = self.ctk
+        modes = ctk.CTkFrame(tab, fg_color="transparent")
+        modes.pack(fill="x", pady=(4, 6))
+        self.duel_mode_button = ctk.CTkButton(modes, text="Duel", width=150, height=36,
+                                              fg_color=BAD, hover_color="#b84848",
+                                              command=self.focus_duel)
+        self.duel_mode_button.pack(side="left", padx=(0, 8))
+        self.team_button = ctk.CTkButton(modes, text="Team Battle", width=150, height=36,
+                                         fg_color="#3f7fd1", hover_color="#2f62a3",
+                                         command=self.open_team_window)
+        self.team_button.pack(side="left", padx=8)
+        self.sect_war_button = ctk.CTkButton(modes, text="Sect War", width=150, height=36,
+                                             state="disabled", fg_color="#3a3f4d",
+                                             text_color_disabled="#7d8497")
+        self.sect_war_button.pack(side="left", padx=8)           # not available yet
         top = ctk.CTkFrame(tab, fg_color="transparent")
         top.pack(fill="x", pady=(4, 8))
         self.duel_entries = []
@@ -955,8 +1014,192 @@ class App:
         self.fight_button.pack(side="left")
         self.duel_area = ctk.CTkScrollableFrame(tab, fg_color=PANEL, corner_radius=10)
         self.duel_area.pack(fill="both", expand=True)
-        self.say(self.duel_area, "Enter two profiles and let their cultivators duel. "
-                                 "Dead cultivators cannot fight.")
+        self.say(self.duel_area, "Enter two profiles and let their cultivators duel, or press "
+                                 "Team Battle for 2 vs 2 and 3 vs 3. Dead cultivators cannot fight.")
+
+    def focus_duel(self):
+        try:
+            self.duel_entries[0].focus()
+        except Exception:
+            pass
+
+    # -- the team battle window --------------------------------------------------------------
+    def open_team_window(self):
+        if self.controller is None:
+            return
+        ctk = self.ctk
+        if self.team_dialog is not None and self.widget_alive(self.team_dialog):
+            try:
+                self.team_dialog.lift()
+                self.team_dialog.focus()
+            except Exception:
+                pass
+            return
+        dlg = ctk.CTkToplevel(self.root)
+        self.team_dialog = dlg
+        dlg.title("Team Battle")
+        dlg.geometry("1020x860")
+        dlg.configure(fg_color=PANEL)
+        try:
+            dlg.transient(self.root)
+        except Exception:
+            pass
+        ctk.CTkLabel(dlg, text="Team Battle", font=self.title_font, text_color=ACCENT
+                     ).pack(pady=(14, 0))
+        ctk.CTkLabel(dlg, text="Type a profile for every slot, or pick from the recently looked-up "
+                     "cultivators below. Team One fights on the left, Team Two on the right.",
+                     font=self.small_font, text_color=MUTED, wraplength=900).pack(pady=(0, 6))
+        sizes = ctk.CTkFrame(dlg, fg_color="transparent")
+        sizes.pack(pady=4)
+        self.team_size_buttons = {}
+        for n in (2, 3):
+            b = ctk.CTkButton(sizes, text=f"{n} vs {n}", width=110,
+                              command=lambda n=n: self.set_team_size(n))
+            b.pack(side="left", padx=4)
+            self.team_size_buttons[n] = b
+        cols = ctk.CTkFrame(dlg, fg_color="transparent")
+        cols.pack(fill="x", padx=16, pady=4)
+        cols.grid_columnconfigure((0, 1), weight=1)
+        self.team_entries = {"a": [], "b": []}
+        for col, (side, title, color) in enumerate((("a", "Team One", "#5fb3ff"),
+                                                    ("b", "Team Two", "#e0a85f"))):
+            box = ctk.CTkFrame(cols, fg_color=PANEL_2, corner_radius=10)
+            box.grid(row=0, column=col, sticky="nsew", padx=6)
+            ctk.CTkLabel(box, text=title, font=self.head_font, text_color=color).pack(pady=(10, 4))
+            for n in range(3):
+                e = ctk.CTkEntry(box, placeholder_text=f"Fighter {n + 1}: URL, name or SteamID64",
+                                 height=34)
+                e.pack(fill="x", padx=12, pady=3)
+                self.team_entries[side].append(e)
+            ctk.CTkButton(box, text="Clear", width=80, fg_color=PANEL,
+                          command=lambda sd=side: self.clear_team(sd)).pack(pady=(4, 10))
+        self.team_recent_box = ctk.CTkFrame(dlg, fg_color=PANEL_2, corner_radius=10)
+        self.team_recent_box.pack(fill="x", padx=22, pady=8)
+        row = ctk.CTkFrame(dlg, fg_color="transparent")
+        row.pack(pady=(2, 0))
+        self.team_start = ctk.CTkButton(row, text="Start team battle", width=200, height=38,
+                                        fg_color=BAD, hover_color="#b84848",
+                                        command=self.do_team_battle)
+        self.team_start.pack(side="left", padx=6)
+        ctk.CTkButton(row, text="Close", width=110, height=38, fg_color=PANEL_2,
+                      command=dlg.destroy).pack(side="left", padx=6)
+        self.team_msg = ctk.CTkLabel(dlg, text="", font=self.body_font, text_color=MUTED,
+                                     wraplength=900, justify="left")
+        self.team_msg.pack(pady=(4, 2))
+        self.team_result = ctk.CTkScrollableFrame(dlg, fg_color=PANEL, corner_radius=10)
+        self.team_result.pack(fill="both", expand=True, padx=16, pady=(0, 14))
+        self.set_team_size(2)
+        self.refresh_team_recent()
+
+    def set_team_size(self, n):
+        self.team_size = n
+        for size, b in self.team_size_buttons.items():
+            b.configure(fg_color=ACCENT if size == n else PANEL_2,
+                        text_color="#1a1a1a" if size == n else TEXT)
+        for side in ("a", "b"):
+            third = self.team_entries[side][2]
+            if n == 2:
+                third.delete(0, "end")
+                third.configure(state="disabled")
+            else:
+                third.configure(state="normal")
+
+    def clear_team(self, side):
+        for e in self.team_entries[side]:
+            if str(e.cget("state") or "normal") != "disabled":
+                e.delete(0, "end")
+
+    def refresh_team_recent(self):
+        """Redraws the 'recently looked up' list (never shows the selected cultivator)."""
+        if self.team_dialog is None or not self.widget_alive(self.team_dialog) or self.controller is None:
+            return
+        ctk = self.ctk
+        body = self.fresh(self.team_recent_box)
+        ctk.CTkLabel(body, text="Recently looked up (the selected cultivator is not listed)",
+                     font=self.head_font, text_color=ACCENT, anchor="w").pack(fill="x", padx=12, pady=(8, 2))
+        recent = self.controller.recent_list()
+        if not recent:
+            ctk.CTkLabel(body, text="Nobody yet: look up some profiles in the Cultivator tab.",
+                         font=self.small_font, text_color=MUTED, anchor="w").pack(fill="x", padx=12, pady=(0, 8))
+            return
+        for e in recent:
+            row = ctk.CTkFrame(body, fg_color="transparent")
+            row.pack(fill="x", padx=10, pady=1)
+            ctk.CTkLabel(row, text=f"{e['name']}    ({e['steamid']})", font=self.body_font,
+                         anchor="w").pack(side="left", fill="x", expand=True)
+            ctk.CTkButton(row, text="Team Two", width=90, height=26, fg_color="#e0a85f",
+                          text_color="#1a1a1a", hover_color="#b88840",
+                          command=lambda sid=e["steamid"]: self.add_to_team("b", sid)
+                          ).pack(side="right", padx=3)
+            ctk.CTkButton(row, text="Team One", width=90, height=26, fg_color="#5fb3ff",
+                          text_color="#1a1a1a", hover_color="#4a8fcc",
+                          command=lambda sid=e["steamid"]: self.add_to_team("a", sid)
+                          ).pack(side="right", padx=3)
+        ctk.CTkLabel(body, text="", height=4).pack()
+
+    def add_to_team(self, side, steamid):
+        """Puts a recent cultivator in the first free slot of a team."""
+        used = [e.get().strip() for sd in ("a", "b") for e in self.team_entries[sd][:self.team_size]]
+        name = "Team One" if side == "a" else "Team Two"
+        if steamid in used:
+            self.team_msg.configure(text="That cultivator is already on a team.", text_color=BAD)
+            return
+        for e in self.team_entries[side][:self.team_size]:
+            if not e.get().strip():
+                e.insert(0, steamid)
+                self.team_msg.configure(text="", text_color=MUTED)
+                return
+        self.team_msg.configure(text=f"{name} is full ({self.team_size} fighters).", text_color=BAD)
+
+    def do_team_battle(self):
+        a = [e.get() for e in self.team_entries["a"][:self.team_size]]
+        b = [e.get() for e in self.team_entries["b"][:self.team_size]]
+        self.team_msg.configure(text="", text_color=MUTED)
+        self.run_async("The teams clash...", lambda: self.controller.team_battle(a, b),
+                       self.show_team_result, self.show_team_error)
+
+    def show_team_error(self, message):
+        if self.team_dialog is not None and self.widget_alive(self.team_dialog):
+            self.team_msg.configure(text=message, text_color=BAD)
+
+    def show_team_result(self, d):
+        if self.team_dialog is None or not self.widget_alive(self.team_dialog):
+            return
+        ctk, result = self.ctk, d["result"]
+        body = self.fresh(self.team_result)
+        sides = ctk.CTkFrame(body, fg_color="transparent")
+        sides.pack(fill="x", padx=6, pady=(6, 10))
+        sides.grid_columnconfigure((0, 1), weight=1)
+        for col, (side, title) in enumerate((("a", "Team One"), ("b", "Team Two"))):
+            team, p = d["team_" + side], result["p_" + side]
+            won = result["winner_side"] == side
+            box = ctk.CTkFrame(sides, fg_color=PANEL_2, corner_radius=10,
+                               border_width=2 if won else 0, border_color=GOOD)
+            box.grid(row=0, column=col, sticky="nsew", padx=6)
+            ctk.CTkLabel(box, text=("WINNER  " if won else "") + title, font=self.head_font,
+                         text_color=GOOD if won else TEXT).pack(padx=12, pady=(10, 0))
+            ctk.CTkLabel(box, text=f"{teambattle.team_type(team)} team", font=self.small_font,
+                         text_color=MUTED).pack()
+            for c in team:
+                ctk.CTkLabel(box, text=c["name"], font=self.head_font).pack(pady=(8, 0))
+                self.chip(box, c["path"]["name"], PATH_COLORS.get(c["path"]["name"], "#999999"))
+                for line in (f"{c['realm']}   -   power {c['score']:,.0f}", f"{c['element']}, {c['talent']['name']}"):
+                    ctk.CTkLabel(box, text=line, font=self.small_font, text_color=MUTED).pack()
+            pb = ctk.CTkProgressBar(box, progress_color=GOOD if won else BAD, width=220)
+            pb.set(p)
+            pb.pack(pady=(10, 2))
+            ctk.CTkLabel(box, text=f"Win chance {p * 100:.1f}%", font=self.small_font,
+                         text_color=MUTED).pack(pady=(0, 10))
+        self.section(body, "The battle")
+        self.paragraph(body, d["story"])
+        self.section(body, "Report")
+        box = ctk.CTkTextbox(body, height=420, font=self.mono_font, wrap="none", fg_color=PANEL_2)
+        box.pack(fill="x", padx=8, pady=(0, 10))
+        box.insert("end", d["report"])
+        box.configure(state="disabled")
+        winners = d["team_a"] if result["winner_side"] == "a" else d["team_b"]
+        self.status.configure(text=f"{teambattle.names_text(winners)} win the team battle.",
+                              text_color=GOOD)
 
     def do_duel(self):
         a, b = (e.get() for e in self.duel_entries)
