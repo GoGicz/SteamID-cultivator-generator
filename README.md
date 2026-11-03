@@ -4,6 +4,7 @@ Turn your Steam profile into a cultivator from a xianxia novel.
 
 Features
 - Steam-powered cultivation realms
+- Persistent cultivation world with each character having it's own story
 - Heavenly talents and elemental affinities
 - Sects, techniques, and treasures
 - Life, death, and heavenly fate
@@ -11,7 +12,7 @@ Features
 - Achievements as sect missions
 - Personality and Reputation system based on your steam Stats
 - Battle system which allow two different SteamID's to have dynamic battles between them and there is also Team battle allowing 2v2 or 3v3 battles
-- full profile caching for better load time
+- full profile SQLite caching for better load time
 - Inventory and theft system based on your cached cultivator profile
 - Sect martial pavilion let's you buy treasures and talismans for protection
 - Both Gui and Terminal modes so you can choose which one to use
