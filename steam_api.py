@@ -15,8 +15,69 @@ API = "https://api.steampowered.com"
 TIMEOUT = 15
 
 
+# Public Community inventories are separate from the publisher-only Inventory API.
+# No API key, login cookies, trade actions, or market-price requests are sent here.
+def inventory_treasure_candidates(steamid, appid, game):
+    import html
+    try:
+        response = requests.get(f"https://steamcommunity.com/inventory/{steamid}/{appid}/2",
+                                params={"l": "english", "count": 1000}, timeout=(2, 4))
+        logs.RUN_LOG.record(f"CommunityInventory/{appid}", f"HTTP {response.status_code}")
+        if response.status_code != 200:
+            return []
+        data = response.json()
+    except requests.RequestException:
+        logs.RUN_LOG.record(f"CommunityInventory/{appid}", "network error")
+        logs.RUN_LOG.note(f"Community inventory {appid} unavailable; using game treasure fallback if needed")
+        return []
+    except ValueError:
+        logs.RUN_LOG.note(f"Community inventory {appid} returned invalid JSON; using fallback if needed")
+        return []
+    if not isinstance(data, dict) or data.get("success") != 1:
+        return []
+    assets, descriptions = data.get("assets"), data.get("descriptions")
+    if not isinstance(assets, list) or not isinstance(descriptions, list):
+        return []
+    owned = {(str(a.get("classid")), str(a.get("instanceid", "0"))) for a in assets
+             if isinstance(a, dict) and str(a.get("classid", "")).isdigit()
+             and str(a.get("instanceid", "0")).isdigit()
+             and str(a.get("amount", "1")).isdigit() and int(str(a.get("amount", "1"))) > 0}
+    result = []
+    for item in descriptions:
+        if not isinstance(item, dict) or (str(item.get("classid")), str(item.get("instanceid", "0"))) not in owned:
+            continue
+        name = item.get("market_hash_name") or item.get("name")
+        if not isinstance(name, str):
+            continue
+        tags = item.get("tags", [])
+        type_tags = " ".join(str(t.get("localized_tag_name", "")) + " " + str(t.get("internal_name", ""))
+                             for t in tags if isinstance(t, dict) and t.get("category") == "Type") if isinstance(tags, list) else ""
+        kind = (str(item.get("type", "")) + " " + type_tags).casefold()
+        if appid == 730:
+            if not any(word in kind for word in ("rifle", "pistol", "knife", "smg", "shotgun", "machinegun", "machine gun", "gloves")):
+                continue
+        elif any(word in kind for word in ("container", "supply crate", "treasure chest", "key", "tool")):
+            continue
+        clean = re.sub(r"[\x00-\x1f\x7f]", " ", html.unescape(re.sub(r"<[^>]*>", "", name))).strip()[:160]
+        if clean:
+            result.append(f"Steam item · {game} · {clean}")
+    return sorted(set(result))
+
+
+def choose_inventory_treasure(steamid):
+    """Bounded parallel sampling: first 1,000 assets per supported game, no retries."""
+    from concurrent.futures import ThreadPoolExecutor
+    games = [(730, "CS2"), (570, "Dota 2"), (440, "TF2")]
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        batches = list(pool.map(lambda g: inventory_treasure_candidates(steamid, *g), games))
+    candidates = sorted(set(item for batch in batches for item in batch))
+    return random.SystemRandom().choice(candidates) if candidates else None
+
+
 def steam_get(endpoint, params):
     """Makes one Steam request and counts it. Every request in the program goes through here."""
+    if not params.get("key"):
+        raise logs.SteamError("This action needs a Steam API key. Local profiles work without one.")
     name = re.sub(r"/v\d+/?$", "", endpoint.strip("/"))
     try:
         r = requests.get(f"{API}/{endpoint}", params=params, timeout=TIMEOUT)
@@ -34,15 +95,37 @@ def api_get(path, key, **params):
     try:
         r = steam_get(path, params)
     except requests.RequestException as e:
-        raise logs.SteamError(f"Could not reach Steam: {e}")
+        raise logs.SteamError("Could not reach Steam. Check your connection and try again.") from None
     if r.status_code in (401, 403):
         raise logs.SteamError("Steam rejected the API key (check it is correct).")
     if r.status_code != 200:
         raise logs.SteamError(f"Steam returned HTTP {r.status_code}.")
     try:
-        return r.json().get("response", {})
+        data = r.json()
+        if not isinstance(data,dict) or not isinstance(data.get('response'),dict):
+            raise ValueError('Unexpected response structure')
+        return data['response']
     except ValueError:
         raise logs.SteamError("Steam sent a response I could not read.")
+
+
+def check_key(key):
+    """Asks Steam one small question to find out whether the API key works. Raises SteamError
+    (with a message fit to show) if Steam rejects the key or cannot be reached. The check is
+    written to the run log like any other command."""
+    logs.RUN_LOG.secret = key
+    logs.RUN_LOG.begin("API key check")
+    try:
+        result = api_get("ISteamUser/GetPlayerSummaries/v0002/", key, steamids="76561197960435530")
+        if not isinstance(result.get('players'),list) or any(not isinstance(p,dict) for p in result['players']):
+            raise logs.SteamError('Steam returned an invalid key-validation response. Please try again.')
+    except logs.SteamError as e:
+        logs.RUN_LOG.finish(f"error: {e}")
+        raise
+    except BaseException as e:
+        logs.RUN_LOG.finish(f"crashed: {type(e).__name__}: {e}")
+        raise
+    logs.RUN_LOG.finish("ok")
 
 
 def parse_profile_input(text):
@@ -60,6 +143,12 @@ def parse_profile_input(text):
 
 
 def resolve_steamid(text, key, refresh=False):
+    import generator
+    local_id = generator.resolve_local_profile(text)
+    if local_id:
+        return local_id
+    if not key:
+        raise logs.SteamError("No local profile found. Enter its name or local ID; Steam lookup needs an API key.")
     kind, value = parse_profile_input(text)
     if kind == "id":
         return value
@@ -91,7 +180,11 @@ def fetch_friend_ids(steamid, key):
     if r.status_code != 200:
         return [], None, False
     try:
-        friends = r.json().get("friendslist", {}).get("friends", [])
+        data=r.json()
+        listing=data.get('friendslist') if isinstance(data,dict) else None
+        friends=listing.get('friends') if isinstance(listing,dict) else None
+        if not isinstance(friends,list) or any(not isinstance(f,dict) or not re.fullmatch(r'\d{17}',str(f.get('steamid',''))) for f in friends):
+            return [],None,False
     except ValueError:
         return [], None, False
     return [f["steamid"] for f in friends], None, True  # no friends -> empty list -> story skipped
@@ -144,7 +237,7 @@ def get_friend(friend_id, key):
         players = api_get("ISteamUser/GetPlayerSummaries/v2/", key, steamids=friend_id).get("players", [])
     except logs.SteamError:
         return None
-    if not players:
+    if not isinstance(players,list) or not players or not isinstance(players[0],dict):
         return None
     name = players[0].get("personaname")
     if isinstance(name, str) and name:

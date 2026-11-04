@@ -48,18 +48,12 @@ def check_teams(ids_a, ids_b):
                               "is listed twice.")
 
 
-def fight_teams(team_a, team_b, ids_a, ids_b):
-    """Decides the battle. The same two teams (in any order) always give the same winner."""
+def fight_teams(team_a, team_b, rng=random):
+    """Decides the battle with a dice roll: team a wins with the chance team_odds() says. With
+    BATTLE_UPSETS off the favorite always wins."""
     p_a, p_power, shift = team_odds(team_a, team_b)
-    key_a, key_b = "-".join(sorted(ids_a)), "-".join(sorted(ids_b))
-    a_is_first = key_a <= key_b
-    favorite_a = p_a > 0.5 or (p_a == 0.5 and a_is_first)
-    if combat.BATTLE_UPSETS:
-        roll = random.Random(f"team-{min(key_a, key_b)}|{max(key_a, key_b)}").random()
-        p_first = p_a if a_is_first else 1 - p_a
-        a_wins = (roll < p_first) == a_is_first
-    else:
-        a_wins = favorite_a
+    favorite_a = p_a >= 0.5
+    a_wins = rng.random() < p_a if combat.BATTLE_UPSETS else favorite_a
     p_winner = p_a if a_wins else 1 - p_a
     return {"p_a": p_a, "p_b": 1 - p_a, "p_power_a": p_power, "element_shift_a": shift,
             "even": abs(p_a - 0.5) < 1e-9, "winner_side": "a" if a_wins else "b",
@@ -161,7 +155,7 @@ def team_fields(tag, team):
 
 
 def team_story(team_a, team_b, result, pairs=None, change=None, rng=random):
-    """The story of the battle. The winner is fixed by fight_teams(); the telling is random.
+    """The story of the battle. The winner is decided by fight_teams(); the telling is random.
     It depends on the paths of both teams, the realms, the arsenal, weapons, treasures and
     the personalities of the fighters."""
     pairs = pairs or []
@@ -220,6 +214,7 @@ def team_story(team_a, team_b, result, pairs=None, change=None, rng=random):
     return text
 
 
+@storage.atomic
 def perform_team_battle(ids_a, ids_b, key, profiles, rng=random):
     """Runs one team battle: loads the fighters, refuses the dead, fights, saves loot,
     reputation and activity. Returns everything a front end needs (teams sorted strongest
@@ -238,9 +233,10 @@ def perform_team_battle(ids_a, ids_b, key, profiles, rng=random):
 
     def ordered(ids):                       # strongest first, ties by SteamID
         return sorted(ids, key=lambda i: (-loaded[i][1]["score"], int(i)))
+    storage.require_physical(ids_a[0],dangerous=True,others=tuple((ids_a+ids_b)[1:]))
     ids_a, ids_b = ordered(ids_a), ordered(ids_b)
     team_a, team_b = [loaded[i][1] for i in ids_a], [loaded[i][1] for i in ids_b]
-    result = fight_teams(team_a, team_b, ids_a, ids_b)
+    result = fight_teams(team_a, team_b, rng)
     won_a = result["winner_side"] == "a"
     winners, losers = (team_a, team_b) if won_a else (team_b, team_a)
     ids_of = {id(c): i for i, (_, c) in loaded.items()}

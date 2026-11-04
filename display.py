@@ -86,6 +86,7 @@ def print_cultivator(c, info):
             print(f"  Since last  : +{new:,} new mission{'' if new == 1 else 's'} "
                   f"(+{new * gamedata.SECT_POINTS_PER_MISSION:,} sect points) since your last visit")
     print(f"  Sect points : {generator.sect_points_text(c)}")
+    print(f"  Spirit Stones: {c.get('spirit_stones', 0):,}")
     goods = generator.describe_goods(c.get("pavilion", {}).get("items", {}))
     if goods:
         wrap_field("Pavilion", goods)
@@ -107,12 +108,12 @@ def print_cultivator(c, info):
     if c["lightning"]:
         print(f"  Tribulations: survived {c['lightning']} heavenly lightning strikes")
     print(line)
-    print("  Source stats from Steam:")
+    print("  Locally generated stats:" if info.get("offline") else "  Source stats from Steam:")
     if info.get("account_created") and c.get("account_years") is not None:
         year = datetime.datetime.fromtimestamp(info["account_created"], datetime.timezone.utc).year
         print(f"    Account age : {c['account_years']:.1f} years (created {year})")
-    print(f"    Steam level : {info['level']}")
-    print(f"    Paid games  : {info['game_count']:,}")
+    print(f"    {'Training lvl' if info.get('offline') else 'Steam level'} : {info['level']}")
+    print(f"    {'Library size' if info.get('offline') else 'Paid games '} : {info['game_count']:,}")
     print(f"    Achievements: {info['achievements']:,}")
     if info["badges_hidden"]:
         print("    Badges      : 0 (Steam is hiding your badges)")
@@ -191,6 +192,7 @@ def print_pavilion(c):
     print(f"  Sect points available: {c['sect_points']:,}")
     kind_seen = None
     for n, item in enumerate(gamedata.PAVILION_ITEMS, 1):
+        item = pavilion_shop.discounted_item(c, item)
         if item["kind"] != kind_seen:
             kind_seen = item["kind"]
             print(f"\n  {kind_seen.upper()}S")

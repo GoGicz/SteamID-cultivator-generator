@@ -1,7 +1,29 @@
 """Static game content: realms, talents, paths, personalities, reputation ranks, names, titles,
 elements, treasures and pavilion goods, signature moves."""
 
-VERSION = "v0.2.4"        # shown in the window (top left) and when the command line starts
+import time
+
+VERSION = "v0.6.1-DEV"    # shared GUI and terminal version
+
+SECT_RANKS = [(0, "Random sect initiate"), (200, "Sect Junior outer disciple"),
+              (400, "Sect Outer disciple"), (600, "Sect Inner disciple"),
+              (851, "Sect Senior inner disciple"), (1200, "Elder"),
+              (5000, "The sect guardian and protector")]
+SECT_INITIAL_REPUTATION = [0, 200, 400, 600, 700, 851, 1200, 2500, 4000, 5000]
+SECT_DISCOUNTS = [(0,0,0,0), (5,4,3,2), (10,8,6,4), (15,12,9,6),
+                  (20,16,12,8), (25,20,15,10), (30,24,18,12)]
+
+
+def steam_account_years(info):
+    created = info.get("account_created")
+    if info.get("offline") or type(created) not in (int, float) or created <= 0:
+        return 0
+    return max(0, (time.time() - created) / (365.25 * 24 * 3600))
+
+# Inclusive lifespan ranges granted when entering each realm through a breakthrough.
+REALM_LIFESPANS = [(80, 80), (100, 180), (200, 300), (500, 1000),
+                  (1001, 2000), (2001, 5000), (6000, 10000),
+                  (12000, 60000), (80000, 120000), (10000000, 10000000)]
 
 
 SECT_POINTS_PER_MISSION = 5   # 1 unlocked achievement = 1 sect mission = 5 sect points
@@ -65,6 +87,18 @@ PERSONALITIES = [
 ]
 NO_PERSONALITY_TRAIT = "kept a quiet temperament that set off no gossip"
 
+# Mutually exclusive Steam account-age traits. Appended to preserve old reputation RNG draws.
+PERSONALITIES += [
+    {"name": "Veteran", "rule": "Steam account age 10 to under 20 years", "steam_only": True,
+     "test": lambda info, friends: 10 <= steam_account_years(info) < 20,
+     "power": 70, "death": 0.0, "rep": 30, "rep_chance": 1.0,
+     "trait": "carried the wisdom of a decade of battles"},
+    {"name": "Sage", "rule": "Steam account age at least 20 years", "steam_only": True,
+     "test": lambda info, friends: steam_account_years(info) >= 20,
+     "power": 120, "death": 0.0, "rep": 150, "rep_chance": 1.0,
+     "trait": "guided others with two decades of hard-won wisdom"},
+]
+
 # ---------------------------------------------------------------------------
 # Paths. Every cultivator walks one of two, picked by luck from the SteamID (never from
 # Steam stats). RIGHTEOUS_CHANCE is the chance of the Righteous Path; the Demonic Path
@@ -111,12 +145,12 @@ REALMS = [
     (50,   "Qi Condensation",             "a fledgling who has just opened the first meridians"),
     (150,  "Foundation Establishment",    "a solid Dao foundation is laid"),
     (300,  "Core Formation",              "a golden core spins in the dantian"),
-    (500,  "Nascent Soul",                "a nascent soul now roams beyond the body"),
-    (800,  "Soul Transformation",         "heaven and earth answer the soul's call"),
-    (1200, "Void Refinement",             "stepping through the void is as easy as breathing"),
-    (1800, "Mahayana",                    "an overlord whose name shakes the nine provinces"),
-    (2600, "Tribulation Transcendence",   "heavenly lightning bows to this existence"),
-    (3500, "Immortal Ascension",          "a true immortal who looks down on mortals and sects alike"),
+    (550,  "Nascent Soul",                "a nascent soul now roams beyond the body"),
+    (900,  "Soul Transformation",         "heaven and earth answer the soul's call"),
+    (1300, "Void Refinement",             "stepping through the void is as easy as breathing"),
+    (2000, "Mahayana",                    "an overlord whose name shakes the nine provinces"),
+    (2800, "Tribulation Transcendence",   "heavenly lightning bows to this existence"),
+    (6000, "Immortal Ascension",          "a true immortal who looks down on mortals and sects alike"),
 ]
 
 SURNAMES = ["Li", "Wang", "Zhang", "Liu", "Chen", "Yang", "Huang", "Zhao", "Wu", "Zhou",
@@ -295,3 +329,43 @@ ELEMENT_BEATS = {
     "Ice":       ["Water", "Wind"],         # ice freezes water and stills the air
     "Shadow":    ["Fire", "Ice"],           # darkness swallows flame and chills ice
 }
+
+
+# World personalities are independent of the legacy trait bonus definitions.
+WORLD_PERSONALITIES = ('Ambitious', 'Cautious', 'Loyal', 'Competitive',
+                       'Adventurous', 'Sociable', 'Schemer')
+# Fixed geography: four headquarters and four public landmarks per district.
+REGION_DISTRICTS = (
+    ('Central Basin', '#364b3e', ('Jade Market', 'Willow Village', 'River Crossing', 'Old Watchtower')),
+    ('Northern Peaks', '#414b61', ('Cloudpeak Pass', 'Snowfall Village', 'Echo Cave', 'Pine Gate')),
+    ('Eastern Forests', '#294b42', ('Mistwood Valley', 'Herbalist Grove', 'Moss Ruins', 'East Ferry')),
+    ('Southern Marshes', '#4c4936', ('Blackwater Landing', 'Reed Village', 'Sunken Shrine', 'South Ferry')),
+    ('Western Highlands', '#58443d', ('Copper Mine', 'Red Canyon', 'Fallen Star Road', 'Old Battlefield')),
+)
+
+
+# Behavior weights: cultivation, mission, adventure, travel, duel, conversation.
+NPC_ACTIVITY_WEIGHTS = {
+    'Ambitious': (45,20,10,10,12,3), 'Cautious': (50,22,4,12,1,11),
+    'Loyal': (30,40,5,10,5,10), 'Competitive': (25,10,8,15,35,7),
+    'Adventurous': (15,10,32,32,8,3), 'Sociable': (15,12,8,25,5,35),
+    'Schemer': (30,15,10,15,10,20),
+}
+DUEL_MODES = ('Sparring','Competitive','Lethal')
+COMPETITIVE_INJURY_CHANCE = .05
+LETHAL_DEATH_CHANCE = .15
+INJURY_POWER_FACTOR = .8
+INJURY_RECOVERY_SECONDS = 600
+
+
+# Political policies use active-play seconds; future economy/diplomacy can replace
+# funding and rivalry providers without changing membership or event identities.
+SECT_SALARIES = {'Direct Disciple':50,'Elder':200,'Sect Master':500,'Acting Master':500}
+SECT_SALARY_SECONDS = 1800
+SECT_CHANGE_SECONDS = 7200
+SECT_TRAIN_SECONDS = 600
+SECT_POLITICS_SECONDS = 60
+SECT_ELDER_REPUTATION = 1200
+
+SECT_SUCCESSION_SECONDS = 5400
+SECT_EARLY_ELECTION_SECONDS = 600

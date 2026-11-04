@@ -305,9 +305,25 @@ def run_team(args, key, profiles):
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    key = os.environ.get("STEAM_API_KEY") or input("Steam API key: ").strip()
-    if not key:
-        sys.exit("An API key is required (https://steamcommunity.com/dev/apikey).")
+    key = os.environ.get("STEAM_API_KEY")
+    while True:
+        if "--offline" in sys.argv[1:]:
+            key = ""
+            break
+        typed = not key
+        if typed:
+            key = input("Steam API key (blank for local offline profiles): ").strip()
+        if not key:
+            key = ""
+            break
+        try:
+            steam_api.check_key(key)             # a wrong key is caught right here, not at the first lookup
+            break
+        except logs.SteamError as e:
+            if not typed:
+                sys.exit(str(e))                 # the key came from STEAM_API_KEY
+            print(f"\n  ! {e}\n")
+            key = None
 
     print(f"Steam Cultivator {gamedata.VERSION}")
     print("Welcome, seeker of the Dao. Press Ctrl+C to leave.")
@@ -321,6 +337,19 @@ def main():
     profiles = {}
     session = {}                                 # the latest cultivator looked up (for 'pavilion')
     logs.RUN_LOG.secret = key
+    # The console shares the same session clock as the GUI; input waiting is play time.
+    import threading
+    progress.initialize_world()
+    world_clock=storage.WorldClock()
+    stop_world=threading.Event()
+    def clock_worker():
+        while not stop_world.wait(1):
+            try: world_clock.tick()
+            except Exception as exc:
+                print(f"\nWorld simulation paused: {exc}")
+                break
+    world_thread=threading.Thread(target=clock_worker,daemon=True)
+    world_thread.start()
     while True:
         try:
             text = input("Steam profile URL, custom name, or SteamID64: ").strip()
@@ -341,6 +370,10 @@ def main():
         except (KeyboardInterrupt, EOFError):
             print("\nMay your Dao be eternal. Farewell.")
             break
+    stop_world.set()
+    world_thread.join()
+    world_clock.tick()
+    world_clock.close()
     logs.RUN_LOG.end_session()
 
 

@@ -17,7 +17,8 @@ import storage
 # exponent makes the stronger fighter win more reliably.
 # BATTLE_UPSETS = True: the dice decide the real winner using those chances (the
 # favorite usually wins, sometimes not). False: the favorite always wins.
-# The dice are fixed by the two SteamIDs, so the same pair always gives the same winner.
+# The dice are rolled fresh every time, so the same two cultivators can meet again and the
+# result can change (it follows the percentages, nothing else).
 # ---------------------------------------------------------------------------
 BATTLE_EXPONENT = 2.0
 BATTLE_SCORE_FLOOR = 25
@@ -239,18 +240,12 @@ def power_gap(a, b):
     return tier, strong, weak, ratio
 
 
-def fight(a, b, id_a, id_b):
-    """Decides the duel. Same two SteamIDs, same winner, whichever order they are given in."""
+def fight(a, b, rng=random):
+    """Decides the duel with a dice roll: a wins with the chance battle_odds(a, b) says (54%
+    means a wins 54 duels out of 100). With BATTLE_UPSETS off the favorite always wins."""
     p_a = battle_odds(a, b)
-    a_is_first = int(id_a) <= int(id_b)
-    favorite_is_a = p_a > 0.5 or (p_a == 0.5 and a_is_first)
-    if BATTLE_UPSETS:
-        lo, hi = sorted((int(id_a), int(id_b)))
-        roll = random.Random(f"battle-{lo}-{hi}").random()
-        p_first = p_a if a_is_first else 1 - p_a
-        a_wins = (roll < p_first) == a_is_first
-    else:
-        a_wins = favorite_is_a
+    favorite_is_a = p_a >= 0.5
+    a_wins = rng.random() < p_a if BATTLE_UPSETS else favorite_is_a
     p_winner = p_a if a_wins else 1 - p_a
     return {"p_a": p_a, "p_b": 1 - p_a, "even": abs(p_a - 0.5) < 1e-9,
             "winner": a if a_wins else b, "loser": b if a_wins else a,
@@ -287,7 +282,7 @@ def move_fields(tag, c):
 
 
 def battle_story(a, b, result, loot=None, change=None):
-    """A short story of the duel. The winner is fixed by fight(); the telling is random,
+    """A short story of the duel. The winner is decided by fight(); the telling is random,
     so asking again gives the same result told in a different way."""
     x, y = a, b
     if a["path"]["name"] == "Demonic" and b["path"]["name"] == "Righteous":
@@ -345,30 +340,43 @@ def battle_story(a, b, result, loot=None, change=None):
     return text
 
 
-def perform_battle(ids, key, profiles):
-    """Runs one duel between the two SteamIDs in ids: loads both cultivators, refuses dead
-    ones, fights, saves loot and reputation. Returns everything a front end needs to show it
-    (a, b, info_a, info_b, result, story, loot, change). Nothing is printed here."""
-    if ids[0] == ids[1]:
-        raise logs.SteamError("Pick two different profiles: a cultivator cannot duel themselves.")
-    (info_a, _, _, a), (info_b, _, _, b) = [generator.build_cultivator(i, key, profiles) for i in ids]
-    dead = [(c, inf) for c, inf in ((a, info_a), (b, info_b)) if c["death"]]
-    if dead:                                             # the dead cannot duel
-        who = "; ".join(f"{c['name']} (Steam: {inf['name']}) died in Year {c['death']['year']} "
-                        f"of the Heavenly Calendar, aged {c['death']['age']:,}" for c, inf in dead)
-        raise logs.SteamError(f"{who}. The dead cannot duel, so there is no duel.")
-    result = fight(a, b, ids[0], ids[1])
-    loot = resolve_loot(result["winner"], result["loser"])
-    change = reputation_change(result["winner"], result["loser"])
-    story = battle_story(a, b, result, loot, change)
-    apply_loot(ids, a, b, result, loot)                  # written to the inventory files
-    apply_reputation(ids, a, b, result, change)          # ...and the reputation points
-    now = time.time()
-    for me, other, cid, p, won in ((a, b, ids[0], result["p_a"], result["winner"] is a),
-                                   (b, a, ids[1], result["p_b"], result["winner"] is b)):
-        rep = (change["gain"] if won else -change["loss"]) if change["kind"] == "upset" else 0
-        storage.add_activity(cid, {"at": now, "type": "duel", "won": won, "other": other["name"],
-                                   "other_realm": other["realm"], "p": p, "rep": rep,
-                                   "upset": bool(result["upset"]) and won})
-    return {"a": a, "b": b, "info_a": info_a, "info_b": info_b, "result": result,
-            "story": story, "loot": loot, "change": change}
+def duel_ready(a,b):
+    with storage.world_transaction() as db:
+        row=db.execute('SELECT ready_day FROM duel_cooldowns WHERE a=? AND b=?',tuple(sorted((a,b)))).fetchone()
+        return not row or row[0]<=storage.world_state()['day']
+
+
+@storage.atomic
+def perform_battle(ids,key,profiles,rng=random,mode='Competitive'):
+    import progress
+    if mode not in gamedata.DUEL_MODES:raise logs.SteamError('Choose Sparring, Competitive or Lethal.')
+    if len(ids)!=2 or ids[0]==ids[1]:raise logs.SteamError('Pick two different cultivators.')
+    loaded=[generator.build_cultivator(sid,key,profiles) for sid in ids]
+    (info_a,_,_,a),(info_b,_,_,b)=loaded
+    if a['death'] or b['death']:raise logs.SteamError('The dead cannot duel.')
+    storage.require_physical(ids[0],dangerous=mode!='Sparring',others=(ids[1],))
+    if mode!='Sparring' and not duel_ready(*ids):raise logs.SteamError('These cultivators must wait one active-play minute before another competitive or lethal duel.')
+    result=fight(a,b,rng);w,l=result['winner'],result['loser']
+    wi,li=(ids[0],ids[1]) if w is a else (ids[1],ids[0])
+    loot=resolve_loot(w,l,rng) if mode=='Lethal' else dict(stolen=None,nothing=False,found=None,blocked=False,missed=False)
+    change=reputation_change(w,l) if mode!='Sparring' else dict(kind='same',gap=0,gain=0,loss=0,light=False)
+    apply_loot(ids,a,b,result,loot);apply_reputation(ids,a,b,result,change)
+    consequence='Both cultivators leave alive.'
+    killed=False
+    if mode=='Competitive' and rng.random()<gamedata.COMPETITIVE_INJURY_CHANCE:
+        storage.injure(li,'Competitive duel');consequence=l['name']+' suffered a temporary injury. Both cultivators survived.'
+    elif mode=='Lethal':
+        if rng.random()<gamedata.LETHAL_DEATH_CHANCE:
+            killed=True;storage.mark_dead(li,l,'lethal_duel');l['death']=storage.read_life(li)['dead'];consequence=l['name']+' was killed in the lethal duel.'
+        else:storage.injure(li,'Lethal duel');consequence=l['name']+' survived with an injury.'
+    story=f"{mode}: {w['name']} defeated {l['name']}. {consequence}"
+    if change['gain']:story+=f" The victory earned {change['gain']} general reputation."
+    if loot['stolen']:story+=' A treasure was seized: '+loot['stolen']+'.'
+    if loot['found']:story+=' A treasure was found: '+loot['found']+'.'
+    upset=change['kind']=='upset' and change['gap']>=2
+    event=progress.record_world_action('duel',w['name']+' defeated '+l['name'],story,list(zip(ids,(a,b))),subject=wi,outcome='killed' if killed else 'upset' if upset else 'victory' if mode!='Sparring' else 'sparring',importance=3 if upset else 2 if killed else 1)
+    with storage.world_transaction() as db:
+        if mode!='Sparring':db.execute('INSERT OR REPLACE INTO duel_cooldowns VALUES(?,?,?)',(*sorted(ids),storage.world_state()['day']+60/storage.world_state()['seconds_per_day']))
+    for me,other,cid,prob,won in ((a,b,ids[0],result['p_a'],w is a),(b,a,ids[1],result['p_b'],w is b)):
+        storage.add_activity(cid,dict(at=time.time(),type='duel',won=won,other=other['name'],other_realm=other['realm'],p=prob,rep=(change['gain'] if won else -change['loss']),upset=bool(result['upset']) and won,mode=mode,event=event))
+    return dict(a=a,b=b,info_a=info_a,info_b=info_b,result=result,story=story,loot=loot,change=change,mode=mode,event=event)

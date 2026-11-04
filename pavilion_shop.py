@@ -14,12 +14,21 @@ import storage
 # up last in this run (session["latest"]); looking up another profile makes that one the
 # latest. mocb does not change it.
 # ---------------------------------------------------------------------------
+def discounted_item(c, item):
+    original = item.get("original_price", item["price"])
+    tier = 0 if original < 500 else 1 if original < 2000 else 2 if original < 5000 else 3
+    rank = c.get("sect_status", {}).get("rank_index", 0)
+    discount = gamedata.SECT_DISCOUNTS[rank][tier]
+    return dict(item, original_price=original, discount=discount,
+                price=(original * (100 - discount) + 99) // 100)
+
+
 def pavilion_status(c, item):
     """'you can afford it', 'need 120 more', 'already owned'... for one item."""
     owned = c["pavilion"]["items"].get(item["id"], 0)
     if item["kind"] == "Weapon" and owned:
         return "already owned"
-    price = item["price"]
+    price = discounted_item(c, item)["price"]
     if price > c["sect_points"]:
         return f"need {price - c['sect_points']:,} more"
     return "you can afford it" + (f" (you own {owned})" if owned else "")
@@ -31,18 +40,20 @@ def pavilion_goods_text(c):
     return goods or "nothing yet"
 
 
+@storage.atomic
 def buy_pavilion_item(steamid, c, number):
     """Buys item number `number` (1-based, as listed) for the cultivator c: the sect points
     are spent, and the item is written into their JSON file (a treasure goes into the
     treasure inventory, everything else into the pavilion goods). One write, so a purchase is
     never half done. Raises SteamError if the choice is not valid or too expensive."""
+    storage.require_physical(steamid)
     try:
         n = int(str(number).strip().lstrip("#"))
     except ValueError:
         raise logs.SteamError(f"'{number}' is not an item number. Pick one from 1 to {len(gamedata.PAVILION_ITEMS)}.")
     if not 1 <= n <= len(gamedata.PAVILION_ITEMS):
         raise logs.SteamError(f"There is no item number {n}. Pick one from 1 to {len(gamedata.PAVILION_ITEMS)}.")
-    item = gamedata.PAVILION_ITEMS[n - 1]
+    item = discounted_item(c, gamedata.PAVILION_ITEMS[n - 1])
     pav = c["pavilion"]
     if item["kind"] == "Weapon" and pav["items"].get(item["id"], 0):
         raise logs.SteamError(f"{c['name']} already owns {item['name']}; one is enough.")
@@ -62,15 +73,17 @@ def buy_pavilion_item(steamid, c, number):
         inv["history"] = (inv["history"] + [{"at": now, "type": "bought", "item": item["name"],
                                               "other": None}])[-storage.INVENTORY_HISTORY_LIMIT:]
         pc["inventory"] = inv
-        c["treasures"] = inv["treasures"]
-        c["treasure"] = generator.prized_treasure(inv["treasures"]) or gamedata.FALLBACK_TREASURE
-        c["inventory_history"] = inv["history"]
     else:
         items[item["id"]] = items.get(item["id"], 0) + 1
     history = (pav["history"] + [event])[-storage.INVENTORY_HISTORY_LIMIT:]
     pc["pavilion"] = {"items": items, "spent": spent, "earned": c["sect_points_earned"],
                       "bonus": pav.get("bonus", 0), "history": history}
-    storage.save_profile_cache(pc)
+    if not storage.save_profile_cache(pc, durable=True):
+        raise logs.SteamError("Purchase could not be saved. Check cache write permissions.")
+    if item["kind"] == "Treasure":
+        c["treasures"] = inv["treasures"]
+        c["treasure"] = generator.prized_treasure(inv["treasures"]) or gamedata.FALLBACK_TREASURE
+        c["inventory_history"] = inv["history"]
     c["pavilion"] = dict(pc["pavilion"])
     c["sect_points"] = generator.points_left(c)
     logs.RUN_LOG.note(f"pavilion: {c['name']} ({steamid}) bought {item['name']} for {item['price']} "
@@ -123,9 +136,11 @@ def sell_rows(c):
             for n, t in enumerate(generator.treasures_of(c), 1)]
 
 
+@storage.atomic
 def sell_treasure(steamid, c, number):
     """Sells treasure number `number` (as listed by sell_rows) for half its value. The treasure
     leaves the inventory and the sect points are credited, in one write. Raises SteamError."""
+    storage.require_physical(steamid)
     rows = sell_rows(c)
     if not rows:
         raise logs.SteamError(f"{c['name']} owns no treasure to sell.")
@@ -153,7 +168,8 @@ def sell_treasure(steamid, c, number):
     cur["earned"] = max(cur["earned"], c["sect_points_earned"])
     pc["pavilion"] = {"items": cur["items"], "spent": cur["spent"], "earned": cur["earned"],
                       "bonus": cur["bonus"], "history": cur["history"]}
-    storage.save_profile_cache(pc)
+    if not storage.save_profile_cache(pc, durable=True):
+        raise logs.SteamError("Sale could not be saved. Check cache write permissions.")
     c["treasures"] = items
     c["treasure"] = generator.prized_treasure(items) or gamedata.FALLBACK_TREASURE
     c["inventory_history"] = inv["history"]
