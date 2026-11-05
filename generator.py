@@ -588,6 +588,8 @@ def build_cultivator(steamid, key, profiles, refresh=False):
         cultivator['score'] = round(cultivator['score']*cultivator['injury']['factor'])
     if cultivator['death']:storage.retire_dead(steamid)
     with storage.world_transaction() as db:
+        affiliation=db.execute('SELECT sect_id,office,mentor FROM affiliations WHERE actor=?',(steamid,)).fetchone()
+        cultivator['sect_role']=storage.member_role(affiliation)
         db.execute('INSERT OR REPLACE INTO actor_measures VALUES(?,?,?,?)',(steamid,cultivator.get('healthy_score',cultivator['score']),cultivator['realm_index'],storage.world_state()['day']))
     return info, friend_ids, note, cultivator
 

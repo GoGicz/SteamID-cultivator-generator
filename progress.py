@@ -665,7 +665,7 @@ def initialize_region():
                 def aptitude(row):
                     pc=storage.decode_profile_json(row['data']);s=pc['offline']['character']
                     talent=next((j for j,t in enumerate(gamedata.TALENTS) if t['name']==s['talent']),0)
-                    achievements=sum(e.get('success') is True for e in pc.get('activity',[]))
+                    achievements=sum(e.get('success') is True for e in pc.get('activity',[])+storage.npc_history_archive(row['actor'],20))
                     compatibility=len(mentor_traits.intersection(storage.actor_disposition(row['actor'])))
                     return (talent*3+min(achievements,20)+compatibility*2,row['actor'])
                 candidates.sort(key=aptitude,reverse=True)
@@ -846,14 +846,18 @@ def record_world_action(kind,title,summary,actors,*,subject=None,outcome='',impo
 def learn_event(db,event,observer,day,source,facts=None):
     inserted=db.execute('INSERT OR IGNORE INTO event_knowledge VALUES(?,?,?,?)',(observer,event,day,source)).rowcount
     if not inserted:return
+    if source=='Local report':
+        storage.queue_memory_cleanup(db,observer,day)
     if facts is None:
         row=db.execute('SELECT facts FROM event_facts WHERE event=?',(event,)).fetchone()
         if not row:return
         facts=json.loads(row[0])
     subject=facts['subject']
     if observer==subject:return
-    effect=db.execute("INSERT OR IGNORE INTO event_effects VALUES(?,?,'relationship')",(event,observer)).rowcount
-    if not effect:return
+    # Knowledge insertion and its effects are atomic. Old markers remain a guard
+    # until bounded cleanup removes them; no duplicate ledger is written now.
+    if db.execute('SELECT 1 FROM event_archives WHERE event=?',(event,)).fetchone():return
+    if db.execute("SELECT 1 FROM event_effects WHERE event=? AND actor=? AND effect='relationship'",(event,observer)).fetchone():return
     outcome=facts['outcome']
     respect=12 if outcome=='upset' else 3 if outcome in ('victory','mission_success','breakthrough') else 0
     fear=8 if outcome=='killed' else 0
@@ -1070,7 +1074,7 @@ def open_due_encounter(db,day):
         if outcome in ('death','injured'):db.execute('DELETE FROM journeys WHERE actor=?',(actor,))
         else:db.execute('UPDATE journeys SET encounter_day=NULL WHERE actor=?',(actor,))
         record_world_action('encounter',c['name']+' met danger on the road',text,[(actor,c)],outcome=outcome,importance=2 if outcome=='death' else 1,location_override=where)
-        storage.add_activity(actor,{'at':time.time(),'type':'adventure','summary':text})
+        storage.add_activity(actor,{'at':time.time(),'type':'adventure','outcome':outcome,'summary':text})
         return False
     db.execute('INSERT INTO encounters VALUES(?,?,?,?)',(uuid.uuid4().hex,actor,day,json.dumps(data)))
     db.execute('UPDATE journeys SET encounter_day=NULL WHERE actor=?',(actor,))
@@ -1150,6 +1154,9 @@ def advance_world(elapsed_seconds, *, max_work_seconds=None):
         politics_tick(target)
         spread_news(db,target)
         prune_routine_events(db,target)
+        # Catch-up keeps priority over optional storage housekeeping. Persisted
+        # retention queues resume once scheduled simulation work has caught up.
+        if pending<=1e-6:storage.maintain_storage(db,target)
         db.execute('DELETE FROM injuries WHERE until_day<=?',(target,))
         return dict(storage.world_state(),encounter=None)
 
@@ -1163,7 +1170,7 @@ def prune_routine_events(db,day):
     # from reusing its integer ID after routine-history pruning.
     old=[r[0] for r in db.execute('SELECT id FROM world_events e WHERE importance<2 AND day<? AND NOT EXISTS (SELECT 1 FROM mentor_rewards r WHERE r.event=e.id) ORDER BY e.id LIMIT 100',(day-12,))]
     for event in old:
-        for table in ('news_queue','event_knowledge','event_effects','event_facts'):
+        for table in ('news_queue','event_knowledge','event_effects','event_facts','event_archives'):
             db.execute('DELETE FROM '+table+' WHERE event=?',(event,))
         db.execute('DELETE FROM world_events WHERE id=?',(event,))
     # Continue a large cleanup on the next tick, releasing the world lock between chunks.
@@ -1224,7 +1231,9 @@ def political_event(sect,kind,text,*,actor=None,plot=None,public=True,data=None)
     with storage.world_transaction() as db:
         # Routine sect reports remain in sect affairs; the world chronicle is reserved for major changes.
         major=kind in ('Appointment','Elder assassinated','Sect civil conflict','Takeover succeeded','Takeover failed','Conspiracy exposed')
-        event=storage.world_event('politics',kind,text,actors=[actor] if actor and public else [],sects=[sect],importance=2,visibility=('public' if major else 'local') if public else 'hidden')
+        sect_row=db.execute('SELECT name FROM sects WHERE id=?',(sect,)).fetchone()
+        sect_name=sect_row['name'] if sect_row else sect
+        event=storage.world_event('politics',kind,f'{sect_name} — {text}',actors=[actor] if actor and public else [],sects=[sect],importance=2,visibility=('public' if major else 'local') if public else 'hidden')
         facts=dict(data or {},sect_id=sect,actor=actor,kind=kind)
         day=storage.world_state()['day']
         db.execute('INSERT INTO political_events(sect_id,plot,event,day,kind,data,public) VALUES(?,?,?,?,?,?,?)',(sect,plot,event,day,kind,json.dumps(facts),int(public)))
@@ -1319,7 +1328,9 @@ def appoint(actor,office,*,reason):
         ensure_member_term(actor)
         db.execute('UPDATE membership_terms SET next_salary=?,paid_role=? WHERE actor=?',(day+political_seconds(gamedata.SECT_SALARY_SECONDS),office,actor))
         db.execute('UPDATE sect_governance SET revision=revision+1 WHERE sect_id=?',(sect,))
-        political_event(sect,'Appointment',state['name']+' became '+office+'. '+reason,actor=actor)
+        prior_role=storage.member_role(state)
+        political_event(sect,'Appointment',f"{prior_role} {state['name']} became {office}. {reason}",actor=actor,
+                        data={'former_role':prior_role,'new_role':office})
 
 
 @storage.atomic
@@ -1387,7 +1398,7 @@ def claim_mentor_reward(actor):
         if storage.read_spirit_stones(m['actor'])<amount:raise logs.SteamError(f'Your mentor needs {amount} Spirit Stones for this reward. Try again after their salary.')
         wallet_transfer(m['actor'],actor,amount)
         db.execute('INSERT INTO mentor_rewards VALUES(?,?,?,?)',(actor,event,m['actor'],amount))
-        storage.add_activity(actor,dict(at=time.time(),type='adventure',summary=f'{m["name"]} awarded {amount} Spirit Stones for a verified achievement.'))
+        storage.add_activity(actor,dict(at=time.time(),type='adventure',milestone='mentor_reward',summary=f'{m["name"]} awarded {amount} Spirit Stones for a verified achievement.'))
         return f'Your mentor awarded {amount} Spirit Stones from their own wallet.'
 
 def support_chance(candidate,voter,amount=0,*,betrayal=False):
@@ -1500,7 +1511,7 @@ def pay_sect_salaries(sect,day):
 
 def reconcile_leadership(sect,day):
     with storage.world_transaction() as db:
-        dead=db.execute("SELECT a.actor,a.office FROM affiliations a JOIN profiles p ON p.id=a.actor WHERE a.sect_id=? AND json_extract(p.data,'$.life.dead') IS NOT NULL AND a.office IN ('Sect Master','Acting Master','Elder')",(sect,)).fetchall()
+        dead=db.execute("SELECT a.actor,a.office,p.name FROM affiliations a JOIN profiles p ON p.id=a.actor WHERE a.sect_id=? AND json_extract(p.data,'$.life.dead') IS NOT NULL AND a.office IN ('Sect Master','Acting Master','Elder')",(sect,)).fetchall()
         for row in dead:
             db.execute("UPDATE affiliations SET office='Former '||office,mentor=NULL WHERE actor=?",(row['actor'],))
             db.execute('UPDATE affiliations SET mentor=NULL WHERE mentor=?',(row['actor'],))
@@ -1511,7 +1522,11 @@ def reconcile_leadership(sect,day):
             elders=[a for a in council if a['office']=='Elder']
             if elders:
                 acting=max(elders,key=lambda a:(a['power'],a['realm'],a['actor']))
-                appoint(acting['actor'],'Acting Master',reason='The strongest eligible elder safeguards the vacant leadership.')
+                previous=next((r for r in dead if r['office'] in ('Sect Master','Acting Master')),None)
+                reason='The strongest eligible elder safeguards the vacant leadership.'
+                if previous:
+                    reason=f"Following the death of {previous['office']} {previous['name']}, the strongest eligible elder safeguards the sect."
+                appoint(acting['actor'],'Acting Master',reason=reason)
                 db.execute('UPDATE sect_governance SET succession_at=? WHERE sect_id=?',(day+political_seconds(gamedata.SECT_SUCCESSION_SECONDS),sect))
         due=db.execute('SELECT succession_at FROM sect_governance WHERE sect_id=?',(sect,)).fetchone()[0]
         if not master and due is not None and day>=due:
@@ -1610,7 +1625,9 @@ def resolve_plot(plot,success,reason):
                 pc=storage.load_profile_cache(actor['actor']);member=pc.get('sect_memberships',{}).get(plot['sect_id'])
                 if member:member['points']=max(0,member['points']-200);storage.save_profile_cache(pc,durable=True)
         db.execute("UPDATE sect_plots SET stage='resolved',outcome=? WHERE id=?",(outcome+': '+reason,plot['id']))
-        political_event(plot['sect_id'],outcome,actor['name']+': '+reason,actor=actor['actor'],plot=plot['id'],data={'success':success})
+        prior_role=storage.member_role(actor)
+        political_event(plot['sect_id'],outcome,f"{prior_role} {actor['name']} challenged for leadership. {reason}",
+                        actor=actor['actor'],plot=plot['id'],data={'success':success,'challenger_role':prior_role})
 
 
 def political_duty(actor):
@@ -1677,7 +1694,7 @@ def progress_plot(plot,day,rng):
                 success=sum(election_score(x,1) for x in attackers)>sum(election_score(x,0) for x in defenders)
                 resolve_plot(plot,success,'A council confrontation settled the leadership without civil fighting.');return
             db.execute("UPDATE sect_plots SET stage='conflict',due=?,round=0,wins=0 WHERE id=?",(day+political_seconds(120),plot['id']))
-            political_event(plot['sect_id'],'Sect civil conflict',a['name']+' openly challenged the leadership. Armed factions are assembling at headquarters.',actor=a['actor'],plot=plot['id'])
+            political_event(plot['sect_id'],'Sect civil conflict',storage.member_role(a)+' '+a['name']+' openly challenged the leadership. Armed factions are assembling at headquarters.',actor=a['actor'],plot=plot['id'])
             for member in attackers+defenders:
                 if member['npc']:political_duty(member['actor'])
             return

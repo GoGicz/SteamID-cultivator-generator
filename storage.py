@@ -350,6 +350,8 @@ def read_activity(steamid):
 
 def add_activity(steamid, event):
     pc = load_profile_cache(steamid)
+    if pc.get('world_npc'):
+        event=dict(event,routine=not significant_activity(event))
     pc["activity"] = (read_activity(steamid) + [event])[-ACTIVITY_LIMIT:]
     return save_profile_cache(pc)
 
@@ -371,6 +373,8 @@ def history_entries(steamid, limit=80):
         entries.append({"at": at, "kind": kind, "text": text})
 
     activity = read_activity(steamid)
+    if pc.get('world_npc'):
+        activity += npc_history_archive(steamid,limit)
     first_duel = min([e["at"] for e in activity if e.get("type") == "duel"], default=None)
     for e in activity:
         if e.get("type") == "duel":
@@ -444,7 +448,7 @@ def history_entries(steamid, limit=80):
             add(e["at"], "duel_win" if won else "duel_loss",
                 f"{'Defeated' if won else 'Lost to'} {e.get('other', 'someone')} "
                 f"({e.get('other_realm', '?')}) in a duel. Reputation {e.get('points', 0):+d}")
-    dated = {}
+    dated = {e.get('at'):e['world_day'] for e in activity if 'world_day' in e}
     for section in ('activity','pavilion','inventory','duel_reputation'):
         source = pc.get(section,[]) if section=='activity' else (pc.get(section) or {}).get('history',[])
         for event in source:
@@ -935,8 +939,10 @@ def _profile_meta(data):
 
 
 def _write_profile(db, data):
+    if data.get('world_npc') and data.get('activity') and db.execute('PRAGMA user_version').fetchone()[0]>=6:
+        data=retain_npc_activity(db,data)
     name, kind = _profile_meta(data)
-    payload = json.dumps(data, ensure_ascii=False, allow_nan=False)
+    payload = json.dumps(data, ensure_ascii=False, allow_nan=False, separators=(',',':'))
     db.execute("""INSERT INTO profiles(id,name,kind,data,revision) VALUES(?,?,?,?,1)
         ON CONFLICT(id) DO UPDATE SET name=excluded.name,kind=excluded.kind,
         data=excluded.data,revision=profiles.revision+1""", (str(data['steamid']), name, kind, payload))
@@ -994,7 +1000,7 @@ def _open_world(cache=None):
     try:
         db.execute("PRAGMA foreign_keys=ON")
         version = db.execute("PRAGMA user_version").fetchone()[0]
-        if version > 5:
+        if version > 6:
             raise logs.SteamError("This world was saved by a newer game version. Please upgrade the game.")
         if version == 0:
             db.execute("BEGIN IMMEDIATE")
@@ -1051,6 +1057,8 @@ def _open_world(cache=None):
             _migrate_living_actions(db,path)
         if db.execute("PRAGMA user_version").fetchone()[0] == 4:
             _migrate_sect_politics(db,path)
+        if db.execute("PRAGMA user_version").fetchone()[0] == 5:
+            _migrate_storage_retention(db,path)
         return db
     except BaseException:
         db.rollback()
@@ -1147,9 +1155,10 @@ def world_history(query='', kind='All', page=0, limit=30):
     with world_transaction() as db:
         where = "visibility IN ('public','rumor') AND importance>=2"
         args = []
+        sect_names=dict(db.execute('SELECT id,name FROM sects'))
         if query:
-            where += " AND (instr(lower(title || ' ' || summary || ' ' || location),lower(?))>0)"
-            args.append(query)
+            where += ''' AND (instr(lower(title || ' ' || summary || ' ' || location),lower(?))>0 OR EXISTS (SELECT 1 FROM json_each(world_events.sects) j JOIN sects s ON s.id=j.value WHERE instr(lower(s.name),lower(?))>0))'''
+            args.extend([query,query])
         if kind != 'All':
             where += ' AND kind=?'; args.append(kind)
         total = db.execute('SELECT count(*) FROM world_events WHERE '+where,args).fetchone()[0]
@@ -1164,6 +1173,11 @@ def world_history(query='', kind='All', page=0, limit=30):
                 if type(e['day']) not in (int,float) or not math.isfinite(e['day']):raise ValueError('Invalid event date')
             except (ValueError,TypeError) as exc:
                 raise logs.SteamError(f"Invalid saved World History event {e['id']}. Restore a database backup.") from exc
+            e['sect_names']=[sect_names.get(s,s) for s in e['sects']]
+            e['actor_names']=[]
+            for actor in e['actors']:
+                profile=db.execute('SELECT name FROM profiles WHERE id=?',(actor,)).fetchone()
+                e['actor_names'].append(profile[0] if profile else actor)
             e['when'] = calendar_text(e['day']); rows.append(e)
         return rows,total
 
@@ -1188,14 +1202,27 @@ def validate_page(query,page,limit):
         raise logs.SteamError('Invalid search or page size (allowed: 1–200).')
 
 
+def member_role(affiliation):
+    if not affiliation or not affiliation['sect_id']:
+        return 'Unaffiliated'
+    if affiliation['office']=='Member' and affiliation['mentor']:
+        return 'Direct Disciple'
+    return affiliation['office']
+
+
 def world_population(query='', page=0, limit=50):
+    from generator import local_power_score
     validate_page(query,page,limit)
     with world_transaction() as db:
         where = "p.kind='npc' AND (instr(lower(p.name),lower(?))>0 OR instr(p.id,?)>0)"
         args = [query,query]
         count = db.execute('SELECT count(*) FROM profiles p WHERE '+where,args).fetchone()[0]
         rows = []
-        for row in db.execute('SELECT p.id,p.name,p.data,n.activity,n.location FROM profiles p JOIN npcs n ON n.id=p.id WHERE '+where+' ORDER BY p.name COLLATE NOCASE,p.id LIMIT ? OFFSET ?',args+[limit,max(0,page)*limit]):
+        for row in db.execute('''SELECT p.id,p.name,p.data,n.activity,a.sect_id,a.office,a.mentor,s.name AS sect,
+                i.factor FROM profiles p JOIN npcs n ON n.id=p.id
+                LEFT JOIN affiliations a ON a.actor=p.id LEFT JOIN sects s ON s.id=a.sect_id
+                LEFT JOIN injuries i ON i.actor=p.id AND i.until_day>(SELECT day FROM world)
+                WHERE '''+where+' ORDER BY p.name COLLATE NOCASE,p.id LIMIT ? OFFSET ?',args+[limit,max(0,page)*limit]):
             try:
                 data=decode_profile_json(row['data'])
                 validate_profile_data(data,row['id'])
@@ -1204,9 +1231,18 @@ def world_population(query='', page=0, limit=50):
             except (ValueError,TypeError,KeyError) as exc:
                 raise logs.SteamError(f"Invalid saved world cultivator {row['id']}: {exc}. Restore a database backup.") from exc
             dead = (data.get('life') or {}).get('dead')
-            rows.append(dict(id=row['id'],name=row['name'],sect=(data.get('life',{}).get('incarnation') or {}).get('sect',c['sect']),
-                             realm=gamedata.REALMS[data['realm_state']['realm_index']][1],
-                             activity='Deceased' if dead else 'Travelling' if presence(row['id'])['state']=='travelling' else row['activity'],location=presence(row['id'])['name']))
+            realm=data['realm_state']['realm_index']
+            incarnation=data.get('life',{}).get('incarnation') or {}
+            power=local_power_score(c,talent_name=incarnation.get('talent',c['talent']))+data.get('mentor_power',0)
+            if row['factor'] and not dead:
+                power=round(power*row['factor'])
+            standing=data.get('sect_memberships',{}).get(row['sect_id'],{}).get('points',gamedata.SECT_INITIAL_REPUTATION[realm])
+            rank=next(name for threshold,name in reversed(gamedata.SECT_RANKS) if standing>=threshold)
+            where_now=presence(row['id'])
+            rows.append(dict(id=row['id'],name=row['name'],sect=row['sect'] or 'Wanderer',
+                             role=member_role(row),rank=rank if row['sect_id'] else None,power=power,
+                             realm=gamedata.REALMS[realm][1],location=where_now['name'],
+                             activity='Deceased' if dead else 'Travelling' if where_now['state']=='travelling' else row['activity']))
         return rows,count
 
 
@@ -1323,8 +1359,14 @@ def actor_disposition(actor):
 def relationship_list(player, page=0):
     validate_page('',page,50)
     with world_transaction() as db:
-        rows = db.execute('SELECT r.*,p.name FROM relationships r JOIN profiles p ON p.id=r.npc WHERE player=? ORDER BY last_day DESC,p.name LIMIT 50 OFFSET ?', (player,page*50)).fetchall()
-        total = db.execute('SELECT count(*) FROM relationships WHERE player=?',(player,)).fetchone()[0]
+        # The pair index lists only this player's conversations. Rumors can
+        # change opinions before a first meeting and keep their own records.
+        contacts=""" FROM (SELECT DISTINCT npc FROM conversations WHERE player=?) c
+                      JOIN relationships r ON r.player=? AND r.npc=c.npc
+                      JOIN profiles p ON p.id=c.npc"""
+        rows=db.execute('SELECT r.*,p.name'+contacts+' ORDER BY last_day DESC,p.name,r.npc LIMIT 50 OFFSET ?',
+                        (player,player,page*50)).fetchall()
+        total=db.execute('SELECT count(*)'+contacts,(player,player)).fetchone()[0]
         result=[]
         for row in rows:
             item=dict(row)
@@ -1342,11 +1384,15 @@ def sect_roster(sect_id, page=0):
         leaders = db.execute(sql+" AND a.office<>'Member' ORDER BY CASE a.office WHEN 'Sect Master' THEN 0 WHEN 'Acting Master' THEN 0 ELSE 1 END,p.name",(sect_id,)).fetchall()
         members = db.execute(sql+' ORDER BY p.name LIMIT 50 OFFSET ?',(sect_id,page*50)).fetchall()
         count = db.execute('SELECT count(*) FROM affiliations WHERE sect_id=?',(sect_id,)).fetchone()[0]
+        disciples=db.execute(sql+' AND a.mentor IS NOT NULL ORDER BY p.name,p.id',(sect_id,)).fetchall()
         def present(row):
             result=dict(row);pc=decode_profile_json(result.pop('data'))
+            life=pc.get('life',{})
+            result['gender']=(life.get('incarnation') or {}).get('gender') or pc.get('offline',{}).get('character',{}).get('gender')
+
             result['dead']=bool(pc.get('life',{}).get('dead'))
             return result
-        return dict(leaders=[present(r) for r in leaders],members=[present(r) for r in members],total=count)
+        return dict(leaders=[present(r) for r in leaders],members=[present(r) for r in members],total=count,disciples=[present(r) for r in disciples])
 
 # ============================================================================
 # Living actions (schema 4): authoritative presence, injuries, knowledge, encounters.
@@ -1434,8 +1480,8 @@ def people_here(actor,query='',page=0):
         args=(here['location'],actor,query)
         join=' FROM positions pos JOIN profiles p ON p.id=pos.actor JOIN npcs n ON n.id=p.id LEFT JOIN journeys j ON j.actor=p.id '
         count=db.execute('SELECT count(*)'+join+'WHERE '+where,args).fetchone()[0]
-        rows=db.execute('SELECT p.id,p.name,n.activity,a.office,s.name sect'+join+'LEFT JOIN affiliations a ON a.actor=p.id LEFT JOIN sects s ON s.id=a.sect_id WHERE '+where+' ORDER BY p.name LIMIT 50 OFFSET ?',args+(page*50,)).fetchall()
-        return dict(people=[dict(r) for r in rows],total=count,where=here['name'],state='present')
+        rows=db.execute('SELECT p.id,p.name,n.activity,a.office,a.mentor,a.sect_id,s.name sect'+join+'LEFT JOIN affiliations a ON a.actor=p.id LEFT JOIN sects s ON s.id=a.sect_id WHERE '+where+' ORDER BY p.name LIMIT 50 OFFSET ?',args+(page*50,)).fetchall()
+        return dict(people=[dict(r,role=member_role(r)) for r in rows],total=count,where=here['name'],state='present')
 
 
 def pending_encounter():
@@ -1541,3 +1587,198 @@ def sect_names(cache=None):
     with world_transaction(cache) as db:
         if not db.execute('SELECT 1 FROM sect_charters LIMIT 1').fetchone():sect_catalog(cache)
         return [dict(r) for r in db.execute('SELECT s.id,s.name FROM sects s JOIN sect_charters c ON c.sect_id=s.id ORDER BY s.name')]
+
+# ============================================================================
+# Storage retention (schema 6). All gameplay cleanup is bounded and transactional.
+# ============================================================================
+NPC_RECENT_ACTIVITY = 50
+NPC_HEARD_REPORTS = 200
+NEWS_ARCHIVE_DAYS = 6
+
+
+def _migrate_storage_retention(db,path):
+    lease=db.execute('SELECT expires FROM simulation_lease WHERE id=1').fetchone()
+    if lease and lease[0]>time.time():
+        raise logs.SteamError('Close other game instances before upgrading storage; a crashed session expires after 30 seconds.')
+    folder=path.parent/'migration_backups';folder.mkdir(exist_ok=True)
+    backup=sqlite3.connect(folder/('before_storage_retention_'+datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')+'.db'))
+    try:db.backup(backup)
+    finally:backup.close()
+    db.execute('BEGIN IMMEDIATE')
+    if db.execute('PRAGMA user_version').fetchone()[0]==5:
+        for sql in (
+            'CREATE TABLE npc_milestones(actor TEXT REFERENCES profiles(id),token TEXT NOT NULL,at REAL NOT NULL,data TEXT NOT NULL,PRIMARY KEY(actor,token)) WITHOUT ROWID',
+            'CREATE INDEX milestone_dates ON npc_milestones(actor,at DESC,token)',
+            'CREATE TABLE npc_legacy_activity(actor TEXT PRIMARY KEY REFERENCES profiles(id),data TEXT NOT NULL)',
+            'CREATE TABLE event_archives(event INTEGER PRIMARY KEY REFERENCES world_events(id))',
+            'CREATE TABLE memory_queue(actor TEXT PRIMARY KEY REFERENCES profiles(id),due REAL NOT NULL)',
+            'CREATE INDEX memory_due ON memory_queue(due,actor)',
+            "CREATE INDEX heard_news_recent ON event_knowledge(actor,learned_day DESC,event DESC) WHERE source='Local report'",
+            'CREATE INDEX cooldown_expiry ON duel_cooldowns(ready_day)',
+            "CREATE TABLE storage_maintenance(id INTEGER PRIMARY KEY CHECK(id=1),profile_cursor TEXT NOT NULL DEFAULT '',profiles_done INTEGER NOT NULL DEFAULT 0,effect_cursor INTEGER NOT NULL DEFAULT 0,effect_actor TEXT NOT NULL DEFAULT '',effect_kind TEXT NOT NULL DEFAULT '',effects_done INTEGER NOT NULL DEFAULT 0,turn INTEGER NOT NULL DEFAULT 0)",
+            "INSERT INTO storage_maintenance(id,profiles_done,effects_done) SELECT 1,NOT EXISTS(SELECT 1 FROM profiles WHERE kind='npc'),NOT EXISTS(SELECT 1 FROM event_effects)",
+        ):db.execute(sql)
+        db.execute('PRAGMA user_version=6')
+    db.commit()
+
+
+def significant_activity(event):
+    """Only structured outcomes, never words in narrative summaries."""
+    kind=event.get('type')
+    return bool(kind in ('breakthrough','reborn')
+                or event.get('milestone') in ('mentor_reward','major_discovery','leadership','major_injury')
+                or event.get('outcome') in ('death','injury','injured','killed')
+                or (kind in ('duel','team') and (event.get('upset') or event.get('mode')=='Lethal'))
+                or (kind=='adventure' and event.get('kind') in ('treasure','gain','loss')))
+
+
+def retain_npc_activity(db,data):
+    import hashlib
+    actor=str(data['steamid']);routine=[]
+    for event in data.get('activity',[]):
+        if not isinstance(event,dict):continue
+        if significant_activity(event):
+            payload=json.dumps(event,ensure_ascii=False,allow_nan=False,sort_keys=True,separators=(',',':'))
+            token=hashlib.sha256(payload.encode('utf-8')).hexdigest()
+            db.execute('INSERT OR IGNORE INTO npc_milestones VALUES(?,?,?,?)',(actor,token,event.get('at',0),payload))
+        else:routine.append(event)
+    # Old untyped summaries may contain milestones. Preserve them once, outside
+    # the frequently rewritten profile, instead of guessing from their wording.
+    unknown=[e for e in routine[:-NPC_RECENT_ACTIVITY] if 'routine' not in e and e.get('type')=='adventure' and 'outcome' not in e and 'kind' not in e]
+    if unknown:
+        row=db.execute('SELECT data FROM npc_legacy_activity WHERE actor=?',(actor,)).fetchone()
+        archive=json.loads(row[0]) if row else []
+        keys={json.dumps(e,sort_keys=True,separators=(',',':')) for e in archive}
+        for e in unknown:
+            key=json.dumps(e,sort_keys=True,separators=(',',':'))
+            if key not in keys:archive.append(e);keys.add(key)
+        db.execute('INSERT INTO npc_legacy_activity VALUES(?,?) ON CONFLICT(actor) DO UPDATE SET data=excluded.data',
+                   (actor,json.dumps(archive,ensure_ascii=False,allow_nan=False,separators=(',',':'))))
+    return dict(data,activity=routine[-NPC_RECENT_ACTIVITY:])
+
+
+def npc_history_archive(actor,limit=80):
+    with world_transaction() as db:
+        result=[json.loads(r[0]) for r in db.execute('SELECT data FROM npc_milestones WHERE actor=? ORDER BY at DESC,token LIMIT ?',(actor,limit))]
+        row=db.execute('SELECT data FROM npc_legacy_activity WHERE actor=?',(actor,)).fetchone()
+        if row:result.extend(json.loads(row[0]))
+        return result
+
+
+def queue_memory_cleanup(db,actor,day):
+    if db.execute('SELECT 1 FROM npcs WHERE id=?',(actor,)).fetchone():
+        db.execute('INSERT OR IGNORE INTO memory_queue VALUES(?,?)',(actor,day))
+
+
+def trim_heard_reports(db,actor,day):
+    boundary=db.execute("SELECT learned_day,event FROM event_knowledge WHERE actor=? AND source='Local report' ORDER BY learned_day DESC,event DESC LIMIT 1 OFFSET ?",(actor,NPC_HEARD_REPORTS-1)).fetchone()
+    if not boundary:
+        db.execute('DELETE FROM memory_queue WHERE actor=?',(actor,));return 0
+    candidates=db.execute("SELECT k.event,e.day FROM event_knowledge k JOIN world_events e ON e.id=k.event WHERE k.actor=? AND k.source='Local report' AND (k.learned_day,k.event)<(?,?) ORDER BY k.learned_day,k.event LIMIT 64",(actor,*boundary)).fetchall()
+    removed=0
+    for row in candidates:
+        if row['day']>day-NEWS_ARCHIVE_DAYS or db.execute('SELECT 1 FROM news_queue WHERE event=? LIMIT 1',(row['event'],)).fetchone():continue
+        # This marker is written before memory deletion, in the same transaction.
+        # Rehearing an archived event can never apply its effects a second time.
+        db.execute('INSERT OR IGNORE INTO event_archives VALUES(?)',(row['event'],))
+        db.execute('DELETE FROM event_effects WHERE event=? AND actor=?',(row['event'],actor))
+        db.execute('DELETE FROM event_knowledge WHERE actor=? AND event=?',(actor,row['event']))
+        removed+=1
+    if candidates:
+        db.execute('UPDATE memory_queue SET due=? WHERE actor=?',(day if removed else day+.2,actor))
+    else:db.execute('DELETE FROM memory_queue WHERE actor=?',(actor,))
+    return removed
+
+
+def maintain_storage(db,day,*,budget=.008):
+    """Small round-robin jobs; cursors and deletions commit with the world tick."""
+    deadline=time.perf_counter()+budget;completed=0
+    initial=db.execute('SELECT * FROM storage_maintenance WHERE id=1').fetchone()
+    if initial['profiles_done'] and initial['effects_done'] and not db.execute('SELECT 1 FROM memory_queue WHERE due<=? LIMIT 1',(day,)).fetchone() and not db.execute('SELECT 1 FROM duel_cooldowns WHERE ready_day<=? LIMIT 1',(day,)).fetchone():return 0
+    while completed<8 and (not completed or time.perf_counter()<deadline):
+        state=db.execute('SELECT * FROM storage_maintenance WHERE id=1').fetchone();turn=(initial['turn']+completed)%4
+        if turn==0 and not state['profiles_done']:
+            rows=db.execute('SELECT p.id,p.data FROM npcs n JOIN profiles p ON p.id=n.id WHERE n.id>? ORDER BY n.id LIMIT 2',(state['profile_cursor'],)).fetchall()
+            for row in rows:
+                _write_profile(db,decode_profile_json(row['data']));queue_memory_cleanup(db,row['id'],day)
+            db.execute('UPDATE storage_maintenance SET profile_cursor=?,profiles_done=? WHERE id=1',(rows[-1]['id'] if rows else state['profile_cursor'],int(len(rows)<2)))
+        elif turn==1 and not state['effects_done']:
+            # Stable logical keys survive offline VACUUM and database copying.
+            rows=db.execute('SELECT event,actor,effect FROM event_effects WHERE (event,actor,effect)>(?,?,?) ORDER BY event,actor,effect LIMIT 128',(state['effect_cursor'],state['effect_actor'],state['effect_kind'])).fetchall()
+            for row in rows:
+                if db.execute('SELECT 1 FROM event_knowledge WHERE actor=? AND event=?',(row['actor'],row['event'])).fetchone() or db.execute('SELECT 1 FROM event_archives WHERE event=?',(row['event'],)).fetchone():
+                    db.execute('DELETE FROM event_effects WHERE event=? AND actor=? AND effect=?',(row['event'],row['actor'],row['effect']))
+            if rows:
+                last=rows[-1]
+                db.execute('UPDATE storage_maintenance SET effect_cursor=?,effect_actor=?,effect_kind=?,effects_done=? WHERE id=1',(last['event'],last['actor'],last['effect'],int(len(rows)<128)))
+            else:db.execute('UPDATE storage_maintenance SET effects_done=1 WHERE id=1')
+        elif turn==2:
+            row=db.execute('SELECT actor FROM memory_queue WHERE due<=? ORDER BY due,actor LIMIT 1',(day,)).fetchone()
+            if row:trim_heard_reports(db,row['actor'],day)
+        elif turn==3:
+            db.execute('DELETE FROM duel_cooldowns WHERE rowid IN (SELECT rowid FROM duel_cooldowns WHERE ready_day<=? ORDER BY ready_day LIMIT 64)',(day,))
+        completed+=1
+    db.execute('UPDATE storage_maintenance SET turn=? WHERE id=1',((initial['turn']+completed)%4,))
+    return completed
+
+
+def compact_world_copy(destination,cache=None):
+    """Explicit offline tool: validate a compact copy; never replace the input."""
+    source=database_path(cache).resolve();destination=Path(destination).resolve()
+    if destination.exists():raise logs.SteamError('Choose a new output filename; existing files are never overwritten.')
+    if not source.is_file():raise logs.SteamError('No world.db was found in that cache.')
+    stage=destination.with_name(destination.name+'.incomplete-'+uuid.uuid4().hex)
+    try:
+        with contextlib.closing(sqlite3.connect(source.as_uri()+'?mode=ro',uri=True)) as db:
+            lease=db.execute('SELECT expires FROM simulation_lease WHERE id=1').fetchone()
+            if lease and lease[0]>time.time():raise logs.SteamError('Close the game and editor before offline compaction.')
+            db.execute('VACUUM INTO ?',(str(stage),))
+        with contextlib.closing(sqlite3.connect(stage.as_uri()+'?mode=ro',uri=True)) as check:
+            if check.execute('PRAGMA integrity_check').fetchone()[0]!='ok' or check.execute('PRAGMA foreign_key_check').fetchone():
+                raise logs.SteamError('The compact copy did not pass validation. The original remains unchanged.')
+        # Publish without replacement, including if another process creates the
+        # requested destination while validation is running.
+        os.link(stage,destination)
+        return dict(original_bytes=source.stat().st_size,compact_bytes=destination.stat().st_size,path=str(destination))
+    finally:
+        if stage.exists():stage.unlink()
+
+
+def optimize_world_copy(destination,cache=None):
+    """Finish retention on a private SQLite backup, then publish a compact copy."""
+    source=database_path(cache).resolve();destination=Path(destination).resolve()
+    if destination.exists():raise logs.SteamError('Choose a new output filename; existing files are never overwritten.')
+    with tempfile.TemporaryDirectory(prefix='world-optimize-',dir=destination.parent) as folder:
+        copied=Path(folder)/'world.db'
+        with contextlib.closing(sqlite3.connect(source.as_uri()+'?mode=ro',uri=True)) as src:
+            lease=src.execute('SELECT expires FROM simulation_lease WHERE id=1').fetchone()
+            if lease and lease[0]>time.time():raise logs.SteamError('Close the game and editor before offline optimization.')
+            with contextlib.closing(sqlite3.connect(copied)) as dst:src.backup(dst)
+        transactions=0
+        with contextlib.closing(_open_world(folder)) as db:
+            day=db.execute('SELECT day FROM world').fetchone()[0]
+            while True:
+                db.execute('BEGIN IMMEDIATE')
+                try:
+                    maintain_storage(db,day)
+                    state=db.execute('SELECT profiles_done,effects_done FROM storage_maintenance').fetchone()
+                    pending=(not all(state) or db.execute('SELECT 1 FROM memory_queue WHERE due<=? LIMIT 1',(day,)).fetchone()
+                             or db.execute('SELECT 1 FROM duel_cooldowns WHERE ready_day<=? LIMIT 1',(day,)).fetchone())
+                    db.commit();transactions+=1
+                except BaseException:
+                    db.rollback();raise
+                if not pending:break
+        result=compact_world_copy(destination,folder)
+        result.update(original_bytes=source.stat().st_size,retention_transactions=transactions)
+        return result
+
+
+if __name__=='__main__':
+    import argparse
+    parser=argparse.ArgumentParser(description='Offline world storage tools; never overwrites a save.')
+    action=parser.add_mutually_exclusive_group(required=True)
+    action.add_argument('--compact-copy',help='Compact the current data into a new output database. Close the game/editor first.')
+    action.add_argument('--optimize-copy',help='Finish retention on a private backup and produce a validated compact database. Close the game/editor first.')
+    parser.add_argument('--cache',default=CACHE_DIR,help='Folder containing world.db')
+    args=parser.parse_args()
+    print(json.dumps((optimize_world_copy(args.optimize_copy,args.cache) if args.optimize_copy else compact_world_copy(args.compact_copy,args.cache)),indent=2))

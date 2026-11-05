@@ -746,7 +746,9 @@ class Controller:
                     if "name is already in use" in str(exc):
                         continue
                     raise
-                return self._view_data(settings["seed"])
+                result=self._view_data(settings["seed"])
+                logs.RUN_LOG.note("Local generation for "+settings["name"]+": "+", ".join(key+"="+value for key,value in result["view"]["source"]))
+                return result
             raise logs.SteamError("Could not find a unique local name. Please try again.")
         return self._run("create random local cultivator", work)
 
@@ -816,20 +818,28 @@ class Controller:
             return {"steamid": steamid, "c": c, "rows": shop_rows(c), "sells": pavilion_shop.sell_rows(c)}
         return self._run("pavilion", work)
 
-    def sell(self, number):
+    def sell(self, number, expected=None):
         """Sells treasure number `number` (as listed in the 'sells' rows) for half its value.
         Returns the shop data plus 'sold' (the row sold)."""
         def work():
             steamid, c = pavilion_shop.pavilion_target(self.key, self.profiles, self.session, "sell")
+            if expected is not None:
+                shown=next((r for r in pavilion_shop.sell_rows(c) if r["number"]==number),None)
+                if shown is None or (steamid,shown["name"],shown["price"])!=expected:
+                    raise logs.SteamError("This listing changed. Reopen the pavilion to see the current offer.")
             row = pavilion_shop.sell_treasure(steamid, c, number)
             return {"steamid": steamid, "c": c, "rows": shop_rows(c), "sells": pavilion_shop.sell_rows(c),
                     "sold": row}
         return self._run(f"sell {number}", work)
 
-    def buy(self, number):
+    def buy(self, number, expected=None):
         """Buys item number `number` (as listed in shop rows). Returns the receipt dict."""
         def work():
             steamid, c = pavilion_shop.pavilion_target(self.key, self.profiles, self.session)
+            if expected is not None:
+                shown=next((r for r in shop_rows(c) if r["number"]==number),None)
+                if shown is None or (steamid,shown["name"],shown["price"])!=expected:
+                    raise logs.SteamError("This listing changed. Reopen the pavilion to see the current offer.")
             item = pavilion_shop.buy_pavilion_item(steamid, c, number)
             return {"item": item, "c": c, "rows": shop_rows(c), "steamid": steamid,
                     "sells": pavilion_shop.sell_rows(c),
@@ -929,6 +939,11 @@ def cultivator_view(c, info):
             ("Personality", ", ".join(c.get("world_personalities", []))),
             ("Path", generator.path_label(c["path"])),
             ("Reputation", f"{rep['rank']} ({rep['points']:,} points)")]
+    rows.insert(1,("Overall power",f"{c['score']:,}"))
+    rows.extend([("Sect", c["sect"]),("Sect office", c.get("sect_role","Unaffiliated"))])
+    if c["sect"]!="Wanderer" and c.get("sect_status"):
+        status=c["sect_status"]
+        rows.append(("Sect reputation rank",status['rank']))
     if c.get("injury"):
         rows.append(("Injury", c["injury"]["cause"]+" · power reduced 20% · recovering until "+storage.calendar_text(c["injury"]["until_day"])))
     if rep["bonuses"]:
@@ -1063,6 +1078,337 @@ ACCENT = "#c8a24a"        # a muted gold
 GOOD = "#6fcf97"
 BAD = "#eb6b6b"
 WIDE = 820                # wrap width for long texts
+
+
+class CouncilChart(tk.Frame):
+    """Public council offices and mentor links, painted on one scrollable canvas."""
+    GOLD, SILVER, JADE = '#dbb36c', '#b6c7da', '#85c7ac'
+
+    def __init__(self,parent,app):
+        super().__init__(parent,bg=PANEL)
+        self.app=app
+        self.model=None
+        self.images={}
+        self.targets={}
+        self.cards={}
+        self.active=None
+        self.pressed=None
+        self.width=0
+        self.caption=app.ctk.CTkLabel(self,text='',font=app.body_font,anchor='w')
+        self.caption.grid(row=0,column=0,columnspan=2,sticky='ew',padx=10)
+        cv=self.canvas=tk.Canvas(self,bg=PANEL,highlightthickness=1,highlightbackground=PANEL,
+                                 highlightcolor=ACCENT,takefocus=True)
+        vertical=app.ctk.CTkScrollbar(self,command=cv.yview)
+        horizontal=app.ctk.CTkScrollbar(self,orientation='horizontal',command=cv.xview)
+        cv.configure(xscrollcommand=horizontal.set,yscrollcommand=vertical.set)
+        cv.grid(row=1,column=0,sticky='nsew');vertical.grid(row=1,column=1,sticky='ns')
+        horizontal.grid(row=2,column=0,sticky='ew')
+        self.columnconfigure(0,weight=1);self.rowconfigure(1,weight=1)
+        cv.bind('<Configure>',self.resize)
+        cv.bind('<ButtonPress-1>',self.press)
+        cv.bind('<ButtonRelease-1>',self.release)
+        cv.bind('<MouseWheel>',lambda e:self.wheel(e,False))
+        cv.bind('<Shift-MouseWheel>',lambda e:self.wheel(e,True))
+        cv.bind('<Button-4>',lambda e:cv.yview_scroll(-1,'units'))
+        cv.bind('<Button-5>',lambda e:cv.yview_scroll(1,'units'))
+        cv.bind('<Return>',lambda e:self.open(self.active))
+        cv.bind('<space>',lambda e:self.open(self.active))
+        for key,delta in [('Up',-1),('Left',-1),('Down',1),('Right',1)]:
+            cv.bind('<'+key+'>',lambda e,d=delta:self.step(d))
+        cv.bind('<FocusIn>',lambda e:self.select(self.active or next(iter(self.cards),None)))
+        cv.tag_bind('portrait','<Enter>',lambda e:cv.configure(cursor='hand2'))
+        cv.tag_bind('portrait','<Leave>',lambda e:cv.configure(cursor=''))
+
+    def wheel(self,event,sideways):
+        scroll=self.canvas.xview_scroll if sideways else self.canvas.yview_scroll
+        if event.delta:scroll(-1 if event.delta>0 else 1,'units')
+        return 'break'
+
+    def hit(self):
+        item=self.canvas.find_withtag('current')
+        return self.targets.get(item[0]) if item else None
+
+    def press(self,event):
+        self.canvas.focus_set()
+        self.pressed=self.hit()
+        if self.pressed:self.select(self.pressed)
+
+    def release(self,event):
+        actor=self.hit()
+        if actor and actor==self.pressed:self.open(actor)
+        self.pressed=None
+
+    def open(self,actor):
+        if actor in self.cards and not self.app.working:self.app.inspect_world_actor(actor)
+        return 'break'
+
+    def select(self,actor):
+        if self.active in self.cards:self.canvas.itemconfigure(self.cards[self.active],width=2)
+        self.active=actor
+        if actor in self.cards:self.canvas.itemconfigure(self.cards[actor],width=4)
+
+    def step(self,delta):
+        actors=list(self.cards)
+        if actors:
+            i=actors.index(self.active) if self.active in actors else 0
+            self.select(actors[max(0,min(len(actors)-1,i+delta))])
+            x,y,r,b=self.canvas.bbox(self.cards[self.active])
+            cv=self.canvas
+            if x<cv.canvasx(0) or r>cv.canvasx(cv.winfo_width()):cv.xview_moveto(max(0,x-5)/self.extent[0])
+            if y<cv.canvasy(0) or b>cv.canvasy(cv.winfo_height()):cv.yview_moveto(max(0,y-5)/self.extent[1])
+        return 'break'
+
+    def resize(self,event):
+        if self.width!=event.width:
+            self.width=event.width
+            self.draw()
+
+    def show(self,sect,data):
+        # Ignore support scores, member-page changes and other nonvisual data.
+        def person(r):
+            return (r['actor'],r['name'],r['office'],r['mentor'],r.get('gender') or generator.roll_gender(r['actor']))
+        leaders=[person(r) for r in data['leaders'] if not r['dead'] and r['office'] in ('Sect Master','Acting Master','Elder')]
+        students=[person(r) for r in data['disciples'] if not r['dead']]
+        model=(sect,leaders,students)
+        if model==self.model:return
+        changed_sect=self.model is None or self.model[0]!=sect
+        self.model=model
+        self.caption.configure(text=f"{sect} · Council hierarchy     Silver: council offices     Jade: direct disciples")
+        self.draw()
+        if changed_sect:
+            self.canvas.xview_moveto(max(0,(self.extent[0]-self.width)/2)/self.extent[0])
+            self.canvas.yview_moveto(0)
+
+    def portrait(self,actor,gender):
+        import hashlib
+        index=int.from_bytes(hashlib.sha256(actor.encode()).digest()[:4],'big')%8+(8 if gender=='female' else 0)
+        if index not in self.images:
+            path=Path(__file__).parent/'assets'/'portraits'/f'{index}.png'
+            self.images[index]=tk.PhotoImage(master=self.canvas,file=str(path))
+        return self.images[index]
+
+    def draw(self):
+        if self.model is None:return
+        sect,leaders,students=self.model
+        master=next((r for r in leaders if r[2] in ('Sect Master','Acting Master')),None)
+        elders=[r for r in leaders if r[2]=='Elder']
+        pupils={}
+        for r in students:pupils.setdefault(r[3],[]).append(r)
+        own=pupils.get(master[0],[]) if master else []
+        # The master's pupils occupy their own branch. Elder pupils have one
+        # shared stem per mentor so siblings never look like each other's pupils.
+        columns=max(1,len(elders)+bool(own))
+        pitch=158
+        width=max(self.width-4,columns*pitch+24)
+        left=(width-columns*pitch)/2
+        cv=self.canvas;cv.delete('all')
+        self.cards.clear();self.targets.clear();self.pressed=None
+        height=200
+        def card(row,x,y,role,color):
+            nonlocal height
+            actor,name,_,_,gender=row
+            rect=cv.create_rectangle(x-66,y,x+66,y+152,fill=PANEL_2,outline=color,width=2,tags='portrait')
+            items=[rect,cv.create_image(x,y+45,image=self.portrait(actor,gender),tags='portrait'),
+                   cv.create_text(x,y+88,text=name,width=124,anchor='n',font=self.app.body_font,fill=TEXT,tags='portrait'),
+                   cv.create_text(x,y+137,text=role,font=self.app.small_font,fill=color,tags='portrait')]
+            self.cards[actor]=rect
+            self.targets.update((item,actor) for item in items)
+            height=max(height,y+170)
+        def wire(*points,color):
+            line=cv.create_line(*points,fill=color,width=2)
+            cv.tag_lower(line)
+        center=width/2
+        if master:card(master,center,10,master[2],self.GOLD)
+        else:cv.create_text(center,85,text='Master seat vacant',font=self.app.head_font,fill=self.GOLD)
+        def children(rows,x,top,parent_x,parent_y):
+            if not rows:return
+            stem=x-75
+            wire(parent_x,parent_y,parent_x,parent_y+12,stem,parent_y+12,stem,top+(len(rows)-1)*166+52,color=self.JADE)
+            for i,student in enumerate(rows):
+                y=top+166*i
+                wire(stem,y+52,x-66,y+52,color=self.JADE)
+                card(student,x,y,'Direct disciple',self.JADE)
+        for i,elder in enumerate(elders):
+            x=left+(i+.5)*pitch
+            wire(center,162,center,182,x,182,x,206,color=self.SILVER)
+            card(elder,x,206,'Elder',self.SILVER)
+            children(pupils.get(elder[0],[]),x,390,x,358)
+        if own:
+            x=left+(len(elders)+.5)*pitch
+            children(own,x,206,center,162)
+        self.extent=(width,height)
+        cv.configure(scrollregion=(0,0,width,height))
+        self.select(self.active if self.active in self.cards else None)
+
+
+class WorldCardList(tk.Frame):
+    """One drawing surface for a page. Moving the viewport never lays out its cards."""
+    def __init__(self, master, app, action=None):
+        super().__init__(master, bg=PANEL)
+        self.open_actor = action or app.inspect_world_actor
+        self.affinity_image = app.affinity_image
+        self.canvas = cv = tk.Canvas(self, bg=PANEL, highlightthickness=1,
+                                      highlightbackground=PANEL, highlightcolor=ACCENT,
+                                      takefocus=True, yscrollincrement=12)
+        self.bar = bar = app.ctk.CTkScrollbar(self, command=cv.yview)
+        bar.pack(side="right", fill="y")
+        cv.configure(yscrollcommand=bar.set)
+        cv.pack(fill="both", expand=True)
+        self.fonts = (app.head_font, app.body_font)
+        self.rows = []
+        self.context = None
+        self.width = 0
+        self.wheel_units = 1
+        self.extent = 0
+        self.actions = {}
+        self.order = []
+        self.active = self.pressed = None
+        cv.bind("<Configure>", self.resize)
+        cv.bind("<MouseWheel>", self.wheel)
+        cv.bind("<Button-4>", lambda e: cv.yview_scroll(-3,"units"))
+        cv.bind("<Button-5>", lambda e: cv.yview_scroll(3,"units"))
+        cv.tag_bind("action","<Enter>",lambda e: cv.configure(cursor="hand2"))
+        cv.tag_bind("action","<Leave>",lambda e: cv.configure(cursor=""))
+        cv.bind("<Button-1>", self.press)
+        cv.bind("<ButtonRelease-1>", self.release)
+        cv.bind("<Key-Up>", lambda e: self.step(-1))
+        cv.bind("<Key-Down>", lambda e: self.step(1))
+        cv.bind("<Return>", lambda e: self.activate())
+        cv.bind("<space>", lambda e: self.activate())
+        cv.bind("<FocusIn>", lambda e: self.focus_action(self.active or next(iter(self.order),None)))
+        cv.bind("<FocusOut>", lambda e: self.paint_focus(False))
+
+    def wheel(self,event):
+        delta=event.delta
+        units=delta if sys.platform=='darwin' else (max(1,abs(delta)//120)*(1 if delta>0 else -1))
+        if delta:self.canvas.yview_scroll(-3*units*self.wheel_units,"units")
+        return "break"
+
+    def press(self,event):
+        item=self.canvas.find_withtag("current")
+        self.pressed=self.actions.get(item[0]) if item else None
+        self.canvas.focus_set()
+        if self.pressed:self.focus_action(item[0])
+
+    def release(self,event):
+        item=self.canvas.find_withtag("current")
+        target=self.actions.get(item[0]) if item else None
+        if target and target==self.pressed:self.open_actor(target)
+        self.pressed=None
+
+    def activate(self):
+        if self.active in self.actions:self.open_actor(self.actions[self.active])
+        return "break"
+
+    def paint_focus(self,visible):
+        if self.active in self.actions:
+            self.canvas.itemconfigure(self.active,fill=TEXT if visible else ACCENT)
+
+    def focus_action(self,item):
+        self.paint_focus(False)
+        self.active=item
+        self.paint_focus(True)
+
+    def step(self,direction):
+        if self.order:
+            index=self.order.index(self.active) if self.active in self.order else 0
+            item=self.order[max(0,min(index+direction,len(self.order)-1))]
+            self.focus_action(item)
+            _,y,_,end=self.canvas.bbox(item)
+            top=self.canvas.canvasy(0)
+            height=self.canvas.winfo_height()
+            if y<top or end>top+height:
+                self.canvas.yview_moveto(max(0,y-16)/max(1,self.extent))
+        return "break"
+
+    def resize(self,event):
+        if self.width!=event.width:
+            self.width=event.width
+            self.layout(force=True)
+
+    def show(self, entries, context):
+        # Each entry is (heading, details, ((action label, actor id), ...)).
+        cv=self.canvas
+        reset=context!=self.context
+        self.context=context
+        changed=False
+        while len(self.rows)<len(entries):
+            tag=f"card{len(self.rows)}"
+            bg=cv.create_rectangle(0,0,1,1,fill=PANEL_2,outline="",tags=tag)
+            items=[cv.create_text(0,0,anchor="nw",font=font,fill=color,tags=tag)
+                   for font,color in zip(self.fonts,(TEXT,MUTED))]
+            self.rows.append(dict(tag=tag,bg=bg,items=items,links=[],entry=None,dirty=True,y=0,height=0))
+        for row,entry in zip(self.rows,entries):
+            old=row['entry']
+            if entry==old:continue
+            changed=True
+            for i,item in enumerate(row['items']):
+                if old is None or entry[i]!=old[i]:cv.itemconfigure(item,text=entry[i])
+            icon_key=entry[3] if len(entry)>3 else None
+            if icon_key!=row.get('icon_key'):
+                if row.get('icon'):cv.delete(row.pop('icon'))
+                row['icon_key']=icon_key
+                icon=self.affinity_image(icon_key) if icon_key else None
+                if icon:
+                    if not isinstance(icon,tk.PhotoImage):icon=icon.create_scaled_photo_image(1,'dark')
+                    row['icon']=cv.create_image(0,0,image=icon,anchor='nw',tags=row['tag'])
+            links=row['links']
+            for i,(label,actor) in enumerate(entry[2]):
+                if i==len(links):
+                    links.append(cv.create_text(0,0,anchor="nw",font=self.fonts[1],fill=ACCENT,width=max(1,self.width-42),tags=(row['tag'],'action')))
+                if old is None or i>=len(old[2]) or label!=old[2][i][0]:
+                    cv.itemconfigure(links[i],text=label)
+                self.actions[links[i]]=actor
+            while len(links)>len(entry[2]):
+                item=links.pop();self.actions.pop(item);cv.delete(item)
+            row.update(entry=entry,dirty=True)
+        while len(self.rows)>len(entries):
+            row=self.rows.pop()
+            for item in row['links']:self.actions.pop(item)
+            cv.delete(row['tag']);changed=True
+        if changed:
+            self.order=[item for row in self.rows for item in row['links']]
+            if self.active not in self.actions:self.active=None
+            self.layout()
+        if reset:
+            self.pressed=None
+            self.focus_action(None)
+            cv.yview_moveto(0)
+
+    def layout(self,force=False):
+        if self.width<40:return
+        cv=self.canvas
+        y=4
+        for row in self.rows:
+            if force or row['dirty']:
+                cursor=y+8
+                for item in row['items']+row['links']:
+                    indent=34 if row.get('icon') and item==row['items'][1] else 0
+                    if indent:cv.coords(row['icon'],20,cursor)
+                    cv.coords(item,20+indent,cursor)
+                    if force or row.get("wrap")!=self.width or row.get("previous_icon")!=row.get("icon_key"):
+                        cv.itemconfigure(item,width=max(1,self.width-42-indent))
+                    bounds=cv.bbox(item)
+                    cursor=max(bounds[3] if bounds else cursor,cursor+28 if indent else cursor)+3
+                height=cursor-y+5
+                cv.coords(row['bg'],6,y,self.width-6,y+height)
+                row.update(height=height,dirty=False,wrap=self.width,previous_icon=row.get("icon_key"))
+            elif y!=row['y']:
+                cv.move(row['tag'],0,y-row['y'])
+            row['y']=y
+            y+=row['height']+6
+        if force or y!=self.extent:
+            self.extent=y
+            cv.configure(scrollregion=(0,0,self.width,y))
+
+
+def dialog_scroll(ctk,window,**options):
+    # Toplevel bindtags deliver wheel/shift events from all its descendants.
+    # Tk releases these bindings with the dialog, including after repeated inspection.
+    class DialogScroll(ctk.CTkScrollableFrame):
+        def bind_all(self,sequence=None,func=None,add=None):
+            return window.bind(sequence,func,add)
+    return DialogScroll(window,**options)
 
 
 class App:
@@ -1240,7 +1586,7 @@ class App:
         for name in ("Cultivator", "Sect", "Pavilion", "Battles", "History", "World", "World History", "Log"):
             self.tabs.add(name)
         self.build_cultivator_tab(self.tabs.tab("Cultivator"))
-        self.sect_panel = ctk.CTkScrollableFrame(self.tabs.tab("Sect"), fg_color=PANEL)
+        self.sect_panel = WorldCardList(self.tabs.tab("Sect"),self,self.sect_action)
         self.sect_panel.pack(fill="both", expand=True)
         self.say(self.sect_panel, "Look up a cultivator to visit their sect.")
         self.build_pavilion_tab(self.tabs.tab("Pavilion"))
@@ -1287,6 +1633,10 @@ class App:
 
     def on_tab(self):
         name = self.tabs.get()
+        if name in ('Sect','History','Pavilion') and self.working:
+            self._deferred_tab=name
+            return
+        self._deferred_tab=None
         if name == "Sect":
             self.refresh_sect()
         elif name == "World":
@@ -1358,7 +1708,7 @@ class App:
         dlg=getattr(self,'sect_management_window',None)
         if not dlg or not self.widget_alive(dlg):
             dlg=self.ctk.CTkToplevel(self.root);self.sect_management_window=dlg;dlg.title('Sect membership and politics');dlg.geometry('930x800');dlg.transient(self.root)
-            self.sect_management_panel=self.ctk.CTkScrollableFrame(dlg);self.sect_management_panel.pack(fill='both',expand=True,padx=10,pady=10)
+            self.sect_management_panel=dialog_scroll(self.ctk,dlg);self.sect_management_panel.pack(fill='both',expand=True,padx=10,pady=10)
         body=self.fresh(self.sect_management_panel)
         self.section(body,a['name']+' · '+data['role'])
         self.paragraph(body,f"Standing: {a['standing']} · Spirit Stones: {data['spirit_stones']:,} · Salary: {data['salary']} every 30 active minutes (highest role only).")
@@ -1426,63 +1776,61 @@ class App:
 
     def refresh_sect(self):
         if self.working:
-            self.root.after(1000, lambda: self.refresh_sect() if self.tabs.get() == "Sect" else None)
+            self._deferred_tab="Sect"
             return
         if not self.selected:
             self.say(self.sect_panel, "Look up a cultivator to visit their sect.")
             return
-        self.run_async("Visiting the sect…", self.controller.sect, self.show_sect)
+        self.run_async("Visiting the sect…", self.controller.sect, lambda data:self.show_sect(data) if self.tabs.get()=="Sect" else None)
 
     def show_sect(self, data, show_offers=False):
         job = getattr(self, "_sect_refresh_job", None)
         if job:
             self.root.after_cancel(job)
             self._sect_refresh_job = None
-        body = self.fresh(self.sect_panel)
-        c, sect = data["c"], data["sect"]
-        self.section(body, sect["identity"]["name"])
-        self.ctk.CTkButton(body,text="Membership, mentorship and sect politics",command=self.open_sect_management).pack(pady=8)
-        if c["sect"]=="Wanderer":
-            self.paragraph(body,"You are a wanderer. Choose a sect above and travel to its headquarters to join; sect missions require membership.")
-            return
-        self.table(body, [("Cultivator", c["name"]), ("Current title", c["title"]),
-                          ("Sect reputation rank", sect["rank"]), ("Sect reputation points", f"{sect['points']:,}"),
-                          ("Sect points", f"{c['sect_points']:,}"), ("Spirit Stones", f"{c['spirit_stones']:,}")], label_width=190)
-        discounts = gamedata.SECT_DISCOUNTS[sect["rank_index"]]
-        self.paragraph(body, "Pavilion discounts: " + ", ".join(f"{v}%" for v in discounts) + " for prices <500 / <2,000 / <5,000 / 5,000+.")
-        self.paragraph(body, "Easy: guaranteed success, 5-minute cooldown. Hard: success/failure 10 minutes; injury 15 minutes. Failure, injury and death give no rewards.")
-        risk = progress.mission_risks(c)
-        self.paragraph(body, f"Hard mission risks: failure {risk['failure']*100:g}%, injury {risk['injury']*100:g}%, death {risk['death']*100:g}%. Injury costs {10*(c['realm_index']+1)} lifespan years and can be fatal.")
-        if sect["history"]:
-            self.paragraph(body, sect["history"][-1]["summary"])
-        remaining = max(0, int(sect["ready_at"] - time.time() + .999))
-        if c["death"]:
-            self.paragraph(body, "This cultivator is dead. Use Adventure to seek rebirth.")
-        elif remaining:
-            countdown = self.ctk.CTkLabel(body, text="", anchor="w", justify="left",
-                                         wraplength=WIDE, font=self.body_font)
-            countdown.pack(fill="x", padx=12, pady=3)
-            sid = data["steamid"]
-            def tick():
-                self._sect_refresh_job = None
-                if not self.widget_alive(countdown) or self.tabs.get() != "Sect" or self.controller.selected() != sid:
-                    return
-                left = max(0, int(sect["ready_at"] - time.time() + .999))
-                if not left:
-                    self.refresh_sect()
-                    return
-                countdown.configure(text=f"Next sect mission in {left//60}m {left%60:02d}s. New offers unlock when the cooldown ends.")
-                self._sect_refresh_job = self.root.after(1000, tick)
-            tick()
+        c,sect,sid=data['c'],data['sect'],data['steamid']
+        board=(sid,sect['identity']['id'],tuple(o['id'] for o in sect['offers']))
+        self._sect_expanded=show_offers or (getattr(self,'_sect_board_key',None)==board and getattr(self,'_sect_expanded',False))
+        self._sect_board_key=board
+        self._sect_data=data
+        entries=[(sect['identity']['name'],c['name']+' · '+c['title'],(('Membership, mentorship and sect politics',(sid,'management')),))]
+        if c['sect']=='Wanderer':
+            entries.append(('Wanderer','Choose a sect above and travel to its headquarters to join. Sect missions require membership.',()))
         else:
-            self.ctk.CTkButton(body, text="Go out on a sect mission", command=lambda: self.show_sect(data, True)).pack(pady=10)
-            if show_offers:
-                for offer in sect["offers"]:
-                    card = self.ctk.CTkFrame(body, fg_color=PANEL_2)
-                    card.pack(fill="x", padx=10, pady=5)
-                    self.paragraph(card, ("Hard: " if offer["hard"] else "Easy: ") + offer["text"])
-                    self.paragraph(card, f"Rewards: {offer['sect_points']} sect points · {offer['stones']} Spirit Stones · {offer['reputation']} sect reputation")
-                    self.ctk.CTkButton(card, text="Choose this mission", command=lambda oid=offer["id"]: self.choose_sect_mission(oid)).pack(pady=8)
+            entries.append(('Sect reputation rank',f"{sect['rank']} · {sect['points']:,} sect reputation",()))
+            entries.append(('Currencies',f"{c['sect_points']:,} sect points · {c['spirit_stones']:,} Spirit Stones",()))
+            discounts=gamedata.SECT_DISCOUNTS[sect['rank_index']]
+            entries.append(('Pavilion discounts',', '.join(f'{v}%' for v in discounts)+' for prices <500 / <2,000 / <5,000 / 5,000+.',()))
+            risk=progress.mission_risks(c)
+            entries.append(('Sect missions','Easy: guaranteed success, 5-minute cooldown. Hard: success/failure 10 minutes; injury 15 minutes. Failure, injury and death give no rewards.\n'
+                            +f"Hard mission risks: failure {risk['failure']*100:g}%, injury {risk['injury']*100:g}%, death {risk['death']*100:g}%. Injury costs {10*(c['realm_index']+1)} lifespan years and can be fatal.",()))
+            if sect['history']:entries.append(('Last mission',sect['history'][-1]['summary'],()))
+            if c['death']:entries.append(('Missions unavailable','Use Adventure to seek rebirth.',()))
+            elif sect['ready_at']>time.time():
+                def tick():
+                    self._sect_refresh_job=None
+                    if self.tabs.get()!='Sect' or self.controller.selected()!=sid:return
+                    left=max(0,int(sect['ready_at']-time.time()+.999))
+                    if not left:
+                        self.refresh_sect()
+                        return
+                    self.sect_panel.show(entries+[('Next sect mission',f'{left//60}m {left%60:02d}s until new offers unlock.',())],sid)
+                    self._sect_refresh_job=self.root.after(1000,tick)
+                tick()
+                return
+            elif not self._sect_expanded:entries.append(('Mission board','',(('Go out on a sect mission',(sid,'board')),)))
+            else:
+                for offer in sect['offers']:
+                    rewards=f"{offer['sect_points']} sect points · {offer['stones']} Spirit Stones · {offer['reputation']} sect reputation"
+                    entries.append((('Hard: ' if offer['hard'] else 'Easy: ')+offer['text'],rewards,(('Choose this mission',(sid,'mission',offer['id'])),)))
+        self.sect_panel.show(entries,sid)
+
+    def sect_action(self,target):
+        sid,action,*args=target
+        if self.working or self.controller.selected()!=sid:return
+        if action=='management':self.open_sect_management()
+        elif action=='board':self.show_sect(self._sect_data,True)
+        elif action=='mission':self.choose_sect_mission(args[0])
 
     def choose_sect_mission(self, offer_id):
         if self.working:
@@ -1513,20 +1861,20 @@ class App:
         ctk.CTkButton(controls,text='Previous',width=90,command=lambda:self.change_world_page(-1)).pack(side='right',padx=4)
         ctk.CTkButton(controls,text='Next',width=90,command=lambda:self.change_world_page(1)).pack(side='right',padx=4)
         self.world_count = ctk.CTkLabel(tab,text='',font=self.small_font);self.world_count.pack()
-        self.world_panel = ctk.CTkScrollableFrame(tab,fg_color=PANEL);self.world_panel.pack(fill='both',expand=True)
+        self.world_panel = WorldCardList(tab,self);self.world_panel.pack(fill='both',expand=True)
         tab = self.tabs.tab('World History')
         self.chronicle_page = 0
         controls = ctk.CTkFrame(tab,fg_color='transparent');controls.pack(fill='x',padx=12,pady=8)
         self.chronicle_search = ctk.CTkEntry(controls,placeholder_text='Search event, location or sect',width=280)
         self.chronicle_search.pack(side='left',padx=(0,8))
-        self.chronicle_kind = ctk.CTkOptionMenu(controls,values=['All','calendar','world','breakthrough','death','war','inheritance'],width=140)
+        self.chronicle_kind = ctk.CTkOptionMenu(controls,values=['All','calendar','world','breakthrough','death','war','inheritance','politics'],width=140)
         self.chronicle_kind.pack(side='left',padx=8)
         ctk.CTkButton(controls,text='Search',width=80,command=lambda:self.refresh_chronicle(reset=True)).pack(side='left')
         ctk.CTkButton(controls,text='Next',width=70,command=lambda:self.change_chronicle_page(1)).pack(side='right',padx=4)
         ctk.CTkButton(controls,text='Previous',width=80,command=lambda:self.change_chronicle_page(-1)).pack(side='right',padx=4)
         self.chronicle_count = ctk.CTkLabel(tab,text='Major public events and rumors; hidden discoveries remain secret.',font=self.small_font)
         self.chronicle_count.pack()
-        self.chronicle_panel = ctk.CTkScrollableFrame(tab,fg_color=PANEL);self.chronicle_panel.pack(fill='both',expand=True)
+        self.chronicle_panel = WorldCardList(tab,self);self.chronicle_panel.pack(fill='both',expand=True)
 
     def begin_world(self):
         if self.working:
@@ -1540,7 +1888,7 @@ class App:
         def done(world):
             self.show_world_clock(world)
             self.root.after(1000,self.world_tick)
-            if self.tabs.get() == 'World': self.refresh_world()
+            if self.tabs.get() == 'World': self.social_tab_changed()
         self.run_async('Preparing the living world…',work,done,
                        lambda message:self.world_header.configure(text='World could not start: '+message))
 
@@ -1631,16 +1979,15 @@ class App:
         self.ctk.CTkButton(bar,text='Refresh',width=90,command=lambda:self.refresh_people(reset=True)).pack(side='left',padx=4)
         for label,delta in (('Previous',-1),('Next',1)):
             self.ctk.CTkButton(bar,text=label,width=85,command=lambda d=delta:self.page_people(d)).pack(side='left',padx=4)
-        self.people_panel=self.ctk.CTkScrollableFrame(tab);self.people_panel.pack(fill='both',expand=True)
-        self.people_panel.grid_columnconfigure(0,weight=1)
-        self._people_rows={}
-        self._people_order=[]
+        self.people_panel=WorldCardList(tab,self,lambda actor:self.inspect_world_actor(actor))
+        self.people_panel.pack(fill='both',expand=True)
+        self.people_panel.canvas.configure(yscrollincrement=1)
+        self.people_panel.wheel_units=12
         self._people_pointer_down=False
-        self._people_layout_revision=0
-        self.people_message=self.ctk.CTkLabel(self.people_panel,text='',wraplength=700,justify='left')
-        self.root.bind('<ButtonPress-1>',self.people_pointer_press,add='+')
-        self.root.bind('<ButtonRelease-1>',self.people_pointer_release,add='+')
-        self.root.bind('<MouseWheel>',lambda event:setattr(self,'_people_layout_revision',self._people_layout_revision+1),add='+')
+        for widget in (self.people_panel.canvas,self.people_panel.bar._canvas):
+            widget.bind('<ButtonPress-1>',self.people_pointer_press,add='+')
+            widget.bind('<ButtonRelease-1>',self.people_pointer_release,add='+')
+
         tab=self.world_views.tab('Map')
         self.map_notice=self.ctk.CTkLabel(tab,text='Select a cultivator, then choose a destination.',wraplength=900)
         self.map_notice.pack(fill='x',padx=10,pady=4)
@@ -1658,16 +2005,21 @@ class App:
         self.sect_selector=self.ctk.CTkOptionMenu(tab,values=['Preparing sects…'],command=lambda value:self.refresh_leadership(reset=True))
         self.sect_selector.pack(fill='x',padx=12,pady=8)
         self.roster_page=0
-        bar=self.ctk.CTkFrame(tab);bar.pack(fill='x')
+        controls=self.ctk.CTkFrame(tab);controls.pack(fill='x')
+        self.leader_mode=self.ctk.CTkSegmentedButton(controls,values=['Council hierarchy','Member roster'],command=self.switch_leadership)
+        self.leader_mode.pack(side='left',padx=8,pady=3);self.leader_mode.set('Council hierarchy')
+        self.roster_controls=self.ctk.CTkFrame(controls,fg_color='transparent')
         for text,delta in (('Previous',-1),('Next',1)):
-            self.ctk.CTkButton(bar,text=text,width=90,command=lambda d=delta:self.change_roster_page(d)).pack(side='left',padx=4)
-        self.leader_panel=self.ctk.CTkScrollableFrame(tab);self.leader_panel.pack(fill='both',expand=True)
+            self.ctk.CTkButton(self.roster_controls,text=text,width=90,command=lambda d=delta:self.change_roster_page(d)).pack(side='left',padx=4)
+        self.leader_panel=WorldCardList(tab,self,lambda actor:self.inspect_world_actor(actor))
+        self.council_chart=CouncilChart(tab,self);self.council_chart.pack(fill='both',expand=True)
         tab=self.world_views.tab('Relationships')
         self.relationship_page=0
         bar=self.ctk.CTkFrame(tab);bar.pack(fill='x')
         for text,delta in (('Previous',-1),('Next',1)):
             self.ctk.CTkButton(bar,text=text,width=90,command=lambda d=delta:self.change_relationship_page(d)).pack(side='left',padx=4,pady=6)
-        self.relationship_panel=self.ctk.CTkScrollableFrame(tab);self.relationship_panel.pack(fill='both',expand=True)
+        self.relationship_count=self.ctk.CTkLabel(tab,text='');self.relationship_count.pack()
+        self.relationship_panel=WorldCardList(tab,self);self.relationship_panel.pack(fill='both',expand=True)
 
     def defer_world_refresh(self, view):
         if self.working:
@@ -1680,7 +2032,9 @@ class App:
         if self.working or getattr(self,'_closing',False):return
         view=getattr(self,'_pending_world_refresh',None)
         self._pending_world_refresh=None
-        if view and self.tabs.get()=='World' and self.world_views.get()==view:
+        if view=='World History' and self.tabs.get()=='World History':
+            self.refresh_chronicle()
+        elif view and self.tabs.get()=='World' and self.world_views.get()==view:
             # Re-read current selection, filters and page on the UI thread.
             self.social_tab_changed()
 
@@ -1704,8 +2058,9 @@ class App:
         self._region_sects=names
         if names:
             old=self.sect_selector.get()
-            self.sect_selector.configure(values=sorted(names))
-            self.sect_selector.set(old if old in names else sorted(names)[0])
+            choices=sorted(names)
+            if self.sect_selector.cget('values')!=choices:self.sect_selector.configure(values=choices)
+            if old not in names:self.sect_selector.set(choices[0])
         self.draw_region()
         if self.world_views.get()=='Leadership':self.refresh_leadership()
 
@@ -1713,7 +2068,12 @@ class App:
         import json
         view=getattr(self,'_map_view',None)
         if not view:return
-        canvas=self.map_canvas;canvas.delete('all')
+        canvas=self.map_canvas
+        key=(canvas.winfo_width(),canvas.winfo_height(),view['locations'],view['routes'],view['location'],
+             view['journey'],view['day'] if view['journey'] else None,self.route_policy.get(),self.map_destination)
+        if key==getattr(self,'_drawn_region',None):return
+        self._drawn_region=key
+        canvas.delete('all')
         sx=max(1,canvas.winfo_width())/1050;sy=max(1,canvas.winfo_height())/760
         places={r['id']:r for r in view['locations']}
         def point(sid):
@@ -1785,20 +2145,31 @@ class App:
         if not sect:return
         page=self.roster_page
         def done(data):
-            if page==self.roster_page and sect==getattr(self,'_region_sects',{}).get(self.sect_selector.get()):self.show_leadership(data)
+            if self.tabs.get()=='World' and self.world_views.get()=='Leadership' and page==self.roster_page and sect==getattr(self,'_region_sects',{}).get(self.sect_selector.get()):self.show_leadership(data)
         self.run_async('Reading sect leadership…',lambda:storage.sect_roster(sect,page),done)
 
+    def switch_leadership(self,mode):
+        self.leader_panel.pack_forget();self.council_chart.pack_forget();self.roster_controls.pack_forget()
+        if mode=='Member roster':
+            self.roster_controls.pack(side='right')
+            self.leader_panel.pack(fill='both',expand=True)
+        else:self.council_chart.pack(fill='both',expand=True)
+        self.refresh_leadership()
+
     def show_leadership(self,data):
-        body=self.fresh(self.leader_panel)
-        self.section(body,f'{self.sect_selector.get()} · {data["total"]} members')
-        self.paragraph(body,'Offices are separate from reputation ranks. Use the Sect tab for applications, mentorship and political intervention.')
+        sect=self.sect_selector.get()
+        if self.leader_mode.get()=='Council hierarchy':
+            self.council_chart.show(sect,data)
+            return
+        entries=[(f'{sect} · {data["total"]} members','Offices are separate from reputation ranks. Use the Sect tab for applications, mentorship and political intervention.',())]
         for row in data['leaders']:
-            self.ctk.CTkButton(body,text=row['office']+' · '+row['name']+(' · Deceased (office vacant)' if row['dead'] else ''),command=lambda sid=row['actor']:self.inspect_world_actor(sid)).pack(fill='x',padx=12,pady=3)
-        self.section(body,f'Membership · Page {self.roster_page+1}')
+            entries.append((row['name'],row['office']+(' · Deceased (office vacant)' if row['dead'] else ''),(('View / Talk',row['actor']),)))
+        entries.append((f'Membership · Page {self.roster_page+1}','',()))
         for row in data['members']:
-            text=row['name']+' · '+row['office']+(' · Deceased' if row['dead'] else '')
-            if row['mentor_name']:text+=' · Direct disciple of '+row['mentor_name']
-            self.ctk.CTkButton(body,text=text,command=lambda sid=row['actor']:self.inspect_world_actor(sid)).pack(fill='x',padx=12,pady=2)
+            detail=row['office']+(' · Deceased' if row['dead'] else '')
+            if row['mentor_name']:detail+=' · Direct disciple of '+row['mentor_name']
+            entries.append((row['name'],detail,(('View / Talk',row['actor']),)))
+        self.leader_panel.show(entries,(sect,self.roster_page))
 
     def change_relationship_page(self,delta):
         self.relationship_page=max(0,self.relationship_page+delta);self.refresh_relationships()
@@ -1808,18 +2179,19 @@ class App:
         sid=self.controller.selected()
         page=self.relationship_page
         def done(data):
-            if sid==self.controller.selected() and page==self.relationship_page:self.show_relationships(data)
+            if self.tabs.get()=='World' and self.world_views.get()=='Relationships' and sid==self.controller.selected() and page==self.relationship_page:self.show_relationships(data)
         self.run_async('Reading relationships…',lambda:storage.relationship_list(sid,page),done)
 
     def show_relationships(self,result):
-        rows,total=result;body=self.fresh(self.relationship_panel)
-        self.section(body,f'{total} acquaintances · Page {self.relationship_page+1}')
-        self.paragraph(body,'Trust grows through greetings once per world day. Respect, fear and hostility reflect known events. Locations are last known, not live tracking.')
+        rows,total=result
+        header=f'{total} spoken contacts · Page {self.relationship_page+1}'
+        if self.relationship_count.cget('text')!=header:self.relationship_count.configure(text=header)
+        entries=[]
         for row in rows:
-            self.ctk.CTkButton(body,text=row['name'],command=lambda sid=row['npc']:self.inspect_world_actor(sid)).pack(fill='x',padx=12,pady=(10,2))
-            self.paragraph(body,f'Trust {row["trust"]} · Respect {row["respect"]} · Fear {row["fear"]} · Hostility {row["hostility"]} · Last known: {row["known_location"] or "Unknown"}')
-            if row.get('memory'):self.paragraph(body,'Known deed: '+row['memory'])
-        if not rows:self.paragraph(body,'Speak to a cultivator in People here to begin a relationship.')
+            details=f'Trust {row["trust"]} · Respect {row["respect"]} · Fear {row["fear"]} · Hostility {row["hostility"]} · Last known: {row["known_location"] or "Unknown"}'
+            if row.get('memory'):details+='\nKnown deed: '+row['memory']
+            entries.append((row['name'],details,(('View / Talk',row['npc']),)))
+        self.relationship_panel.show(entries or [('No acquaintances on this page','Speak to a cultivator in People here to begin a relationship.',())],(self.controller.selected(),self.relationship_page))
 
     def refresh_people(self,reset=False):
         self._people_request_revision=getattr(self,'_people_request_revision',0)+1
@@ -1841,12 +2213,7 @@ class App:
         return (self.controller.selected(),self.nearby_search.get(),self.nearby_page)
 
     def people_pointer_press(self,event):
-        # A row must not disappear or move between pressing and releasing its button.
-        widget=event.widget
-        while widget is not None:
-            if widget in (self.people_panel,self.people_panel._parent_frame):
-                self._people_pointer_down=True;return
-            widget=getattr(widget,'master',None)
+        self._people_pointer_down=True
 
     def people_pointer_release(self,event):
         self._people_pointer_down=False
@@ -1854,75 +2221,47 @@ class App:
         self._pending_people=None
         if pending:
             context,data=pending
-            def apply():
-                if (not self.working and self.tabs.get()=='World' and
-                    self.world_views.get()=='People here' and context==self.people_context()):
-                    self.show_people(data)
-            self.root.after_idle(apply)
+            if self.tabs.get()=='World' and self.world_views.get()=='People here' and context==self.people_context():
+                self.show_people(data)
 
     def show_people(self,data):
-        # Only called by main-thread event handlers. Workers return plain snapshots.
         context=self.people_context()
         if self._people_pointer_down:
-            self._pending_people=(context,data);return
+            self._pending_people=(context,data)
+            return
         self._pending_people=None
+        panel=self.people_panel
         header=f'{data["where"]} · {data["total"]} available cultivators · Page {self.nearby_page+1}'
         if self.nearby_header.cget('text')!=header:self.nearby_header.configure(text=header)
-        message=''
-        if data['state']=='deceased':message='Seek rebirth through Adventure before meeting people again.'
-        elif data['state']!='present':message='You can browse profiles, history and relationships while travelling. Conversations and physical activities become available after arrival.'
-        elif not data['people']:message='No living NPCs are available here on this page. Try another location or clear the filter.'
-        if self.people_message.cget('text')!=message:
-            self.people_message.configure(text=message)
-            if message:self.people_message.grid(row=0,column=0,sticky='ew',padx=12,pady=12)
-            else:self.people_message.grid_remove()
+        entries=[]
+        for person in data['people']:
+            detail=person['sect'] or 'Wanderer'
+            if person.get('role') not in (None,'Member','Unaffiliated'):detail+=' · '+person['role']
+            entries.append((person['name'],detail+' · '+person['activity'],(('View / Talk',person['id']),)))
+        if not entries:
+            message='No living NPCs are available here on this page. Try another location or clear the filter.'
+            if data['state']=='deceased':message='Seek rebirth through Adventure before meeting people again.'
+            elif data['state']!='present':message='You can browse profiles, history and relationships while travelling. Conversations and physical activities become available after arrival.'
+            entries.append(('People here',message,()))
+        # Live arrivals/departures should not move the name being read.
         order=[p['id'] for p in data['people']]
-        structural=order!=self._people_order
-        layout_changed=structural or any(p['id'] in self._people_rows and self._people_rows[p['id']]['text']!=p['name']+' · '+(p['sect'] or 'Wanderer')+' · '+p['activity'] for p in data['people'])
-        canvas=self.people_panel._parent_canvas
+        previous=getattr(self,'_people_order',[])
         anchor=None
-        if layout_changed and getattr(self,'_people_context',None)==context:
-            top=canvas.canvasy(0)
-            for sid in self._people_order:
-                card=self._people_rows[sid]['card']
-                if sid in order and card.winfo_y()+card.winfo_height()>top:
-                    anchor=(sid,card.winfo_y()-top);break
-        for sid in set(self._people_rows)-set(order):
-            self._people_rows.pop(sid)['card'].destroy()
-        for index,person in enumerate(data['people']):
-            sid=person['id']
-            text=person['name']+' · '+(person['sect'] or 'Wanderer')+' · '+person['activity']
-            row=self._people_rows.get(sid)
-            if row is None:
-                card=self.ctk.CTkFrame(self.people_panel)
-                button=self.ctk.CTkButton(card,text='View / Talk',width=110,command=lambda actor=sid:self.inspect_world_actor(actor))
-                button.pack(side='right',padx=8,pady=8)
-                label=self.ctk.CTkLabel(card,text=text,wraplength=650,anchor='w')
-                label.pack(fill='x',padx=10,pady=8)
-                row=dict(card=card,label=label,button=button,text=text,index=None)
-                self._people_rows[sid]=row
-            elif row['text']!=text:
-                row['label'].configure(text=text);row['text']=text
-            if row['index']!=index:
-                row['card'].grid(row=index+1,column=0,sticky='ew',padx=8,pady=4)
-                row['index']=index
+        active_actor=panel.actions.get(panel.active)
+        if context==panel.context and order!=previous:
+            top=panel.canvas.canvasy(0)
+            present=set(order)
+            for actor,row in zip(previous,panel.rows):
+                if actor in present and row['y']+row['height']>top:
+                    anchor=actor,row['y']-top
+                    break
+        panel.show(entries,context)
+        if anchor:
+            actor,offset=anchor
+            panel.canvas.yview_moveto((panel.rows[order.index(actor)]['y']-offset)/max(1,panel.extent))
+        if active_actor and order!=previous and panel.canvas.focus_get()==panel.canvas:
+            panel.focus_action(next((i for i in panel.order if panel.actions[i]==active_actor),None))
         self._people_order=order
-        self._people_context=context
-        if layout_changed:
-            self._people_layout_revision+=1
-            revision=self._people_layout_revision
-            if anchor:
-                sid,offset=anchor
-                def restore_anchor():
-                    if (revision!=self._people_layout_revision or context!=self.people_context() or
-                        self._people_pointer_down or not self.widget_alive(canvas)):return
-                    # Flush geometry-only idle work; never run a nested input event loop.
-                    canvas.update_idletasks()
-                    if revision!=self._people_layout_revision or not self.widget_alive(canvas):return
-                    row=self._people_rows.get(sid);bounds=canvas.bbox('all')
-                    if row and bounds and bounds[3]>bounds[1]:
-                        canvas.yview_moveto((row['card'].winfo_y()-offset-bounds[1])/(bounds[3]-bounds[1]))
-                self.root.after_idle(restore_anchor)
 
     def prepare_nearby_duel(self,player,npc):
         for entry,sid in zip(self.duel_entries,(player,npc)):
@@ -1958,7 +2297,7 @@ class App:
         if self.defer_world_refresh('Population'):return
         query,page = self.world_search.get().strip(),self.world_page
         def done(data):
-            if query==self.world_search.get().strip() and page==self.world_page:self.show_world(data)
+            if self.tabs.get()=='World' and self.world_views.get()=='Population' and query==self.world_search.get().strip() and page==self.world_page:self.show_world(data)
         self.run_async('Reading the world…',lambda:self.controller._run('world browser',lambda:storage.world_population(query,page)),done)
 
     def change_world_page(self,delta):
@@ -1966,14 +2305,16 @@ class App:
 
     def show_world(self,result):
         rows,total=result
-        self.world_count.configure(text=f'{total:,} cultivators · Page {self.world_page+1} of {max(1,(total+49)//50)} · 50 per page')
-        body=self.fresh(self.world_panel)
+        header=f'{total:,} cultivators · Page {self.world_page+1} of {max(1,(total+49)//50)} · 50 per page'
+        if self.world_count.cget('text')!=header:self.world_count.configure(text=header)
+        entries=[]
         for actor in rows:
-            card=self.ctk.CTkFrame(body,fg_color=PANEL_2);card.pack(fill='x',padx=8,pady=4)
-            self.ctk.CTkButton(card,text='View / Talk',width=110,command=lambda sid=actor['id']:self.inspect_world_actor(sid)).pack(side='right',padx=10,pady=8)
-            self.ctk.CTkLabel(card,text=actor['name']+' · '+actor['realm'],anchor='w',font=self.body_font).pack(fill='x',padx=12,pady=(6,0))
-            self.ctk.CTkLabel(card,text=actor['sect']+' · '+actor['activity']+' · '+actor['location'],anchor='w',font=self.small_font,text_color=MUTED,wraplength=600).pack(fill='x',padx=12,pady=(0,6))
-        if not rows:self.paragraph(body,'No cultivators on this page. Try a different search or the previous page.')
+            title=f"{actor['name']} · {actor['realm']} · Power {actor['power']:,}"
+            details=f"{actor['sect']} · {actor['role']}"
+            if actor['rank']:details+=' · Standing: '+actor['rank']
+            details+=f"\n{actor['activity']} · {actor['location']}"
+            entries.append((title,details,(('View / Talk',actor['id']),)))
+        self.world_panel.show(entries or [('No cultivators on this page','Try a different search or the previous page.',())],(self.world_search.get().strip(),self.world_page))
 
     def inspect_world_actor(self,sid):
         def work():
@@ -1994,7 +2335,7 @@ class App:
     def show_world_actor(self,result):
         sid,c,info=result
         dlg=self.ctk.CTkToplevel(self.root);dlg.title(c['name']);dlg.geometry('820x760');dlg.transient(self.root)
-        body=self.ctk.CTkScrollableFrame(dlg,fg_color=PANEL);body.pack(fill='both',expand=True,padx=12,pady=12)
+        body=dialog_scroll(self.ctk,dlg,fg_color=PANEL);body.pack(fill='both',expand=True,padx=12,pady=12)
         self.section(body,c['name']+' · '+c['realm'])
         self.paragraph(body,'Profile ID: '+sid)
         self.table(body,cultivator_view(c,info)['rows'],content_width=700)
@@ -2031,24 +2372,30 @@ class App:
     def refresh_chronicle(self,reset=False):
         if reset:self.chronicle_page=0
         query,kind,page=self.chronicle_search.get().strip(),self.chronicle_kind.get(),self.chronicle_page
-        self.run_async('Reading World History…',lambda:self.controller._run('world history',lambda:storage.world_history(query,kind,page)),self.show_chronicle)
+        if self.working:
+            self._pending_world_refresh='World History'
+            return
+        def done(data):
+            if self.tabs.get()=='World History' and (query,kind,page)==(self.chronicle_search.get().strip(),self.chronicle_kind.get(),self.chronicle_page):
+                self.show_chronicle(data)
+        self.run_async('Reading World History…',lambda:self.controller._run('world history',lambda:storage.world_history(query,kind,page)),done)
 
     def change_chronicle_page(self,delta):
         self.chronicle_page=max(0,self.chronicle_page+delta);self.refresh_chronicle()
 
     def show_chronicle(self,result):
         rows,total=result
-        self.chronicle_count.configure(text=f'{total:,} major public events · Page {self.chronicle_page+1} of {max(1,(total+29)//30)}')
-        body=self.fresh(self.chronicle_panel)
+        header=f'{total:,} major public events · Page {self.chronicle_page+1} of {max(1,(total+29)//30)}'
+        if self.chronicle_count.cget('text')!=header:self.chronicle_count.configure(text=header)
+        entries=[]
         for event in rows:
-            card=self.ctk.CTkFrame(body,fg_color=PANEL_2);card.pack(fill='x',padx=8,pady=6)
-            self.section(card,('Rumor: ' if event['visibility']=='rumor' else '')+event['title'])
-            self.paragraph(card,event['when']+' · '+event['location'],muted=True)
-            self.paragraph(card,event['summary'])
-            for sid in event['actors']:
-                self.ctk.CTkButton(card,text='View involved cultivator',command=lambda value=sid:self.inspect_world_actor(value)).pack(padx=12,pady=4,anchor='w')
-        if not rows:self.paragraph(body,'No major public events match this search. Hidden events do not appear here.')
-
+            title=('Rumor: ' if event['visibility']=='rumor' else '')+event['title']
+            where=event['location']
+            if event['sect_names']:where+=' · '+', '.join(event['sect_names'])
+            details=f"{event['when']} · {where}\n{event['summary']}"
+            links=tuple(('View '+name,sid) for name,sid in zip(event['actor_names'],event['actors']))
+            entries.append((title,details,links))
+        self.chronicle_panel.show(entries or [('No major public events match this search','Hidden discoveries remain secret.',())],(self.chronicle_search.get().strip(),self.chronicle_kind.get(),self.chronicle_page))
 
     # -- background work -------------------------------------------------------------------
     def run_async(self, label, fn, on_done, on_error=None):
@@ -2083,8 +2430,10 @@ class App:
                 elif event[0] == "cached_profiles":
                     self._cache_scan_running = False
                     if event[2] is None:
-                        self.cached_profile_ids = dict(event[1])
-                        self.filter_cached_profiles()
+                        choices=dict(event[1])
+                        if choices!=self.cached_profile_ids or not choices:
+                            self.cached_profile_ids=choices
+                            self.filter_cached_profiles()
                     else:
                         self.cached_count.configure(text="Cache scan failed")
                     if getattr(self, "_cache_scan_again", False):
@@ -2120,6 +2469,9 @@ class App:
             if callback:
                 callback(payload)
 
+        deferred=getattr(self,'_deferred_tab',None)
+        if deferred and self.tabs.get()==deferred:
+            self.root.after_idle(self.on_tab)
         if getattr(self,'_pending_world_refresh',None):
             self.root.after_idle(self.retry_world_refresh)
 
@@ -2190,7 +2542,18 @@ class App:
         ctk.CTkButton(tools, text="Next", width=65, command=lambda: self.page_cached_profiles(1)).pack(side="left", padx=6)
         self.cached_page = 0
         self.refresh_cached_profiles()
-        self.card = ctk.CTkScrollableFrame(tab, fg_color=PANEL, corner_radius=10)
+        self.profile_head=ctk.CTkFrame(tab,fg_color=PANEL_2)
+        self.profile_title=ctk.CTkLabel(self.profile_head,text='',font=self.head_font,text_color=ACCENT)
+        self.profile_title.pack(anchor='w',padx=10)
+        self.adv_button=ctk.CTkButton(self.profile_head,text='Adventure',command=self.do_adventure)
+        self.adv_button.pack(side='right',padx=6)
+        self.profile_bars=[]
+        for color in (ACCENT,GOOD):
+            line=ctk.CTkFrame(self.profile_head,fg_color='transparent');line.pack(fill='x',padx=10,pady=1)
+            bar=ctk.CTkProgressBar(line,width=110,progress_color=color);bar.pack(side='left',padx=(0,8))
+            label=ctk.CTkLabel(line,text='',height=19,font=self.small_font);label.pack(side='left')
+            self.profile_bars.append((bar,label))
+        self.card=WorldCardList(tab,self)
         self.card.pack(fill="both", expand=True)
         self.say(self.card, "Enter a local cultivator's name or ID, or look up a Steam profile.")
 
@@ -2204,7 +2567,7 @@ class App:
             self.cached_profiles_menu.configure(state="disabled")
             self.cached_profiles_menu.set("Scanning cached profiles…")
         self._cache_scan_running = True
-        self.cached_count.configure(text="Scanning…")
+        if not self.cached_profile_ids:self.cached_count.configure(text="Scanning…")
         def scan():
             try:
                 self.events.put(("cached_profiles", storage.cached_profile_choices(), None))
@@ -2259,11 +2622,15 @@ class App:
         return body
 
     def say(self, scroll, message, color=MUTED, pad=40):
+        if isinstance(scroll,WorldCardList):
+            scroll.show([(message,"",())],None)
+            return
         body = self.fresh(scroll)
         self.ctk.CTkLabel(body, text=message, text_color=color, font=self.body_font,
                           wraplength=WIDE, justify="left").pack(pady=pad, padx=20)
 
     def show_card_error(self, message):
+        self.profile_head.pack_forget()
         self.say(self.card, message, BAD, 30)
 
     def show_cultivator(self, data):
@@ -2272,52 +2639,36 @@ class App:
         if data.get("c",{}).get("sect_choice_needed") and getattr(self,"_sect_prompted",None)!=data["steamid"]:
             self._sect_prompted=data["steamid"]
             self.root.after_idle(lambda:self.open_sect_picker(repair=True))
-        body = self.fresh(self.card)
-        head = ctk.CTkFrame(body, fg_color=PANEL_2, corner_radius=10)
-        head.pack(fill="x", padx=6, pady=(6, 10))
-        ctk.CTkLabel(head, text=v["name"], font=self.title_font, text_color=ACCENT,
-                     anchor="w").pack(fill="x", padx=16, pady=(12, 0))
-        ctk.CTkLabel(head, text=v["subtitle"], font=self.body_font, text_color=MUTED,
-                     anchor="w").pack(fill="x", padx=16)
-        chips = ctk.CTkFrame(head, fg_color="transparent")
-        chips.pack(fill="x", padx=12, pady=(8, 12))
-        self.chip(chips, v["path"], v["path_color"])
-        self.chip(chips, v["realm"], v["realm_color"])
-        self.chip(chips, "Fallen" if v["dead"] else "Alive", BAD if v["dead"] else GOOD)
-        # the Adventure button: top right of this box, under the Look up button
-        self.adv_button = ctk.CTkButton(head, text="Seek rebirth" if v["dead"] else "Adventure",
-                                        command=self.do_adventure, width=110, height=36,
-                                        fg_color="#a98bff" if v["dead"] else "#3f9f7a",
-                                        hover_color="#7d62cc" if v["dead"] else "#2f7a5d",
-                                        text_color="#101010")
-        self.adv_button.place(relx=1.0, x=-16, y=12, anchor="ne")
-        if v["breakthrough_ready"]:
-            self.chip(chips, "Ready to break through", "#a98bff")
-        self.selected = True
-        self.bt_button.configure(state="normal")
+        if not self.profile_head.winfo_manager():self.profile_head.pack(before=self.card,fill='x',pady=2)
+        title=v['name']+' · '+v['realm']+' · '+('Fallen' if v['dead'] else 'Alive')
+        if self.profile_title.cget('text')!=title:self.profile_title.configure(text=title)
+        button_text='Seek rebirth' if v['dead'] else 'Adventure'
+        if self.adv_button.cget('text')!=button_text:self.adv_button.configure(text=button_text)
+        stats=[(v['power_fraction'],'Power · '+v['power_caption'],v['realm_color']),
+               (v['rep_fraction'],v['rep_rank']+' · '+v['rep_caption'],ACCENT)]
+        for (bar,label),(fraction,caption,color) in zip(self.profile_bars,stats):
+            if bar.get()!=fraction:bar.set(fraction)
+            if bar.cget('progress_color')!=color:bar.configure(progress_color=color)
+            if label.cget('text')!=caption:label.configure(text=caption)
+        self.selected=True
+        self.bt_button.configure(state='normal')
+        entries=[(v['subtitle'],v['path']+(' · Ready to break through' if v['breakthrough_ready'] else ''),())]
+        for key,value in v['rows']:
+            icon=value if key=='Affinity' else 'Death risk' if key=='Death risk' else None
+            entries.append((key,value,(),icon))
+        if not data['info'].get('offline'):
+            entries.append(('Source stats from Steam',
+                            '\n'.join(key+': '+str(value) for key,value in v['source']),()))
+        entries.append(('Backstory',v['backstory'],()))
+        if data['friend'] and data['story']:
+            entries.append((f"A tale from their life (Steam friend: {data['friend']['name']})",data['story'],()))
+        elif data['note']:entries.append(('Note',data['note'],()))
+        if data['death']:
+            label,text=data['death']
+            cause='Cause: ' if data['c']['death']['killer']=='lifespan' else 'Slain by: '
+            entries.append(('The end of the road',cause+label+'\n'+text,()))
+        self.card.show(entries,data['steamid'])
 
-        bars = ctk.CTkFrame(body, fg_color="transparent")
-        bars.pack(fill="x", padx=6)
-        self.bar(bars, "Power", v["power_fraction"], v["power_caption"], v["realm_color"])
-        self.bar(bars, v["rep_rank"], v["rep_fraction"], v["rep_caption"], ACCENT)
-
-        self.section(body, "Cultivator")
-        self.table(body, v["rows"])
-        self.section(body, "Locally generated stats" if data["info"].get("offline") else "Source stats from Steam")
-        self.table(body, v["source"])
-        self.section(body, "Backstory")
-        self.paragraph(body, v["backstory"])
-        if data["friend"] and data["story"]:
-            self.section(body, f"A tale from their life (Steam friend: {data['friend']['name']})")
-            self.paragraph(body, data["story"])
-        elif data["note"]:
-            self.paragraph(body, f"({data['note']})", muted=True)
-        if data["death"]:
-            label, text = data["death"]
-            self.section(body, "The end of the road", color=BAD)
-            self.paragraph(body, ("Cause: " if data["c"]["death"]["killer"] == "lifespan"
-                                  else "Slain by: ") + label)
-            self.paragraph(body, text)
         self.status.configure(text=f"Loaded {v['name']}.", text_color=GOOD)
         self.refresh_team_recent()
 
@@ -2582,35 +2933,21 @@ class App:
         self.hist_head = ctk.CTkLabel(tab, text="History", font=self.head_font, anchor="w",
                                       text_color=ACCENT)
         self.hist_head.pack(fill="x", padx=6, pady=(4, 6))
-        self.hist_list = ctk.CTkScrollableFrame(tab, fg_color=PANEL, corner_radius=10)
+        self.hist_list = WorldCardList(tab,self)
         self.hist_list.pack(fill="both", expand=True)
         self.say(self.hist_list, "Look up a cultivator to see what they did recently.")
 
     def refresh_history(self):
         if self.working or self.controller is None:
             return
-        self.run_async("Reading the history...", self.controller.history, self.show_history,
+        self.run_async("Reading the history...", self.controller.history, lambda data:self.show_history(data) if self.tabs.get()=="History" else None,
                        lambda m: self.say(self.hist_list, m, BAD, 30))
 
     def show_history(self, data):
-        ctk = self.ctk
-        self.hist_head.configure(text=f"Recent history of {data['name']}")
-        if not data["entries"]:
-            self.say(self.hist_list, "Nothing yet: no duels, purchases or breakthroughs.")
-            return
-        body = self.fresh(self.hist_list)
-        for e in data["entries"]:
-            label, color = HISTORY_KINDS.get(e["kind"], (e["kind"], MUTED))
-            row = ctk.CTkFrame(body, fg_color=PANEL_2, corner_radius=8)
-            row.pack(fill="x", padx=6, pady=3)
-            ctk.CTkLabel(row, text=f"  {label}  ", fg_color=color, text_color="#101010",
-                         corner_radius=10, font=self.small_font, width=110).pack(side="left", padx=10, pady=8)
-            text = ctk.CTkFrame(row, fg_color="transparent")
-            text.pack(side="left", fill="x", expand=True)
-            ctk.CTkLabel(text, text=e["text"], font=self.body_font, anchor="w", justify="left",
-                         wraplength=WIDE - 190).pack(fill="x")
-            ctk.CTkLabel(text, text=e["when"], font=self.small_font, text_color=MUTED,
-                         anchor="w").pack(fill="x")
+        title=f"Recent history of {data['name']}"
+        if self.hist_head.cget('text')!=title:self.hist_head.configure(text=title)
+        entries=[(HISTORY_KINDS.get(e['kind'],(e['kind'],MUTED))[0]+' · '+e['when'],e['text'],()) for e in data['entries']]
+        self.hist_list.show(entries or [('Nothing yet','No duels, purchases or breakthroughs.',())],self.controller.selected())
 
     # -- tab: pavilion ---------------------------------------------------------------------
     def build_pavilion_tab(self, tab):
@@ -2621,7 +2958,7 @@ class App:
         self.pav_msg = ctk.CTkLabel(tab, text="", font=self.body_font, anchor="w",
                                     justify="left", wraplength=WIDE + 100)
         self.pav_msg.pack(fill="x", padx=6, pady=(2, 6))
-        self.pav_list = ctk.CTkScrollableFrame(tab, fg_color=PANEL, corner_radius=10)
+        self.pav_list = WorldCardList(tab,self,self.pavilion_action)
         self.pav_list.pack(fill="both", expand=True)
         self.buy_buttons = []
 
@@ -2629,10 +2966,10 @@ class App:
         if self.working or self.controller is None:
             return
         self.run_async("Opening the Martial Pavilion...", self.controller.shop,
-                       self.show_shop, self.show_shop_error)
+                       lambda data:self.show_shop(data) if self.tabs.get()=="Pavilion" else None, self.show_shop_error)
 
     def show_shop_error(self, message):
-        self.fresh(self.pav_list)
+        self.pav_list.show([],None)
         self.buy_buttons = []
         self.pav_head.configure(text="Sect Martial Pavilion")
         self.pav_msg.configure(text=message, text_color=BAD)
@@ -2640,7 +2977,7 @@ class App:
     def show_shop(self, data, receipt=None):
         sold = data.get("sold")
         ctk, c = self.ctk, data["c"]
-        body = self.fresh(self.pav_list)
+        sid=data["steamid"]
         self.buy_buttons = []
         self.pav_head.configure(text=f"Sect Martial Pavilion - {c['name']} of the {c['sect']}"
                                      f"     Sect points: {c['sect_points']:,}")
@@ -2656,50 +2993,29 @@ class App:
         else:
             self.pav_msg.configure(text="Choose something to buy. Weapons can be bought once; "
                                         "pills, treasures and talismans stack.", text_color=MUTED)
-        kind = None
-        for r in data["rows"]:
-            if r["kind"] != kind:
-                kind = r["kind"]
-                self.section(body, kind + "s")
-            row = ctk.CTkFrame(body, fg_color=PANEL_2, corner_radius=8)
-            row.pack(fill="x", padx=6, pady=3)
-            text = ctk.CTkFrame(row, fg_color="transparent")
-            text.pack(side="left", fill="x", expand=True, padx=10, pady=6)
-            ctk.CTkLabel(text, text=f"{r['name']}   -   {r['price']:,} sect points",
-                         font=self.head_font, anchor="w").pack(fill="x")
-            ctk.CTkLabel(text, text=r["blurb"], font=self.small_font, text_color=MUTED,
-                         anchor="w", justify="left", wraplength=WIDE - 160).pack(fill="x")
-            ctk.CTkLabel(text, text=r["status"], font=self.small_font, anchor="w",
-                         text_color=GOOD if r["can_buy"] else MUTED).pack(fill="x")
-            b = ctk.CTkButton(row, text="Buy" if r["can_buy"] else "Unavailable", width=110,
-                              fg_color=ACCENT, hover_color="#a8862f", text_color="#1a1a1a",
-                              state="normal" if r["can_buy"] else "disabled",
-                              command=lambda n=r["number"]: self.do_buy(n))
-            b.intended_state = "normal" if r["can_buy"] else "disabled"
-            b.pack(side="right", padx=10)
-            self.buy_buttons.append(b)
-        self.section(body, "Sell treasures (the pavilion pays half the value)")
-        if not data.get("sells"):
-            self.paragraph(body, "No treasures to sell.", muted=True)
-        for r in data.get("sells", []):
-            row = ctk.CTkFrame(body, fg_color=PANEL_2, corner_radius=8)
-            row.pack(fill="x", padx=6, pady=3)
-            ctk.CTkLabel(row, text=f"{r['name']}   -   pays {r['price']:,}  (worth {r['value']:,})",
-                         font=self.body_font, anchor="w", justify="left", wraplength=WIDE - 160
-                         ).pack(side="left", fill="x", expand=True, padx=10, pady=8)
-            b = ctk.CTkButton(row, text="Sell", width=110, fg_color="#c667d8",
-                              hover_color="#9d4fad", text_color="#101010",
-                              command=lambda n=r["number"]: self.do_sell(n))
-            b.intended_state = "normal"
-            b.pack(side="right", padx=10)
-            self.buy_buttons.append(b)
+        entries=[]
+        for r in data['rows']:
+            action=(sid,'buy',r['number'],r['name'],r['price'])
+            links=(('Buy',action),) if r['can_buy'] else ()
+            entries.append((f"{r['name']} · {r['price']:,} sect points",f"{r['kind']} · {r['blurb']}\n{r['status']}",links))
+        entries.append(('Sell treasures','The pavilion pays half the value.' if data.get('sells') else 'No treasures to sell.',()))
+        for r in data.get('sells',[]):
+            action=(sid,'sell',r['number'],r['name'],r['price'])
+            entries.append((r['name'],f"Pays {r['price']:,} sect points (worth {r['value']:,})",(('Sell',action),)))
+        self.pav_list.show(entries,sid)
 
-    def do_sell(self, number):
-        self.run_async("Selling...", lambda: self.controller.sell(number),
+    def pavilion_action(self,target):
+        sid,action,number,name,price=target
+        if not self.working and sid==self.controller.selected():
+            if action=='sell':self.do_sell(number,(sid,name,price))
+            else:self.do_buy(number,(sid,name,price))
+
+    def do_sell(self, number, expected=None):
+        self.run_async("Selling...", lambda: self.controller.sell(number,expected),
                        self.show_shop, self.show_buy_error)
 
-    def do_buy(self, number):
-        self.run_async("Buying...", lambda: self.controller.buy(number),
+    def do_buy(self, number, expected=None):
+        self.run_async("Buying...", lambda: self.controller.buy(number,expected),
                        lambda rec: self.show_shop(rec, rec), self.show_buy_error)
 
     def show_buy_error(self, message):
@@ -2736,7 +3052,7 @@ class App:
         self.fight_button = ctk.CTkButton(top, text="Fight!", command=self.do_duel, height=36,
                                           fg_color=BAD, hover_color="#b84848", width=110)
         self.fight_button.pack(side="left")
-        self.duel_area = ctk.CTkScrollableFrame(tab, fg_color=PANEL, corner_radius=10)
+        self.duel_area = WorldCardList(tab,self,self.copy_duel_report)
         self.duel_area.pack(fill="both", expand=True)
         self.say(self.duel_area, "Enter two profiles and let their cultivators duel, or press "
                                  "Team Battle for 2 vs 2 and 3 vs 3. Both fighters must be present at the same location. Sparring is harmless; competitive fights have a 5% injury chance; lethal duels risk death.")
@@ -2810,7 +3126,7 @@ class App:
         self.team_msg = ctk.CTkLabel(dlg, text="", font=self.body_font, text_color=MUTED,
                                      wraplength=900, justify="left")
         self.team_msg.pack(pady=(4, 2))
-        self.team_result = ctk.CTkScrollableFrame(dlg, fg_color=PANEL, corner_radius=10)
+        self.team_result = dialog_scroll(ctk,dlg, fg_color=PANEL, corner_radius=10)
         self.team_result.pack(fill="both", expand=True, padx=16, pady=(0, 14))
         self.set_team_size(2)
         self.refresh_team_recent()
@@ -2838,10 +3154,13 @@ class App:
         if self.team_dialog is None or not self.widget_alive(self.team_dialog) or self.controller is None:
             return
         ctk = self.ctk
+        recent=self.controller.recent_list()
+        signature=(self.team_recent_box,recent)
+        if signature==getattr(self,'_team_recent_signature',None):return
+        self._team_recent_signature=signature
         body = self.fresh(self.team_recent_box)
         ctk.CTkLabel(body, text="Recently looked up (the selected cultivator is not listed)",
                      font=self.head_font, text_color=ACCENT, anchor="w").pack(fill="x", padx=12, pady=(8, 2))
-        recent = self.controller.recent_list()
         if not recent:
             ctk.CTkLabel(body, text="Nobody yet: look up some profiles in the Cultivator tab.",
                          font=self.small_font, text_color=MUTED, anchor="w").pack(fill="x", padx=12, pady=(0, 8))
@@ -2936,40 +3255,22 @@ class App:
         self.say(self.duel_area, message, BAD, 30)
 
     def show_duel(self, d):
-        ctk, result = self.ctk, d["result"]
-        body = self.fresh(self.duel_area)
-        sides = ctk.CTkFrame(body, fg_color="transparent")
-        sides.pack(fill="x", padx=6, pady=(6, 10))
-        sides.grid_columnconfigure((0, 1), weight=1)
-        for col, side in enumerate(("a", "b")):
-            c, p = d[side], result["p_" + side]
-            won = d["winner_side"] == side
-            box = ctk.CTkFrame(sides, fg_color=PANEL_2, corner_radius=10,
-                               border_width=2 if won else 0, border_color=GOOD)
-            box.grid(row=0, column=col, sticky="nsew", padx=6)
-            ctk.CTkLabel(box, text=("WINNER  " if won else "") + c["name"], font=self.head_font,
-                         text_color=GOOD if won else TEXT).pack(padx=12, pady=(10, 0))
-            ctk.CTkLabel(box, text=f"of the {c['sect']}", font=self.small_font,
-                         text_color=MUTED).pack()
-            self.centered_chip(box, c["path"]["name"], PATH_COLORS.get(c["path"]["name"], "#999999"))
-            for line in (c["realm"], f"Power {c['score']:,.0f}", f"{c['talent']['name']}"):
-                ctk.CTkLabel(box, text=line, font=self.small_font).pack()
-            self.affinity_label(box, c["element"], text=f"Affinity: {c['element']}",
-                                font=self.small_font).pack()
-            pb = ctk.CTkProgressBar(box, progress_color=realm_color(c["realm_index"]), width=200)
-            pb.set(p)
-            pb.pack(pady=(8, 2))
-            ctk.CTkLabel(box, text=f"Win chance {p * 100:.1f}%", font=self.small_font,
-                         text_color=MUTED).pack(pady=(0, 10))
-        self.section(body, "The battle")
-        self.paragraph(body, d["story"])
-        self.section(body, "Report")
-        box = ctk.CTkTextbox(body, height=420, font=self.mono_font, wrap="none",
-                             fg_color=PANEL_2)
-        box.pack(fill="x", padx=8, pady=(0, 10))
-        box.insert("end", d["report"])
-        box.configure(state="disabled")
+        result=d['result']
+        entries=[]
+        for side in ('a','b'):
+            c=d[side]
+            title=('Winner · ' if d['winner_side']==side else '')+c['name']
+            details=f"{c['sect']} · {c['path']['name']} · {c['realm']}\nPower {c['score']:,.0f} · {c['talent']['name']} · Affinity: {c['element']}\nWin chance {result['p_'+side]:.1%}"
+            entries.append((title,details,()))
+        self._duel_report=d['report']
+        entries.extend([('The battle',d['story'],()),('Report',d['report'],(('Copy report','copy'),))])
+        self.duel_area.show(entries,(d['story'],d['report']))
+
         self.status.configure(text=f"{result['winner']['name']} wins the duel.", text_color=GOOD)
+
+    def copy_duel_report(self,_):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self._duel_report)
 
     # -- tab: log --------------------------------------------------------------------------
     def build_log_tab(self, tab):
@@ -2984,11 +3285,19 @@ class App:
         if self.controller is None:
             return
         text = self.controller.log_text()
+        if text==getattr(self,"_last_log",None):return
+        previous=getattr(self,'_last_log','')
+        y=self.log_box.yview()
         self.log_box.configure(state="normal")
-        self.log_box.delete("1.0", "end")
-        self.log_box.insert("end", text)
+        if previous and text.startswith(previous):
+            self.log_box.insert("end",text[len(previous):])
+        else:
+            self.log_box.delete("1.0","end")
+            self.log_box.insert("end",text)
+        self._last_log=text
         self.log_box.configure(state="disabled")
-        self.log_box.see("end")
+        if not previous or y[1]>=.999:self.log_box.see("end")
+        else:self.log_box.yview_moveto(y[0])
 
     def run(self):
         self.root.mainloop()

@@ -3,7 +3,7 @@ elements, treasures and pavilion goods, signature moves."""
 
 import time
 
-VERSION = "v0.6.1-DEV"    # shared GUI and terminal version
+VERSION = "v0.6.5-DEV"    # shared GUI and terminal version
 
 SECT_RANKS = [(0, "Random sect initiate"), (200, "Sect Junior outer disciple"),
               (400, "Sect Outer disciple"), (600, "Sect Inner disciple"),
