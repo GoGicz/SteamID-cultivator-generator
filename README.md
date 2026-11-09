@@ -29,23 +29,29 @@ The Living World is still being expanded. Future updates are planned to introduc
 
 **Example of a generated cultivator:**
 
-<img width="1036" height="805" alt="obrazek" src="https://github.com/user-attachments/assets/e6cc6d17-549e-4a39-9c3d-1c084bb82a83" />
+<img width="1039" height="811" alt="obrazek" src="https://github.com/user-attachments/assets/a5016164-ce95-463c-a2e6-40f917b544d2" />
 
 
-<img width="1844" height="782" alt="obrazek" src="https://github.com/user-attachments/assets/cecbbe6f-322b-4279-8b3e-10a64dd801c0" />
+
+<img width="1857" height="798" alt="obrazek" src="https://github.com/user-attachments/assets/427b50d9-6b8c-46ba-ac48-9eba90623bda" />
+
 
 
 **Example of a sect and it's politics:**
 
-<img width="1900" height="812" alt="obrazek" src="https://github.com/user-attachments/assets/4fef3228-5fdd-40f6-92b3-48ccb1b8c944" />
+<img width="1911" height="816" alt="obrazek" src="https://github.com/user-attachments/assets/d65b7309-41bc-4fb4-8516-2b5761ffcf55" />
+
 
 
 **Example of the map:**
 
-<img width="1040" height="810" alt="obrazek" src="https://github.com/user-attachments/assets/61f3f295-272e-427d-a6df-71e1dd8858ca" />
+<img width="1042" height="810" alt="obrazek" src="https://github.com/user-attachments/assets/1be559bc-2c2f-4b5e-92cf-9871a4e2661d" />
+
 
 **Example of current location cultivators:**
-<img width="1039" height="808" alt="obrazek" src="https://github.com/user-attachments/assets/ccd4e553-4f45-4137-8e55-ddc7bbc908d6" />
+
+<img width="1039" height="810" alt="obrazek" src="https://github.com/user-attachments/assets/43e7d4c2-1d89-43f9-82ba-1177d2a65a5a" />
+
 
 
 ## Setup
