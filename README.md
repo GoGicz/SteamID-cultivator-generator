@@ -6,7 +6,7 @@ Turn your Steam profile into a cultivator from a xianxia novel.
 
 Originally created as a fun SteamID generator, the project has grown into a persistent cultivation world where thousands of NPC cultivators live their own lives, develop relationships, and shape the world independently of the player.
 
-**Current version: v0.6.5 Alpha — The Living World Update**
+**Current Public version: v0.6.5 Alpha — The Living World Update**
 
 ## Features
 
