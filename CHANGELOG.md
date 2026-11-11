@@ -1,190 +1,208 @@
-# Steam Cultivator v0.6.5-DEV — Performance, UI & Living World Improvements
+# Steam Cultivator — Changelog
 
-This release focuses on making the Living World faster, more storage-efficient, and easier to explore. From major SQLite optimizations to a redesigned interface with illustrated sect hierarchies, v0.6.5 brings substantial improvements to the existing 2,500-cultivator simulation.
+All notable changes from **v0.6.6 through v0.9.14-DEV**.
 
-**This is still an early development release.** Inter-sect warfare, diplomacy, territory conquest, and major inheritance expeditions remain planned for Living World Part 4.
+## v0.9.14-DEV — Retention Maintenance Improvements
 
-## ✨ Highlights
+### Improved
+- Optimized background retention maintenance so completed cleanup jobs no longer waste processing slots.
+- Added indexed, bounded cleanup of secondhand NPC news reports.
+- Preserved recent news, in-progress rumor propagation, significant memories, and meaningful relationships.
+- Added detailed retention diagnostics to `Logs/performance.log`, including cleanup activity, news deliveries, processing time, and maintenance backlog age.
 
-- **Massively improved GUI performance:** Population, Relationships, World History, and other major views now avoid unnecessary widget rebuilding.
-- **New illustrated sect hierarchy:** Explore your sect's leadership, elders, and direct disciples through clickable character portraits.
-- **Reduced database growth:** New retention policies limit unnecessary historical storage while preserving important events and relationships.
-- **Improved political history:** Sect takeovers and successions now provide clearer historical context.
-- **Smarter relationship display:** Only cultivators you've actually spoken with appear in your Relationships tab.
-- **Better character information:** Power, sect standing, and actual political authority are now presented more clearly.
-- **Save compatibility:** Existing worlds can be carried forward without starting over.
+### Technical
+- Retention maintenance continues during simulation catch-up.
+- No changes to NPC autonomy, news distribution rules, SQLite durability, or WAL checkpoint policy.
+- Existing cleanup debt can still be processed with the offline database optimization tool.
 
-## 🚀 GUI Performance & Scrolling Overhaul
+## v0.9.13-DEV — Sect Politics Dashboard
 
-The interface has received extensive optimization to reduce stuttering, visible rebuilding, and scrolling artifacts.
+### Added
+- Redesigned **Sect Membership & Politics** into a cleaner, organized dashboard.
+- Dedicated panels for membership, sect treasury, council confidence, mentorship, political support, career advancement, and political warnings.
+- Responsive two-column layout that adapts to narrower windows.
+- Clearer promotion eligibility explanations and labeled political controls.
+- Persistent feedback and refresh controls.
 
-### Population, Relationships & World History
+### Improved
+- Preserved selected council members, requested positions, payment inputs, and scroll positions during refreshes.
+- Improved window lifecycle handling to prevent delayed callbacks from reopening closed dialogs.
+- Corrected the display of living disciple capacity and clarified mentorship eligibility.
+- Newly created offline players now begin with zero completed sect missions.
+- Preserved existing player progression and developer customization.
 
-These views now use retained, scrollable cards instead of repeatedly destroying and recreating hundreds of Tk widgets.
+## v0.9.12-DEV — NPC Memory & Rumor Optimization
 
-- Unchanged rows no longer require unnecessary updates.
-- Individual NPC changes update only the affected information.
-- Pagination updates existing cards instead of rebuilding the entire interface.
-- Scroll positions are preserved when returning to the same page.
-- Keyboard navigation is supported for profile links.
-- Rapid scrollbar dragging and mouse-wheel scrolling no longer trigger card reconstruction.
+### Improved
+- Introduced bounded retention for routine NPC activity and secondhand news.
+- NPCs retain 25 routine activity entries and a target of 170 secondhand Local reports.
+- Protected recent rumors, ongoing news propagation, direct memories, major achievements, and significant world events.
+- Fixed maintenance starvation by allowing cleanup to continue during simulation catch-up.
 
-### Population Rendering Benchmarks
+### World Simulation
+- Ordinary notable news now spreads regionally and through relevant sect headquarters.
+- Major events and exceptional victories can still become worldwide news.
+- News delivery uses bounded batches while preserving unfinished deliveries.
+- Prevented repeated relationship effects from duplicate news delivery.
+- Preserved NPC autonomy, meaningful relationships, travel, politics, warfare, and economic systems.
 
-Measured on a mature 2,500-NPC world:
+### Save Compatibility
+- Added backed-up, resumable retention cleanup for existing worlds.
+- Updated offline database optimization to apply the new retention limits without modifying the original save.
 
-| Operation | Previous renderer | New renderer |
-|---|---:|---:|
-| Refresh unchanged page | 1,855 ms | **0.15 ms** |
-| Update one NPC | 1,674 ms | **1.85 ms** |
-| Display 50 different NPCs | 1,860 ms | **31.62 ms** |
+## v0.9.11-DEV — Simulation Efficiency & Diagnostics
 
-These figures measure GUI rendering operations, not complete database-fetch times.
+### Improved
+- Reduced redundant NPC profile decoding and database reads.
+- Introduced transaction-scoped caches with proper invalidation after database changes.
+- Improved sect mission travel behavior so NPCs can retain valid mission intentions until arrival.
+- Preserved existing military scheduling and NPC decision frequencies.
 
-### Improvements Across Other Tabs
+### Diagnostics
+- Expanded performance logging across World Map, Population, Campaigns, Leadership, Relationships, World History, and profile loading.
+- Added detailed measurements for background work, GUI delivery, rendering callbacks, and simulation batches.
+- Improved SQLite transaction and checkpoint diagnostics.
+- Added bounded, rotating performance logs to avoid excessive diagnostic overhead.
 
-- **People here:** Uses the optimized renderer and handles NPC arrivals and departures without disrupting browsing.
-- **Leadership:** Uses retained rendering for the hierarchy and member roster.
-- **Cultivator:** Keeps Adventure controls and progress bars stable while details update.
-- **Sect:** Mission board and character information update in place.
-- **Pavilion:** Shop cards update without unnecessary rebuilding; purchases verify the displayed item, price, and character.
-- **History & Battles:** Existing content updates more efficiently, with a new **Copy report** action for duel reports.
-- **Log:** Preserves your reading position as new output arrives.
+## v0.9.10-DEV — SQLite WAL Management
 
-## 👑 Illustrated Sect Leadership Hierarchy
+### Improved
+- Added SQLite WAL disk-space reclamation through the background checkpoint worker.
+- Introduced a 64 MiB reclamation threshold with deferral when database locks prevent safe recovery.
+- Added WAL reclaim and checkpoint diagnostics.
+- Preserved existing database durability and simulation data.
 
-**World → Leadership** now opens a visual council hierarchy featuring illustrated character portraits.
+## v0.9.9-DEV — Cultivation & World Responsiveness
 
-- Gold highlights the Sect Master or Acting Master.
-- Silver identifies elders.
-- Jade connections show direct disciples and their actual mentors.
-- The Sect Master's disciples appear on a separate branch.
-- Click a portrait to open the cultivator's profile.
-- Navigate using arrow keys and Enter.
-- Use horizontal scrolling to explore larger hierarchies.
-- Switch to **Member roster** for the complete paginated sect membership list.
+### Added
+- **Cultivate (+1 day)** allows players to gain power while advancing the entire world by one Heavenly day.
+- Five-minute active-play recovery shared across player profiles.
+- Power gains from competitive or lethal duels against equally strong or stronger opponents.
+- Visible simulation catch-up progress following cultivation.
 
-The hierarchy uses a shared collection of **16 illustrated portraits**, consistently assigned to characters across promotions and restarts.
+### World Map
+- Added visible attacking and defending army markers.
+- Army markers show troop counts, sect information, and locations.
+- Players can inspect armies and select destinations using map markers or **Find an army**.
 
-All offices and mentorship connections come from existing save data. Portraits do not increase the world database size.
+### Improved
+- Optimized database path handling and background simulation catch-up.
+- Improved responsiveness while queued world simulation work is processed.
+- Preserved all pending NPC actions, travel, payroll, and military activity.
 
-## 📜 Improved Political History
+## v0.9.2–v0.9.8 — World Performance, Warfare & Ascension
 
-World History now provides clearer information about political events.
+### World Performance
+- Added **Pause simulation** to the World interface.
+- Improved World History responsiveness through independent background reads.
+- Introduced SQLite WAL mode on supported local Windows drives.
+- Added diagnostic logging for slow database operations and delayed GUI activity.
+- Improved sect council scheduling and simulation catch-up handling.
 
-- Succession and takeover reports identify the sect involved.
-- New political events preserve the challenger's position at the time of the event.
-- Historical reports no longer incorrectly describe a successful challenger using their newly acquired office.
-- Older events display their recorded sect when available.
-- Added political-event filtering and searching by sect name.
-- Existing historical descriptions are preserved.
+### Warfare & Diplomacy
+- Added more cautious autonomous campaign planning based on treasury affordability and military strength.
+- Councils account for mobilization, supplies, payroll, arrears, and occupation upkeep before launching offensives.
+- Introduced post-settlement truces and delayed council policy reviews.
+- Armies can withdraw when their sect can no longer afford an offensive.
 
-These improvements make it easier to follow leadership changes, political struggles, and major developments across the Living World.
+### Sect Economy
+- Increased small-mine production to 18,000–22,500 Spirit Stones per two active hours.
+- Preserved large-mine production and existing sect financial obligations.
 
-## 🤝 Relationships & Character Information
+### Pavilion & Trading
+- Added sect-point purchases at sect headquarters.
+- Introduced public Spirit Stone trading locations.
+- Added consumable cultivation and injury-recovery pills.
+- NPCs autonomously travel to trade based on their needs, finances, and personalities.
+- Added mission completion tracking and occasional Spirit Stone rewards from adventures.
 
-### More Meaningful Relationships
+### Immortal Ascension
+- Added the **Dao Integration Pill** ascension ritual for qualified Tribulation cultivators.
+- Ascension requires surviving five Heavenly days at the ritual site.
+- Players can recruit protectors before beginning the ritual.
+- Rival sects can dispatch raiders to interrupt ascension.
+- Successful ascension grants immortality; interruption causes a major injury.
+- Added ascension tracking through World Campaigns and World History.
 
-The Relationships tab now displays **cultivators you've actually spoken to**.
+### Developer Tools
+- Expanded Living World Debug controls for campaigns, coups, and NPC opinions.
+- Added forced campaign and coup stages for testing.
+- Debug commands create database backups before modifying world state.
 
-NPCs can still develop respect, fear, hostility, or other opinions about you through rumors, missions, and world events before meeting you.
+## v0.8.x — Inter-Sect Warfare & Diplomacy
 
-Their existing opinions become visible in the Relationships tab after your first conversation.
+### Added
+- Autonomous inter-sect military campaigns and territorial conflicts.
+- Campaign objectives including mines, passes, headquarters, and reparations.
+- Physical troop mustering, marching, combat, withdrawal, and garrison deployment.
+- Sect council voting and leadership overrides for military decisions.
+- Defensive alliances, embassies, peace negotiations, and truces.
+- Military supply costs, casualties, territorial concessions, and upkeep.
 
-### Clearer Character Profiles
+### Player Participation
+- Players can volunteer for campaigns, report to muster, and join military operations.
+- Elders can propose campaigns and direct detachments.
+- Sect Masters can appoint commanders, manage diplomacy, negotiate peace, and assign garrisons.
+- Field commanders can issue army-wide orders.
 
-- Character cards distinguish **overall power**, **sect reputation standing**, and **actual political office**.
-- Special roles such as Elder, Direct Disciple, Acting Master, and Sect Master are displayed accurately.
-- Injured cultivators display their currently adjusted power.
-- The Cultivator tab displays your sect reputation rank, while exact reputation points remain available in the Sect tab.
-- Removed the developer-facing "Locally generated stats" text from player character cards. Generation details remain available in the command log.
+### Living World
+- NPCs respond to military invitations according to personality, courage, and strength.
+- Troops must physically travel to objectives and be fit for combat.
+- Political and territorial outcomes are recorded in World History.
+- Displaced sects can seek refuge or operate from remaining holdings.
 
-## 💾 Database Storage Optimization
+## v0.7.x — Territory & Sect Economy
 
-v0.6.2 introduced new retention and maintenance systems designed to reduce long-term database growth without discarding important world state.
+### Added
+- Expanded the world map to nine districts.
+- Added sect headquarters mines and four contested frontier mining regions.
+- Introduced territorial ownership, passes, frontier holds, and mine wardens.
+- Added shared sect treasuries and periodic mine income.
+- Added recurring sect payroll, wage arrears, and partial salary payments.
+- Founding sects receive an initial treasury of 10,000 Spirit Stones.
 
-### What Changed
+### Sect Politics
+- Unpaid salaries reduce loyalty and confidence in sect leadership.
+- Financial difficulties increase pressure for members to leave.
+- Councils can remove leaders after sustained loss of confidence.
+- Sect finances now influence long-term political stability.
 
-- NPC profiles retain their latest **50 routine activity entries**.
-- Significant milestones, including breakthroughs, notable duels, discoveries, injuries, deaths, and mentor rewards, are preserved separately.
-- Older ambiguous activity records are preserved in a legacy archive.
-- NPCs retain their latest **200 eligible secondhand Local reports**, with exceptions for active news propagation and recent reports.
-- Archived news cannot repeatedly award relationship effects.
-- Redundant event-effect records are retired.
-- Expired duel cooldowns are cleaned up in bounded batches.
-- Frequently updated profile JSON uses more compact formatting.
-- Retention maintenance yields while simulation catch-up is pending.
+## v0.6.6 — Offline Cultivators & Interface Improvements
 
-**Existing relationships, important memories, major World History events, and gameplay state are preserved.**
+### Offline Character Generation
+- Introduced a dedicated offline character generation module.
+- Local characters use their saved 20-digit IDs as generation seeds.
+- Realm, power, reputation, talent, and traits are generated as cultivation attributes.
+- Preserved existing local character progress, reputation, and history.
+- Maintained separate Steam-based character scoring.
 
-### Storage Benchmarks
-
-In controlled tests using identical worlds and 23,886 NPC actions:
-
-- **18.2% less database growth** compared with v0.6.1.
-- A separate mature-world snapshot shrank from approximately **470.6 MB to 287.2 MB** after eligible retention and offline compaction — a **39% reduction**.
-- Compared gameplay-state records remained consistent between versions.
-
-Actual savings depend on world age, accumulated history, and database contents. Database growth is reduced, not eliminated.
-
-### Optional Offline Database Optimization
-
-To optimize a copy of an existing database, close the game and developer editor, then run:
-
-```powershell
-python storage.py --optimize-copy "cache/world.optimized.db"
-```
-
-For compaction only:
-
-```powershell
-python storage.py --compact-copy "cache/world.compact.db"
-```
-
-These commands operate on private copies and do not replace the original database automatically.
-
-**Important:** Large mature-world optimizations can take considerable time and require additional free disk space. Keep your original save until the optimized copy has been validated and tested.
-
-## 🛠️ Stability & Compatibility
-
-- Retains the existing 2,500-NPC Living World simulation.
-- Preserves sect politics, journeys, encounters, relationships, and mentorship systems.
-- Keeps both GUI and terminal gameplay modes.
-- Includes protections against stale UI refreshes and incorrect clicks after list updates.
-- Existing saves remain compatible through the supported migration process.
-- No new world generation is required when upgrading.
-
-## 📦 Upgrading From v0.6.1
-
-**Please back up your existing world before upgrading.**
-
-1. Close Steam Cultivator and the developer editor.
-2. Extract v0.6.5-DEV into a **new folder**.
-3. Copy your entire existing `cache` folder into the new installation, beside the Python scripts.
-4. Launch the updated game normally.
-5. Keep your previous installation and backup until you've confirmed that your world loads correctly.
-
-**Database compatibility notes:**
-
-- v0.6.2 upgrades existing databases to **schema 6**, creating a migration backup before the upgrade.
-- v0.6.3, v0.6.4, and v0.6.5 retain the same schema 6 database format.
-- Older v0.6.1 installations cannot open an upgraded schema 6 database. Use the pre-upgrade backup if you need to roll back.
-- Never delete your `cache` folder to troubleshoot: it contains your persistent world and character progress.
-- Do not run multiple game instances against the same world database.
-
-## 🔮 What's Next?
-
-Living World Part 4 remains planned, with future systems including:
-
-- Inter-sect warfare and army mobilization.
-- Diplomacy and territorial conflicts.
-- Territory conquest and control.
-- Major inheritance expeditions.
-
-For now, v0.6.5-DEV concentrates on strengthening the performance, presentation, and reliability of the existing Living World.
+### Interface
+- Added scrollable NPC profile windows with reusable rendering.
+- Improved conversation controls and in-place response updates.
+- Organized the Martial Pavilion into **Pills, Weapons, Treasures, Talismans, and Sell Treasures**.
+- Improved profile browsing without replacing the currently selected player.
 
 ---
 
+## Save Upgrade Instructions
+
+When updating from an older release:
+
+1. Close Steam Cultivator and the Developer Editor completely.
+2. Extract the new version into a separate folder.
+3. Copy your entire existing `cache` folder into the new installation.
+4. Keep the previous installation and save as a backup.
+5. Allow any required database migrations and backups to complete on first launch.
+
+**Important:** Never delete `world.db-wal` or `world.db-shm` while the game is running. Do not run multiple game instances against the same world database.
+
+## Notes
+
+- Steam Cultivator uses a persistent SQLite world database.
+- NPCs continue acting autonomously, with saved relationships, memories, travel, sect politics, and military activity.
+- Simulation time pauses while the game is closed.
+- Performance improvements and retention policies do not guarantee a fixed maximum database size.
+- Back up your world before upgrading or using developer tools.
 **Thank you for playing Steam Cultivator!**
 
 The world keeps evolving, and this update makes it much easier to watch its cultivators, sects, and political stories unfold.
