@@ -116,3 +116,54 @@ class RunLog:
 
 
 RUN_LOG = RunLog()
+
+
+_performance_lock = threading.Lock()
+
+def performance_note(message, directory=None):
+    """Bounded diagnostic log, written only by background threads on slow paths."""
+    try:
+        with _performance_lock:
+            folder=LOG_DIR if directory is None else directory
+            os.makedirs(folder,exist_ok=True)
+            path=os.path.join(folder,'performance.log')
+            if os.path.exists(path) and os.path.getsize(path)>524288:
+                os.replace(path,path+'.previous')
+            with open(path,'a',encoding='utf-8') as f:
+                f.write(f'[{stamp(time.time())}] {message}\n')
+    except OSError:
+        pass
+
+
+# Bounded diagnostics: GUI callbacks only enqueue, never perform file I/O.
+import queue as _queue
+_timing_queue = _queue.Queue(maxsize=512)
+_timing_start_lock = threading.Lock()
+_timing_thread = None
+
+
+def _write_timings():
+    while True:
+        folder, message = _timing_queue.get()
+        try:performance_note(message, directory=folder)
+        finally:_timing_queue.task_done()
+
+
+def _queue_note(message):
+    global _timing_thread
+    if _timing_thread is None:
+        with _timing_start_lock:
+            if _timing_thread is None:
+                _timing_thread=threading.Thread(target=_write_timings,name='Performance log',daemon=True)
+                _timing_thread.start()
+    try:_timing_queue.put_nowait((LOG_DIR,message))
+    except _queue.Full:pass  # Diagnostic saturation must not delay gameplay.
+
+
+def timing(operation, status='OK', **durations):
+    values=' '.join(f'{name}_ms={max(0,value)*1000:.2f}' for name,value in durations.items())
+    _queue_note(f'TIMING {operation} status={status} {values}')
+
+
+def metric(operation, **values):
+    _queue_note('METRIC '+operation+' '+' '.join(f'{key}={value}' for key,value in values.items()))

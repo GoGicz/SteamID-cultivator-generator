@@ -32,6 +32,7 @@ import combat
 import display
 import gamedata
 import generator
+import offline_generator
 import logs
 import pavilion_shop
 import progress
@@ -178,7 +179,7 @@ class OfflineCreatorTab(ttk.Frame):
 
     def randomize(self):
         self.editing_profile = None
-        settings = generator.random_local_settings()
+        settings = offline_generator.random_local_settings()
         settings["sect"]=__import__("random").choice(self.sect_choices)["name"]
         self.fill_settings(settings, automatic=True)
         self.notice.configure(text="Random values ready. Edit any field, then preview or create.")
@@ -268,7 +269,7 @@ class OfflineCreatorTab(ttk.Frame):
             personalities = [p for p in gamedata.PERSONALITIES if p["name"] in settings["personalities"]]
             path = next(p for p in gamedata.PATHS if p["name"] == settings["path"])
             settings["reputation"] = generator.roll_reputation(settings["seed"], generator.local_profile_info(settings), personalities, path,
-                                                               data.get("duel_reputation", {}).get("points", 0))["points"]
+                                                               data.get("duel_reputation", {}).get("points", 0), starting=settings.get("starting_reputation"))["points"]
             pav = data.get("pavilion", {})
             settings["sect_points"] = max(0, max(settings["missions"] * gamedata.SECT_POINTS_PER_MISSION, pav.get("earned", 0)) + pav.get("bonus", 0) - pav.get("spent", 0))
             self.original_edit_settings = copy.deepcopy(settings)
@@ -286,6 +287,10 @@ class OfflineCreatorTab(ttk.Frame):
             if settings["seed"] != self.editing_profile.steamid:
                 raise ValueError("An existing profile's local ID cannot be changed.")
             data = copy.deepcopy(self.editing_profile.data)
+            saved=data["offline"]["character"]
+            for key in ("starting_reputation","generation"):
+                if key in saved:settings[key]=saved[key]
+            if settings.get("generation")=="seed-v1":settings.pop("power_offset",None)
             data["offline"].update(character=settings, info=generator.local_profile_info(settings))
             data.setdefault("wallet", {})["spirit_stones"] = settings["spirit_stones"]
             old = self.original_edit_settings
@@ -304,7 +309,7 @@ class OfflineCreatorTab(ttk.Frame):
             if settings["reputation"] != old["reputation"]:
                 personalities = [p for p in gamedata.PERSONALITIES if p["name"] in settings["personalities"]]
                 path = next(p for p in gamedata.PATHS if p["name"] == settings["path"])
-                base_rep = generator.roll_reputation(settings["seed"], generator.local_profile_info(settings), personalities, path)["base_points"]
+                base_rep = generator.roll_reputation(settings["seed"], generator.local_profile_info(settings), personalities, path, starting=settings.get("starting_reputation"))["base_points"]
                 data.setdefault("duel_reputation", {"history": []})["points"] = settings["reputation"] - base_rep
             if settings["sect_points"] != old["sect_points"]:
                 pav = data["pavilion"]
@@ -344,7 +349,7 @@ class OfflineCreatorTab(ttk.Frame):
     def build_preview(self):
         try:
             settings = self.settings()
-            data = generator.make_local_profile(settings)
+            data = offline_generator.make_local_profile(settings)
             self.preview_data = data
             self.preview_settings = copy.deepcopy(settings)
             self.preview.configure(state="normal")
@@ -363,7 +368,7 @@ class OfflineCreatorTab(ttk.Frame):
             if self.preview_data is None or self.settings() != self.preview_settings:
                 if not self.build_preview():
                     return
-            path = generator.create_local_profile(self.editor.cache, self.preview_data)
+            path = offline_generator.create_local_profile(self.editor.cache, self.preview_data)
             name = self.preview_data["offline"]["character"]["name"]
             self.editor.refresh()
             self.editor.choice.set(path.name)
@@ -411,6 +416,7 @@ class DeveloperEditor(tk.Toplevel):
         self.form = ttk.Frame(self.tabs, padding=12)
         self.tabs.add(self.form, text="Profile values")
         self.make_form()
+        self.build_world_debug()
         raw_frame = ttk.Frame(self.tabs)
         self.tabs.add(raw_frame, text="JSON (advanced)")
         ttk.Label(raw_frame, text="JSON edits are applied only with 'Apply JSON to form'. Save uses the form and its staged JSON.", padding=8).pack(fill="x")
@@ -428,6 +434,79 @@ class DeveloperEditor(tk.Toplevel):
         self.status = ttk.Label(self, text="Select a profile and load it.", padding=(10, 0, 10, 10))
         self.status.pack(fill="x")
         self.refresh()
+
+    def build_world_debug(self):
+        import warfare
+        panel=ttk.Frame(self.tabs,padding=12)
+        self.tabs.add(panel,text='Living World Debug')
+        ttk.Label(panel,text='Debug changes affect the selected world. Each command first creates a database backup.').pack(anchor='w')
+        fields={}
+        for label,values in [('Action',('Campaign','Coup','Opinion','Grant Dao Integration Pill')),('Mode',('Use normal rules','Force the event')),('Sect',()),('Objective / observer',()),('Starting stage',()),('Subject',()),('Opinion',('respect','trust','fear','hostility'))]:
+            row=ttk.Frame(panel);row.pack(fill='x',pady=3)
+            ttk.Label(row,text=label,width=20).pack(side='left')
+            box=ttk.Combobox(row,state='readonly',values=values,width=65);box.pack(side='left')
+            if values:box.current(0)
+            fields[label]=box
+        val=tk.StringVar(value='0')
+        ttk.Entry(panel,textvariable=val,width=10).pack(anchor='w')
+        note=ttk.Label(panel,text='Load world choices to begin.',wraplength=780)
+        note.pack(anchor='w',pady=8)
+        state={'busy':False,'options':{},'subjects':{},'cache':None}
+        def values(key,items):
+            box=fields[key];old=box.get();items=list(items)
+            box.configure(values=items);box.set(old if old in items else items[0] if items else '')
+        def select(*_):
+            if 'catalog' not in state:return
+            sects,people,targets=state['catalog']
+            sect=state['sects'].get(fields['Sect'].get())
+            action=fields['Action'].get();options={}
+            if action=='Campaign' and sect:
+                for t in targets[sect]:
+                    label=f"{t['objective']} · {t['name']} · {sects.get(t['owner'],'Local wardens')}"
+                    options[label]=(t['site'],t['objective'],t['owner'])
+            elif action in ('Coup','Opinion'):
+                for r in people:
+                    if r['sect_id']==sect and (action=='Coup' and r['office'] in ('Elder','Acting Master') or action=='Opinion' and r['kind']=='npc'):
+                        options[r['name']+' · '+r['actor']]=r['actor']
+            state['options']=options
+            values('Objective / observer',options)
+            stages=('Muster','March','Contest','Holding') if action=='Campaign' else ('gathering','preparing','conflict') if action=='Coup' else ()
+            values('Starting stage',stages if fields['Mode'].get()=='Force the event' else stages[:1])
+        def launch(fn,done):
+            if state['busy']:return
+            state['busy']=True;note.configure(text='Working…')
+            results=queue.Queue()
+            def worker():
+                try:results.put((True,fn()))
+                except Exception as exc:results.put((False,str(exc)))
+            def poll():
+                if results.empty():self.after(60,poll);return
+                ok,result=results.get();state['busy']=False
+                if ok:done(result)
+                else:note.configure(text=result)
+            threading.Thread(target=worker,daemon=True).start();self.after(60,poll)
+        def load():
+            cache=Path(self.cache)
+            def done(catalog):
+                sects,people,_=catalog
+                state.update(cache=cache,catalog=catalog,sects={name:sid for sid,name in sects.items()}|{'Wanderers':None})
+                values('Sect',state['sects'])
+                state['subjects']={r['name']+' · '+r['actor']:r['actor'] for r in people if r['kind']!='npc'}
+                values('Subject',state['subjects'])
+                selected=self.profile.steamid if self.profile else getattr(self,'game_subject',None)
+                for label,actor in state['subjects'].items():
+                    if actor==selected:fields['Subject'].set(label)
+                select();note.configure(text='Ready. Opinion edits do not create a meeting.')
+            launch(lambda:warfare.debug_catalog(cache),done)
+        def apply():
+            if state['busy']:return
+            if state['cache']!=Path(self.cache):note.configure(text='Load choices for this cache first.');return
+            args=(state['cache'],fields['Action'].get(),state['sects'].get(fields['Sect'].get()),state['options'].get(fields['Objective / observer'].get()),
+                  fields['Starting stage'].get(),fields['Mode'].get()=='Force the event',state['subjects'].get(fields['Subject'].get()),fields['Opinion'].get(),val.get(),self._owned_root is not None)
+            launch(lambda:warfare.debug_command(*args),lambda result:note.configure(text=result))
+        for key in ('Action','Mode','Sect'):fields[key].bind('<<ComboboxSelected>>',select)
+        ttk.Button(panel,text='Load world choices',command=load).pack(side='left')
+        ttk.Button(panel,text='Apply debug command',command=apply).pack(side='left',padx=8)
 
     def text_area(self, parent):
         frame = ttk.Frame(parent)
@@ -559,7 +638,7 @@ class DeveloperEditor(tk.Toplevel):
             character = data["offline"]["character"]
             character["realm_index"] = new_realm
             character["score"] = generator.realm_power_range(new_realm)[0]
-            character["power_offset"] = character["score"] - generator.local_power_base(character)
+            if character.get("generation")!="seed-v1":character["power_offset"] = character["score"] - generator.local_power_base(character)
         for section, key, flag in (("realm_state", "last_failed", self.clear_break), ("life", "last_roll", self.clear_rebirth)):
             if flag.get():
                 data.setdefault(section, {})[key] = None
@@ -627,7 +706,7 @@ class DeveloperEditor(tk.Toplevel):
         try:
             if Path(path).suffix == '.db':
                 with contextlib.closing(storage.sqlite3.connect(Path(path))) as backup:
-                    row=backup.execute('SELECT data FROM profiles WHERE id=?',(self.profile.steamid,)).fetchone()
+                    row=storage.paid_profile_row(backup,self.profile.steamid)
                     if row is None: raise ValueError('This backup does not contain the selected profile.')
                     data=json.loads(row[0])
             else:
@@ -729,17 +808,16 @@ class Controller:
             raise logs.SteamError("Enter offline mode to create a random local cultivator.")
         def work():
             for _ in range(30):
-                settings = generator.random_local_settings(player_start=True)
+                settings = offline_generator.random_local_settings(player_start=True)
                 if sect_id:
                     selected=next((r for r in storage.sect_names() if r["id"]==sect_id),None)
                     if not selected:raise logs.SteamError("Choose a registered sect.")
                     settings["sect"]=selected["name"]
-                settings["power_offset"] = settings["score"] - generator.local_power_base(settings)
                 try:
-                    data = generator.make_local_profile(settings)
+                    data = offline_generator.make_local_profile(settings)
                     data["offline"]["origin"] = "player_random"
                     data["activity"][-1]["summary"] = "Began a randomly generated local cultivation journey."
-                    generator.create_local_profile(storage.CACHE_DIR, data)
+                    offline_generator.create_local_profile(storage.CACHE_DIR, data)
                 except FileExistsError:
                     continue
                 except ValueError as exc:
@@ -747,7 +825,7 @@ class Controller:
                         continue
                     raise
                 result=self._view_data(settings["seed"])
-                logs.RUN_LOG.note("Local generation for "+settings["name"]+": "+", ".join(key+"="+value for key,value in result["view"]["source"]))
+                logs.RUN_LOG.note(f"Seed {settings['seed']}: {settings['name']}, power {settings['score']}, starting fame {settings['reputation']}, {settings['talent']}, {settings['element']}.")
                 return result
             raise logs.SteamError("Could not find a unique local name. Please try again.")
         return self._run("create random local cultivator", work)
@@ -815,7 +893,7 @@ class Controller:
         or the cultivator is dead."""
         def work():
             steamid, c = pavilion_shop.pavilion_target(self.key, self.profiles, self.session)
-            return {"steamid": steamid, "c": c, "rows": shop_rows(c), "sells": pavilion_shop.sell_rows(c)}
+            return {"steamid": steamid, "c": c, "venues":pavilion_shop.markets(steamid), "rows": shop_rows(c), "sells": pavilion_shop.sell_rows(c)}
         return self._run("pavilion", work)
 
     def sell(self, number, expected=None):
@@ -828,7 +906,7 @@ class Controller:
                 if shown is None or (steamid,shown["name"],shown["price"])!=expected:
                     raise logs.SteamError("This listing changed. Reopen the pavilion to see the current offer.")
             row = pavilion_shop.sell_treasure(steamid, c, number)
-            return {"steamid": steamid, "c": c, "rows": shop_rows(c), "sells": pavilion_shop.sell_rows(c),
+            return {"steamid": steamid, "c": c, "venues":pavilion_shop.markets(steamid), "rows": shop_rows(c), "sells": pavilion_shop.sell_rows(c),
                     "sold": row}
         return self._run(f"sell {number}", work)
 
@@ -841,7 +919,7 @@ class Controller:
                 if shown is None or (steamid,shown["name"],shown["price"])!=expected:
                     raise logs.SteamError("This listing changed. Reopen the pavilion to see the current offer.")
             item = pavilion_shop.buy_pavilion_item(steamid, c, number)
-            return {"item": item, "c": c, "rows": shop_rows(c), "steamid": steamid,
+            return {"item": item, "c": c, "venues":pavilion_shop.markets(steamid), "rows": shop_rows(c), "steamid": steamid,
                     "sells": pavilion_shop.sell_rows(c),
                     "goods": generator.describe_goods(c["pavilion"]["items"]) or "nothing yet",
                     "treasures": generator.describe_treasures(generator.treasures_of(c)) or "none"}
@@ -898,8 +976,14 @@ class Controller:
         path = os.path.join(logs.LOG_DIR, "steam_cultivator_"
                             + logs.stamp(time.time())[:10] + ".log")
         try:
-            with open(path, encoding="utf-8") as f:
-                return f.read()
+            with open(path,'rb') as f:
+                size=f.seek(0,os.SEEK_END)
+                limit=64*1024
+                f.seek(max(0,size-limit))
+                data=f.read(limit)
+                if size>limit:
+                    data=data.partition(b'\n')[2] or data
+                return ('Recent log entries (full file in Logs)\n' if size>limit else '')+data.decode('utf-8',errors='replace')
         except OSError:
             return "(No log for today yet. It is written after your first action.)"
 
@@ -946,8 +1030,8 @@ def cultivator_view(c, info):
         rows.append(("Sect reputation rank",status['rank']))
     if c.get("injury"):
         rows.append(("Injury", c["injury"]["cause"]+" · power reduced 20% · recovering until "+storage.calendar_text(c["injury"]["until_day"])))
-    if rep["bonuses"]:
-        rows.append(("Fame boosts", ", ".join(f"{n} {a:+d}" for n, a in rep["bonuses"])))
+    if rep["bonuses"] and not rep.get("legacy_local_total"):
+        rows.append(("Fame modifiers", ", ".join(f"{n} {a:+d}" for n, a in rep["bonuses"])))
     rows += [("Death risk", f"{c['death_chance'] * 100:g}%"),
              ("Affinity", c["element"]),
              ("Matchups", f"strong vs {', '.join(gamedata.ELEMENT_BEATS.get(c['element'], []))}; "
@@ -961,7 +1045,7 @@ def cultivator_view(c, info):
     if events:
         rows.append(("Recent", storage.describe_event(events[-1])))
     if info["achievements_hidden"]:
-        rows.append(("Missions", "0 (Steam is hiding your achievements)"))
+        rows.append(("Missions", f"{c['missions']:,} (Steam achievements hidden)"))
     else:
         n = c["missions"]
         rows.append(("Missions", f"{n:,} sect mission{'' if n == 1 else 's'} completed"))
@@ -1037,6 +1121,7 @@ def breakthrough_view(c):
            "next": st["next"], "pills": st["pills"], "cooldown_left": st["cooldown_left"],
            "pill_bonus": progress.BREAKTHROUGH_PILL_BONUS, "plain": None, "with_pill": None,
            "risk": "", "fatal": False, "penalty": st["penalty"]}
+    out["realm_index"]=c["realm_index"]
     if st["chance"]:
         out["risk"], out["fatal"] = progress.breakthrough_risk_text(st), st["fatal"]
     if st["chance"]:
@@ -1241,6 +1326,33 @@ class CouncilChart(tk.Frame):
         self.select(self.active if self.active in self.cards else None)
 
 
+def display_rank(rank):
+    return {'Random sect initiate':'Initiate','The sect guardian and protector':'Guardian and Protector'}.get(rank,rank.removeprefix('Sect ').title())
+
+
+def npc_list_entry(person,location=None):
+    details=[]
+    if person.get('realm') is not None:
+        details.append(f"Realm: {person['realm']}    |    Power: {person['power']:,}")
+    sect="Sect: "+(person.get('sect') or 'Unaffiliated')
+    if person.get('sect')=='Wanderer':sect='Sect: Unaffiliated'
+    rank=person.get('rank')
+    if rank:
+        rank=display_rank(rank)
+        sect+='    |    Sect rank: '+rank
+    role=person.get('role')
+    if role not in (None,'Unaffiliated','Member'):
+        sect+=('    |    Mentorship: ' if role=='Direct Disciple' else '    |    Office: ')+role
+    details.append(sect)
+    place=person.get('location') or location
+    status='Activity: '+person['activity']
+    if person.get('destination'):
+        status+=f"    |    From: {place} → Destination: {person['destination']}"
+    elif place:status+='    |    Location: '+place
+    details.append(status)
+    return (person['name'],'\n'.join(details),(('View / Talk',person['id']),))
+
+
 class WorldCardList(tk.Frame):
     """One drawing surface for a page. Moving the viewport never lays out its cards."""
     def __init__(self, master, app, action=None):
@@ -1344,6 +1456,11 @@ class WorldCardList(tk.Frame):
             changed=True
             for i,item in enumerate(row['items']):
                 if old is None or entry[i]!=old[i]:cv.itemconfigure(item,text=entry[i])
+            section=len(entry)>4 and entry[4]=='section'
+            if section!=row.get('section',False):
+                cv.itemconfigure(row['bg'],fill='#373329' if section else PANEL_2)
+                cv.itemconfigure(row['items'][0],fill=ACCENT if section else TEXT)
+                row['section']=section
             icon_key=entry[3] if len(entry)>3 else None
             if icon_key!=row.get('icon_key'):
                 if row.get('icon'):cv.delete(row.pop('icon'))
@@ -1411,6 +1528,243 @@ def dialog_scroll(ctk,window,**options):
     return DialogScroll(window,**options)
 
 
+class SectPoliticsDashboard:
+    """Retained main-thread controls; refreshes replace data, not the widget tree."""
+    def __init__(self,app,window):
+        self.app,self.window,self.ctk=app,window,app.ctk
+        self.data=None;self.labels={};self.buttons={};self.panels=[];self.layout=None
+        self.body=dialog_scroll(self.ctk,window,fg_color='#101722')
+        self.body.pack(fill='both',expand=True,padx=12,pady=12)
+        self.body.grid_columnconfigure((0,1),weight=1,uniform='panels')
+        self.header=self.panel('Sect membership',0,full=True)
+        self.label(self.header,'name',size=22,gold=True)
+        self.label(self.header,'membership');self.label(self.header,'wallet');self.label(self.header,'timers')
+        actions=self.ctk.CTkFrame(self.header,fg_color='transparent');actions.pack(fill='x',padx=16,pady=8)
+        actions.grid_columnconfigure((0,1),weight=1)
+        self.button(actions,'change','Choose / change sect',app.open_sect_picker)
+        self.button(actions,'leave','Leave sect and relinquish position',self.leave)
+        for key in ('change','leave'):self.buttons[key].pack_forget()
+        self.buttons['change'].grid(row=0,column=0,sticky='ew',padx=(0,8))
+        self.buttons['leave'].grid(row=0,column=1,sticky='ew',padx=(8,0))
+        self.buttons['leave'].configure(fg_color='#553e49',hover_color='#744f5d')
+        self.treasury=self.panel('Sect treasury',1)
+        self.label(self.treasury,'treasury',size=24,gold=True)
+        self.label(self.treasury,'income');self.label(self.treasury,'payroll');self.label(self.treasury,'arrears')
+        self.confidence=self.panel('Sect council',2)
+        self.label(self.confidence,'confidence',size=18)
+        self.bar=self.ctk.CTkProgressBar(self.confidence,progress_color='#c5a355');self.bar.pack(fill='x',padx=16,pady=10)
+        self.label(self.confidence,'council')
+        self.mentor=self.panel('Mentorship · selected council member',3)
+        self.contact=self.ctk.CTkOptionMenu(self.mentor,values=['No council member'],command=self.preview)
+        self.contact.pack(fill='x',padx=16,pady=6)
+        self.label(self.mentor,'mentor',size=16,gold=True);self.label(self.mentor,'mentor_details')
+        self.label(self.mentor,'mentor_reason')
+        self.button(self.mentor,'view','View selected council member',self.view)
+        self.button(self.mentor,'disciple','Apply as their direct disciple',self.disciple)
+        self.button(self.mentor,'train','Train with mentor · 10 active-minute cooldown',lambda:self.perform('Mentor training',lambda sid:progress.mentor_training(sid)))
+        self.button(self.mentor,'reward','Claim achievement reward from mentor',lambda:self.perform('Mentor reward',lambda sid:progress.claim_mentor_reward(sid)))
+        self.support=self.panel('Council support',4)
+        self.label(self.support,'target')
+        self.static(self.support,'Requested position')
+        self.purpose=self.ctk.CTkOptionMenu(self.support,values=['Elder','Sect Master'])
+        self.purpose.pack(fill='x',padx=16,pady=6)
+        self.static(self.support,'Spirit Stone offer · 0 = ordinary request')
+        self.amount=self.ctk.CTkEntry(self.support);self.amount.insert(0,'0');self.amount.pack(fill='x',padx=16,pady=6)
+        self.static(self.support,'This is a payment offer, not a number of supporters. A refused bribe may be exposed and damage your standing.')
+        self.button(self.support,'support','Request council support',self.request_support)
+        self.career=self.panel('Career advancement',5,full=True)
+        self.label(self.career,'elder_status')
+        self.button(self.career,'elder','Apply for Elder',lambda:self.apply_office('Elder'))
+        self.label(self.career,'master_status')
+        self.button(self.career,'master','Apply for Sect Master',lambda:self.apply_office('Sect Master'))
+        self.static(self.career,'Elder: 1,200 standing, at least 80% of the weakest elder’s power, an open seat and council backing. Master: eligible elder/guardian, backing and vacant or acting leadership. Attend headquarters. A supported candidacy can request an earlier council decision.')
+        self.warnings=self.panel('Political warning signs',6,full=True)
+        self.label(self.warnings,'warning',size=16,gold=True);self.label(self.warnings,'plot_details')
+        self.static(self.warnings,'Interventions require headquarters attendance and a two-minute active-play cooldown. Failed investigations increase hostility. Unsupported warnings cost 10 standing; accusations cost 50. Loyal characters cannot back betrayal.')
+        for action in ('Investigate','Warn council','Accuse','Negotiate','Back challenger','Defend leadership'):
+            self.button(self.warnings,action,action,lambda value=action:self.perform(value,lambda sid:progress.intervene(sid,value)))
+        for side in ('Defenders','Challengers'):
+            self.button(self.warnings,side,'Fight for '+side,lambda value=side:self.perform('Lethal sect confrontation',lambda sid:progress.fight_for_sect(sid,value,app.controller.key,app.controller.profiles),'Enter lethal combat? The loser has a 15% chance of death. You can instead negotiate, withdraw, or remain out of the fighting.'))
+        self.reports=self.ctk.CTkTextbox(self.warnings,height=165,wrap='word');self.reports.pack(fill='x',padx=16,pady=10)
+        self.report_text=None
+        footer=self.ctk.CTkFrame(window,fg_color='transparent');footer.pack(side='bottom',fill='x',padx=12,pady=(0,8))
+        self.label(footer,'feedback').pack_configure(side='left',expand=True)
+        self.button(footer,'refresh','Refresh sect affairs',app.open_sect_management).pack_configure(side='right',fill='none')
+        window.bind('<Configure>',self.resize,add='+')
+        self.resize()
+
+    @staticmethod
+    def cancel_owned_timers(window):
+        # CustomTkinter schedules delayed DPI/title-bar work on toplevels.
+        # Cancel only callbacks owned by this dialog before Tk deletes them.
+        commands=set()
+        def collect(widget):
+            commands.update(getattr(widget,'_tclCommands',None) or ())
+            for child in widget.winfo_children():collect(child)
+        collect(window)
+        for job in window.tk.call('after','info'):
+            info=window.tk.call('after','info',job)
+            script=window.tk.splitlist(info[0])
+            if script and script[0] in commands:window.tk.call('after','cancel',job)
+
+    def panel(self,title,index,full=False):
+        p=self.ctk.CTkFrame(self.body,fg_color='#192331',border_width=1,border_color='#45505e',corner_radius=10)
+        self.ctk.CTkLabel(p,text=title,font=self.ctk.CTkFont(size=18,weight='bold'),text_color='#d4b56a',anchor='w').pack(fill='x',padx=16,pady=(12,8))
+        self.panels.append((p,full));return p
+
+    def static(self,p,text):
+        w=self.ctk.CTkLabel(p,text=text,anchor='w',justify='left',wraplength=400,text_color='#bbc7d5')
+        w.pack(fill='x',padx=16,pady=4);self.labels['static'+str(len(self.labels))]=w;return w
+
+    def label(self,p,key,size=13,gold=False):
+        w=self.static(p,'');w.configure(font=self.ctk.CTkFont(size=size,weight='bold' if size>13 else 'normal'),text_color='#e2c579' if gold else '#e0e5ed');self.labels[key]=w;return w
+
+    def button(self,p,key,title,command):
+        w=self.ctk.CTkButton(p,text=title,command=command,height=34,fg_color='#24548a',hover_color='#316da9')
+        w.pack(fill='x',padx=16,pady=(5,8));self.buttons[key]=w;return w
+
+    def text(self,key,value):
+        w=self.labels[key]
+        if w.cget('text')!=value:w.configure(text=value)
+
+    def state(self,widget,value):
+        if widget.cget('state')!=value:widget.configure(state=value)
+
+    def resize(self,event=None):
+        if event is not None and event.widget!=self.window:return
+        width=self.window.winfo_width()/self.body._get_widget_scaling()
+        wide=width>=950
+        if wide!=self.layout:
+            self.layout=wide;row=0;col=0
+            for p,full in self.panels:
+                if full:
+                    if col:row+=1;col=0
+                    p.grid(row=row,column=0,columnspan=2 if wide else 1,sticky='nsew',padx=5,pady=6);row+=1
+                else:
+                    p.grid(row=row,column=col,columnspan=1,sticky='nsew',padx=5,pady=6)
+                    col+=1
+                    if not wide or col==2:row+=1;col=0
+            self.body.grid_columnconfigure(0,weight=1,uniform='panels' if wide else '')
+            self.body.grid_columnconfigure(1,weight=1 if wide else 0,minsize=0,uniform='panels' if wide else '')
+        for w in set(self.labels.values()):
+            full=next((full for p,full in self.panels if w.master==p),True)
+            wrap=max(240,int((width-65)/(2 if wide and not full else 1)-35))
+            if w.cget('wraplength')!=wrap:w.configure(wraplength=wrap)
+
+    def selected(self):return self.council.get(self.contact.get())
+
+    def perform(self,label,fn,confirm=None):
+        sid=self.data['actor']['actor']
+        self.act(label,lambda:fn(sid),confirm)
+
+    def leave(self):
+        self.perform('Leave sect',lambda sid:progress.change_sect(sid,None),'Leave this sect? You lose your office/mentor, former members lose trust and respect, and the two-hour active-play cooldown begins.')
+
+    def view(self):
+        member=self.selected()
+        if member:self.app.inspect_world_actor(member['actor'])
+
+    def disciple(self):
+        member=self.selected()
+        if member:self.perform('Direct disciple application',lambda sid:progress.apply_direct_disciple(sid,member['actor']))
+
+    def request_support(self):
+        try:stones=int(self.amount.get())
+        except ValueError:messagebox.showerror('Invalid amount','Enter a whole number of Spirit Stones.',parent=self.window);return
+        member=self.selected()
+        if member:
+            purpose='elder' if self.purpose.get()=='Elder' else 'master'
+            self.perform('Seek council support',lambda sid:progress.seek_support(sid,member['actor'],purpose,stones),'An offer can be refused or exposed. Accepted bribes transfer your Spirit Stones; exposure can damage standing.' if stones else None)
+
+    def apply_office(self,role):self.perform('Office application',lambda sid:progress.apply_office(sid,role))
+
+    def preview(self,value=None):
+        v=self.selected();a=self.data['actor'];r=self.data.get('readiness',{});here=r.get('presence',{})
+        self.text('target','Target council member: '+(v['name'] if v else 'None available'))
+        self.text('mentor',v['name'] if v else 'No eligible council contact')
+        self.text('mentor_details',(f"{v['office']} · {self.sect_name}\nDirect disciples: {v['disciples']} / {v['capacity']}\nBase support chance (no offer): {v['support_chance']:.0%}\nLocation: {v['location']['name']}" if v else 'Join a sect with a living council to request mentorship or support.'))
+        reason=''
+        if not v:reason='No council member selected.'
+        elif a['dead']:reason='A deceased cultivator cannot apply.'
+        elif here.get('state')!='present' or v['location'].get('state')!='present' or here.get('location')!=v['location'].get('location'):reason='Meet this council member at the same location first.'
+        self.state(self.buttons['view'],'normal' if v else 'disabled')
+        self.state(self.buttons['support'],'disabled' if reason else 'normal')
+        if not reason and (a['office']!='Member' or a['mentor']):reason='Only an unmentored ordinary member can apply.'
+        if not reason and v['disciples']>=v['capacity']:reason='This mentor has no direct-disciple opening.'
+        self.text('mentor_reason',reason or 'Present together. Talent, achievements, compatibility and strength are checked on application.')
+        self.state(self.buttons['disciple'],'disabled' if reason else 'normal')
+
+    def update(self,data):
+        old_actor=self.data['actor']['actor'] if self.data else None
+        selected=self.selected()['actor'] if self.data and self.selected() else None
+        self.data=data;a=data['actor'];sid=a['actor'];self.act=self.app.sect_action_handler(sid,self.window,False)
+        self.sect_name=next((s['name'] for s in data['catalog'] if s['id']==a['sect_id']),'Unaffiliated' if not a['sect_id'] else 'Unregistered sect')
+        if old_actor!=sid:self.amount.delete(0,'end');self.amount.insert(0,'0');self.purpose.set('Elder');self.text('feedback','')
+        self.text('name',a['name'])
+        rank=next(name for threshold,name in reversed(gamedata.SECT_RANKS) if a['standing']>=threshold)
+        self.text('membership',f"{self.sect_name} · {data['role']}\nSect rank: {rank} · Standing: {a['standing']:,}" if a['sect_id'] else 'Unaffiliated · Wanderer\nNo current sect rank or standing.')
+        self.text('wallet',f"Spirit Stones: {data['spirit_stones']:,}    Salary: {data['salary']:,} per 30 active minutes (highest role only)")
+        def timer(seconds):return f'{int(seconds)//60}m {int(seconds)%60:02}s'
+        self.text('timers',f"Next salary: {timer(data['salary_seconds']) if a['sect_id'] else 'Not enrolled'}    Membership-change wait: {timer(data['change_seconds'])}\nTimers show active-play time at the last refresh.")
+        self.state(self.buttons['leave'],'normal' if a['sect_id'] else 'disabled')
+        e=data.get('economy')
+        self.text('treasury',f"{e['treasury']:,} Spirit Stones" if e else 'No sect treasury')
+        self.text('income',f"Mine income: {e['income']:,} per two active hours" if e else 'Join a registered sect to view its economy.')
+        self.text('payroll',f"Roster payroll: {e['wages']:,} per 30 active minutes" if e else '')
+        self.text('arrears',f"Last payout: {e['last_paid']:,} of {e['last_due']:,}\nOutstanding arrears: {e['arrears']:,}" if e else '')
+        self.text('confidence',f"Confidence in the master: {e['confidence']} / 100" if e else 'Council confidence: unavailable')
+        confidence=e['confidence']/100 if e else 0
+        if self.bar.get()!=confidence:self.bar.set(confidence)
+        self.text('council',f"Council members: {len(data['council'])}\nConfidence concerns the current master, not your personal standing.")
+        contacts=[v for v in data['council'] if v['actor']!=sid]
+        titles=[v['office']+' · '+v['name'] for v in contacts]
+        self.council={title+(' ['+v['actor']+']' if titles.count(title)>1 else ''):v for title,v in zip(titles,contacts)}
+        values=list(self.council) or ['No council member']
+        if self.contact.cget('values')!=values:self.contact.configure(values=values)
+        choice=next((name for name,v in self.council.items() if v['actor']==selected),values[0])
+        if self.contact.get()!=choice:self.contact.set(choice)
+        self.state(self.contact,'normal' if self.council else 'disabled');self.preview()
+        for key in ('train','reward'):
+            if a['mentor']:
+                if not self.buttons[key].winfo_manager():self.buttons[key].pack(fill='x',padx=16,pady=(5,8))
+            elif self.buttons[key].winfo_manager():self.buttons[key].pack_forget()
+        r=data.get('readiness',{});elders=[v for v in data['council'] if v['office']=='Elder'];others=[v for v in data['council'] if v['actor']!=sid]
+        for key in ('elder','master'):
+            reasons=[]
+            if a['dead'] or not a['sect_id']:reasons.append('join as a living sect member')
+            if a['standing']<1200:reasons.append('need 1,200 standing')
+            if elders and a['power']<min(v['power'] for v in elders)*.8:reasons.append('need 80% of the weakest elder’s power')
+            votes=r.get('votes',{}).get(key,0);required=max(1,(len(others)+1)//2)
+            if votes<required:reasons.append(f'council backing {votes}/{required}')
+            here=r.get('presence',{})
+            if here.get('state')!='present':reasons.append('finish travel or current encounter')
+            elif r.get('headquarters') and here.get('location')!=r['headquarters']:reasons.append('attend headquarters')
+            if key=='elder':
+                if a['office']!='Member':reasons.append('already holding a council office')
+                if len(elders)>=r.get('elder_capacity',6):reasons.append('elder council is full')
+            else:
+                if a['office'] not in ('Elder','Acting Master') and a['standing']<5000:reasons.append('must be an elder or recognized guardian')
+                if any(v['office']=='Sect Master' for v in data['council']):reasons.append('a legitimate master is still in office')
+            self.text(key+'_status',('Elder' if key=='elder' else 'Sect Master')+' · '+('; '.join(reasons) if reasons else 'Basic requirements met; final validation on application.'))
+            self.state(self.buttons[key],'disabled' if reasons else 'normal')
+        plot=data['plot']
+        self.text('warning',('Active warning · '+plot['stage'].replace('_',' ').title()) if plot else 'No known political plot')
+        self.text('plot_details',f"Organizer: {plot['organizer']} · Evidence: {plot['evidence']}/3 · Confrontations: {plot['round']}/3" if plot else 'Private NPC plans are not revealed here.')
+        for action in ('Investigate','Warn council','Accuse','Negotiate','Back challenger','Defend leadership','Defenders','Challengers'):
+            button=self.buttons[action]
+            visible=plot and (action in plot['choices'] or (action in ('Defenders','Challengers') and plot['stage']=='conflict'))
+            if visible:
+                if action in plot['choices']:
+                    title=f"{action} · {plot['choices'][action]:.0%} chance"
+                    if button.cget('text')!=title:button.configure(text=title)
+                if not button.winfo_manager():button.pack(before=self.reports,fill='x',padx=16,pady=(5,8))
+            elif button.winfo_manager():button.pack_forget()
+        text='\n\n'.join(storage.calendar_text(e['day'])+' · '+e['title']+'\n'+e['summary'] for e in data['reports']) or 'No public political reports for this sect.'
+        if text!=self.report_text:
+            position=self.reports.yview()[0];self.reports.configure(state='normal');self.reports.delete('1.0','end');self.reports.insert('1.0',text);self.reports.configure(state='disabled');self.reports.yview_moveto(position);self.report_text=text
+        self.resize()
+
+
 class App:
     """The window. It only builds widgets and calls the Controller on a worker thread."""
 
@@ -1438,6 +1792,12 @@ class App:
         self.root.configure(fg_color=BG)
         self.controller = None
         self.events = queue.Queue()
+        self._reads = {}
+        self._pause_started = None
+        self._paused_seconds = 0
+        self._last_gui_poll = time.monotonic()
+        self._stop_monitor = threading.Event()
+        threading.Thread(target=self.monitor_gui,args=(threading.get_ident(),),name='GUI stall monitor',daemon=True).start()
         self.working = False
         self.checking_key = False
         self.remember_key_consent = False
@@ -1458,6 +1818,7 @@ class App:
         self.version_label = ctk.CTkLabel(self.root, text=gamedata.VERSION, font=self.small_font,
                                           text_color=MUTED, anchor="w")
         self.version_label.pack(side="top", anchor="w", padx=16, pady=(8, 0))
+        self.political_button=ctk.CTkButton(self.root,text='Sect event',command=self.open_political_event)
         achievements.PROGRESS_HOOK = lambda done, total: self.events.put(("progress", done, total))
         self.root.after(80, self.poll)
         saved_key = "" if offline else storage.load_saved_api_key()
@@ -1626,6 +1987,7 @@ class App:
             window.focus_set()
         else:
             self.developer_window = DeveloperEditor(Path(storage.CACHE_DIR), master=self.root)
+            self.developer_window.game_subject=self.controller.selected()
             self.developer_window.transient(self.root)
             self.developer_window.grab_set()
             self.developer_window.bind("<Destroy>", lambda event: self.refresh_cached_profiles()
@@ -1693,6 +2055,35 @@ class App:
                 self.ctk.CTkButton(dlg,text='Preview route to selected headquarters',command=travel).pack(pady=4)
         self.run_async('Reading the twenty sects…',read,show)
 
+    def update_political_notice(self,sid,notice):
+        if sid!=self.controller.selected():return
+        key=(sid,notice)
+        if key==getattr(self,'_political_key',None):return
+        self._political_key=key
+        old=getattr(self,'political_window',None)
+        if old and self.widget_alive(old):old.destroy()
+        if not notice:
+            self.political_button.pack_forget()
+            return
+        self.political_button.configure(text=notice[3]+' · Leadership challenge · View choices')
+        self.political_button.pack(before=self.tabs,fill='x',padx=16)
+        def present():
+            if getattr(self,'_closing',False) or self._political_key!=key or self.controller.selected()!=sid:return
+            if self.working:
+                self.root.after(250,present)
+            else:self.open_political_event()
+        present()
+
+    def open_political_event(self):
+        if self.working:return
+        sid,notice=self._political_key
+        if not notice or sid!=self.controller.selected():return
+        def show(data):
+            plot=data['plot']
+            if sid==self.controller.selected() and plot and (plot['id'],plot['stage'],plot['round'])==notice[:3]:
+                self.show_sect_management(data,event_only=True)
+        self.run_async('Reading political choices…',lambda:progress.sect_management(sid),show)
+
     def open_sect_management(self):
         sid=self.controller.selected()
         if not sid:return
@@ -1701,24 +2092,61 @@ class App:
                 generator.build_cultivator(sid,self.controller.key,self.controller.profiles)
                 return progress.sect_management(sid)
             return self.controller._run('sect management',read)
-        self.run_async('Reading sect affairs…',work,self.show_sect_management)
+        previous=getattr(self,'sect_management_window',None)
+        was_open=bool(previous and self.widget_alive(previous))
+        def show(data):
+            if sid!=self.controller.selected() or (was_open and not self.widget_alive(previous)):return
+            self.show_sect_management(data)
+        self.run_async('Reading sect affairs…',work,show)
 
-    def show_sect_management(self,data):
+    def show_sect_management(self,data,event_only=False):
         a=data['actor'];sid=a['actor']
+        if event_only:
+            previous=getattr(self,'political_window',None)
+            if previous and self.widget_alive(previous):previous.destroy()
+            if not data['plot']:return
+            dlg=self.political_window=self.ctk.CTkToplevel(self.root)
+            dlg.title('Sect event');dlg.geometry('570x640');dlg.transient(self.root)
+            panel=dialog_scroll(self.ctk,dlg);panel.pack(fill='both',expand=True,padx=10,pady=8)
+            body=self.fresh(panel)
+            self.section(body,self._political_key[1][3]+' · Leadership challenge')
+            self.paragraph(body,a['name']+' · '+data['role'])
+            report=next((r for r in data['reports'] if r['plot']==data['plot']['id']),None)
+            if report:self.paragraph(body,report['summary'])
+        else:
+            self.show_management_details(data)
+            return
+        self.event_feedback=self.ctk.CTkLabel(body,text='',wraplength=470)
+        self.event_feedback.pack(fill='x',pady=2)
+        self.sect_plot_controls(body,data,self.sect_action_handler(sid,dlg,event_only))
+        self.ctk.CTkButton(body,text='Decide later',command=dlg.destroy).pack(pady=8)
+        dlg.lift()
+
+    def show_management_details(self,data):
+        if data['actor']['actor']!=self.controller.selected():return
         dlg=getattr(self,'sect_management_window',None)
         if not dlg or not self.widget_alive(dlg):
-            dlg=self.ctk.CTkToplevel(self.root);self.sect_management_window=dlg;dlg.title('Sect membership and politics');dlg.geometry('930x800');dlg.transient(self.root)
-            self.sect_management_panel=dialog_scroll(self.ctk,dlg);self.sect_management_panel.pack(fill='both',expand=True,padx=10,pady=10)
-        body=self.fresh(self.sect_management_panel)
-        self.section(body,a['name']+' · '+data['role'])
-        self.paragraph(body,f"Standing: {a['standing']} · Spirit Stones: {data['spirit_stones']:,} · Salary: {data['salary']} every 30 active minutes (highest role only).")
-        self.paragraph(body,f"Next salary: {int(data['salary_seconds'])//60}m; voluntary membership-change wait: {int(data['change_seconds'])//60}m.")
+            class PoliticsWindow(self.ctk.CTkToplevel):
+                def destroy(window):
+                    SectPoliticsDashboard.cancel_owned_timers(window)
+                    super().destroy()
+            dlg=PoliticsWindow(self.root);self.sect_management_window=dlg
+            dlg.title('Sect Membership & Politics');dlg.geometry('1100x900');dlg.minsize(600,500);dlg.transient(self.root)
+            self.sect_dashboard=SectPoliticsDashboard(self,dlg)
+        self.sect_dashboard.update(data)
+        dlg.lift()
+
+    def sect_action_handler(self,sid,dlg,event_only):
+        expected=self._political_key[1] if event_only else None
         def act(label,fn,confirm=None):
             if sid!=self.controller.selected():return
             if confirm and not messagebox.askyesno(label,confirm,parent=dlg):return
             def work():
                 def perform():
-                    message=fn()
+                    with storage.world_transaction():
+                        if expected and progress.political_notice(sid)!=expected:
+                            raise logs.SteamError('This political event has changed. Review the current choices.')
+                        message=fn()
                     card=self.controller._view_data(sid)
                     return message,card,progress.sect_management(sid)
                 return self.controller._run(label,perform)
@@ -1728,38 +2156,23 @@ class App:
                 if self.tabs.get()=='Sect':
                     self.show_sect(dict(steamid=sid,c=card['c'],sect=card['c']['sect_status']))
                 self.status.configure(text=message)
-                self.show_sect_management(affairs)
-            self.run_async(label+'…',work,done)
-        self.ctk.CTkButton(body,text='Choose / change sect',command=lambda:self.open_sect_picker()).pack(pady=4)
-        if a['sect_id']:
-            self.ctk.CTkButton(body,text='Leave sect and relinquish position',command=lambda:act('Leave sect',lambda:progress.change_sect(sid,None), 'Leave this sect? You lose your office/mentor, former members lose trust and respect, and the two-hour active-play cooldown begins.')).pack(pady=4)
-        self.section(body,'Mentorship and council appointments')
-        council={v['office']+' · '+v['name']:v for v in data['council'] if v['actor']!=sid}
-        if council:
-            detail=self.ctk.CTkLabel(body,text='',wraplength=800,justify='left');detail.pack(pady=6)
-            def preview(name):
-                v=council[name];detail.configure(text=f"{v['name']} · {v['location']['name']} · Direct disciples {v['disciples']}/{v['capacity']} · Base support chance {v['support_chance']:.0%}. Meet them at the same location to apply or ask for backing.")
-            contact=self.ctk.CTkOptionMenu(body,values=list(council),width=600,command=preview);contact.pack(pady=4);preview(contact.get())
-            self.ctk.CTkButton(body,text='View selected council member',command=lambda:self.inspect_world_actor(council[contact.get()]['actor'])).pack(pady=3)
-            def apply_disciple():
-                mentor = council[contact.get()]['actor']
-                act('Direct disciple application',lambda:progress.apply_direct_disciple(sid,mentor))
-            self.ctk.CTkButton(body,text='Apply as their direct disciple',command=apply_disciple).pack(pady=3)
-            purpose=self.ctk.CTkOptionMenu(body,values=['elder','master']);purpose.pack(pady=3)
-            amount=self.ctk.CTkEntry(body,placeholder_text='Spirit Stone bribe (0 = ordinary request)');amount.insert(0,'0');amount.pack(pady=3)
-            def request_vote():
-                try:stones=int(amount.get())
-                except ValueError:messagebox.showerror('Invalid amount','Enter a whole number of Spirit Stones.',parent=dlg);return
-                voter=council[contact.get()]['actor'];campaign=purpose.get()
-                act('Seek council support',lambda:progress.seek_support(sid,voter,campaign,stones),'An offer can be refused or exposed. Accepted bribes transfer your Spirit Stones; exposure can damage standing.' if stones else None)
-            self.ctk.CTkButton(body,text='Request council support',command=request_vote).pack(pady=4)
-        self.paragraph(body,'Elder: 1,200 standing, suitable strength, an open seat and council backing. Master: eligible elder/guardian, backing and a vacant or acting leadership. A supported candidacy can request an earlier council decision.')
-        for office in ('Elder','Sect Master'):
-            self.ctk.CTkButton(body,text='Apply for '+office,command=lambda role=office:act('Office application',lambda:progress.apply_office(sid,role))).pack(pady=3)
-        if a['mentor']:
-            self.ctk.CTkButton(body,text='Train with mentor (10 active-minute cooldown)',command=lambda:act('Mentor training',lambda:progress.mentor_training(sid))).pack(pady=3)
-            self.ctk.CTkButton(body,text='Claim achievement reward from mentor',command=lambda:act('Mentor reward',lambda:progress.claim_mentor_reward(sid))).pack(pady=3)
-        self.section(body,'Political warning signs')
+                if event_only and not affairs['plot']:
+                    if self.widget_alive(dlg):dlg.destroy()
+                    self.update_political_notice(sid,None)
+                else:
+                    if self.widget_alive(dlg):
+                        self.show_sect_management(affairs,event_only)
+                        if event_only:self.event_feedback.configure(text=message)
+                        else:self.sect_dashboard.text('feedback',message)
+            def show_error(error):
+                if self.widget_alive(dlg):
+                    if event_only:self.event_feedback.configure(text=error,text_color=BAD)
+                    else:self.sect_dashboard.text('feedback',str(error))
+            self.run_async(label+'…',work,done,show_error)
+        return act
+
+    def sect_plot_controls(self,body,data,act):
+        sid=data['actor']['actor']
         plot=data['plot']
         if not plot:self.paragraph(body,'No plot is currently known to you. Private NPC plans are not revealed here.')
         else:
@@ -1770,9 +2183,6 @@ class App:
             if plot['stage']=='conflict':
                 for side in ('Defenders','Challengers'):
                     self.ctk.CTkButton(body,text='Fight for '+side,command=lambda value=side:act('Lethal sect confrontation',lambda:progress.fight_for_sect(sid,value,self.controller.key,self.controller.profiles),'Enter lethal combat? The loser has a 15% chance of death. You can instead negotiate, withdraw, or remain out of the fighting.')).pack(pady=3)
-        for event in data['reports']:
-            self.paragraph(body,storage.calendar_text(event['day'])+' · '+event['title']+'\n'+event['summary'])
-        self.ctk.CTkButton(body,text='Refresh sect affairs',command=self.open_sect_management).pack(pady=12)
 
     def refresh_sect(self):
         if self.working:
@@ -1841,14 +2251,36 @@ class App:
         self.run_async("On a sect mission…", lambda: self.controller.sect_mission(offer_id), done)
 
     # -- living world and shared chronicle -------------------------------------
+    def clock_time(self):
+        now=self._pause_started if self._pause_started is not None else storage.active_play_time()
+        return now-self._paused_seconds
+
+    def toggle_world_pause(self):
+        if not getattr(self.controller,'world_clock',None):return
+        now=storage.active_play_time()
+        if self._pause_started is None:
+            self._pause_started=now
+            self.pause_button.configure(text='Resume simulation')
+        else:
+            self._paused_seconds+=now-self._pause_started
+            self._pause_started=None
+            self.pause_button.configure(text='Pause simulation')
+        if hasattr(self,'_displayed_world_day'):self.show_world_clock({'day':getattr(self,'_clock_day',self._displayed_world_day)})
+
     def build_world_tabs(self):
         ctk = self.ctk
         self.world_views = ctk.CTkTabview(self.tabs.tab('World'),command=self.social_tab_changed)
         self.encounter_notice=ctk.CTkButton(self.tabs.tab('World'),text='Travel encounters: none pending',state='disabled',command=lambda:self.show_encounter(getattr(self,'_encounter',None)))
-        self.encounter_notice.pack(fill='x',padx=12,pady=4)
+        clock_bar=ctk.CTkFrame(self.tabs.tab('World'),fg_color='transparent')
+        clock_bar.pack(fill='x',padx=12,pady=4)
+        self.pause_button=ctk.CTkButton(clock_bar,text='Pause simulation',command=self.toggle_world_pause)
+        self.pause_button.pack(side='right',padx=(6,0))
+        self.encounter_notice.pack(in_=clock_bar,side='left',fill='x',expand=True)
+        self.rite_notice=ctk.CTkLabel(self.tabs.tab('World'),text='',text_color=ACCENT)
         self.world_views.pack(fill='both',expand=True)
-        for label in ('People here','Population','Map','Leadership','Relationships'): self.world_views.add(label)
+        for label in ('People here','Population','Map','Leadership','Campaigns','Relationships'): self.world_views.add(label)
         self.build_region_tabs()
+        self.build_campaign_tab()
         tab = self.world_views.tab('Population')
         self.world_page = 0
         self.world_header = ctk.CTkLabel(tab,text='Preparing the living world…',font=self.head_font,text_color=ACCENT)
@@ -1867,13 +2299,17 @@ class App:
         controls = ctk.CTkFrame(tab,fg_color='transparent');controls.pack(fill='x',padx=12,pady=8)
         self.chronicle_search = ctk.CTkEntry(controls,placeholder_text='Search event, location or sect',width=280)
         self.chronicle_search.pack(side='left',padx=(0,8))
-        self.chronicle_kind = ctk.CTkOptionMenu(controls,values=['All','calendar','world','breakthrough','death','war','inheritance','politics'],width=140)
+        self.chronicle_kind = ctk.CTkOptionMenu(controls,values=['All','calendar','world','breakthrough','death','war','ascension','inheritance','politics'],width=140)
         self.chronicle_kind.pack(side='left',padx=8)
         ctk.CTkButton(controls,text='Search',width=80,command=lambda:self.refresh_chronicle(reset=True)).pack(side='left')
-        ctk.CTkButton(controls,text='Next',width=70,command=lambda:self.change_chronicle_page(1)).pack(side='right',padx=4)
-        ctk.CTkButton(controls,text='Previous',width=80,command=lambda:self.change_chronicle_page(-1)).pack(side='right',padx=4)
+        ctk.CTkButton(controls,text='Refresh',width=80,command=self.refresh_chronicle).pack(side='left',padx=4)
+        self.chronicle_next=ctk.CTkButton(controls,text='Next',width=70,state='disabled',command=lambda:self.change_chronicle_page(1))
+        self.chronicle_next.pack(side='right',padx=4)
+        self.chronicle_prev=ctk.CTkButton(controls,text='Previous',width=80,state='disabled',command=lambda:self.change_chronicle_page(-1))
+        self.chronicle_prev.pack(side='right',padx=4)
         self.chronicle_count = ctk.CTkLabel(tab,text='Major public events and rumors; hidden discoveries remain secret.',font=self.small_font)
         self.chronicle_count.pack()
+        self.root.after(5000,self.poll_visible_history)
         self.chronicle_panel = WorldCardList(tab,self);self.chronicle_panel.pack(fill='both',expand=True)
 
     def begin_world(self):
@@ -1893,10 +2329,27 @@ class App:
                        lambda message:self.world_header.configure(text='World could not start: '+message))
 
     def show_world_clock(self,world):
+        self._clock_day=world['day']
         self._displayed_world_day = int(world['day'])
         caption = storage.calendar_text(world['day']) + ' · 1 day / 5 minutes · time pauses when closed'
-        self.world_header.configure(text=caption)
-        self.version_label.configure(text=gamedata.VERSION+'   ·   '+storage.calendar_text(world['day']))
+        target=world.get('skip_until') or getattr(self,'_skip_target',None)
+        self._skip_target=target if target and target>world['day']+1e-7 else None
+        if self._skip_target:
+            percent=max(0,min(99,int((1-self._skip_target+world['day'])*100)))
+            def clock_text(day):
+                minutes=int((day%1)*1440)
+                return f"{storage.calendar_text(day)} {minutes//60:02}:{minutes%60:02}"
+            journey=f'{clock_text(world["day"])}  →  {clock_text(target)} ({percent}%)'
+            caption='Cultivation · '+journey
+        queued = round(max(0,world.get('pending_seconds',0))/world.get('seconds_per_day',storage.SECONDS_PER_DAY),1)
+        self._displayed_backlog = queued
+        if queued and not self._skip_target:
+            caption += f' · Catching up: {queued:.1f} days queued'
+        if self.world_header.cget('text')!=caption:self.world_header.configure(text=caption)
+        text=gamedata.VERSION+'   ·   '+storage.calendar_text(world['day'])
+        if self._skip_target:text=gamedata.VERSION+'   ·   '+journey
+        if getattr(self,'_pause_started',None) is not None:text+='   ·   Simulation paused'
+        if self.version_label.cget('text')!=text:self.version_label.configure(text=text)
 
     def world_tick(self):
         if getattr(self,'_closing',False): return
@@ -1904,29 +2357,76 @@ class App:
         if self.working or not hasattr(self.controller,'world_clock'):
             self.root.after(1000,self.world_tick);return
         self._world_tick_running = True
+        editor=getattr(self,'developer_window',None)
+        editor_open=bool(editor and self.widget_alive(editor))
+        self._editor_clock_paused=editor_open
         nearby_revision=getattr(self,'_people_request_revision',0)
         nearby_request=(self.controller.selected(),self.nearby_search.get(),self.nearby_page) if hasattr(self,'world_views') and self.tabs.get()=='World' and self.world_views.get()=='People here' else None
+        if nearby_request:
+            now_mono=time.monotonic()
+            if nearby_request==getattr(self,'_last_nearby_poll',None) and now_mono<self._next_nearby_poll:
+                nearby_request=None
+            else:
+                self._last_nearby_poll=nearby_request
+                self._next_nearby_poll=now_mono+1
+        viewer=self.controller.selected()
+        check_politics=hasattr(self,'political_button') and viewer and not editor_open and (viewer!=getattr(self,'_political_viewer',None) or time.monotonic()>=getattr(self,'_next_political_check',0))
+        if check_politics:
+            self._political_viewer=viewer
+            self._next_political_check=time.monotonic()+2
+        read_armies=hasattr(self,'world_views') and self.tabs.get()=='World' and self.world_views.get()=='Map'
+        manual=getattr(self,'_pause_started',None) is not None
+        now=self.clock_time() if hasattr(self,'_pause_started') else storage.active_play_time()
         def worker():
             try:
-                result=self.controller.world_clock.tick()
+                result=self.controller.world_clock.tick(now,paused=editor_open or manual,bank_elapsed=manual and not editor_open)
+                if check_politics:
+                    result['political_notice']=(viewer,progress.political_notice(viewer))
+                if read_armies:
+                    import warfare
+                    result['armies']=warfare.map_armies()
                 if nearby_request and nearby_request[0]:
-                    result['nearby']=(nearby_request,storage.people_here(*nearby_request))
+                    result['nearby']=(nearby_request,storage.people_here(*nearby_request,True))
                     result['nearby_revision']=nearby_revision
                 self.events.put(('world_clock',result,None))
             except Exception as exc:
                 self.events.put(('world_clock',None,str(exc)))
-        threading.Thread(target=worker,daemon=True).start()
+        threading.Thread(target=worker,daemon=True,name='World simulation').start()
 
     def finish_world_tick(self,world,error):
         self._world_tick_running = False
+        try:
+            self.display_world_tick(world,error)
+        finally:
+            if not getattr(self,'_closing',False):
+                delay = 5000 if error else 1000
+                if not error and not world.get('encounter') and world.get('pending_seconds',0)>1e-6 and getattr(self,'_pause_started',None) is None and not getattr(self,'_editor_clock_paused',False):
+                    # Cultivation is foreground work. Older backlog still drains,
+                    # with a small breathing space between bounded worker batches.
+                    delay = 10 if (world.get('skip_until') or 0)>world.get('day',0)+1e-7 else 50
+                self.root.after(delay,self.world_tick)
+
+    def display_world_tick(self,world,error):
         if error:
             self.world_header.configure(text='World paused: '+error)
-        elif int(world['day']) != getattr(self,'_displayed_world_day',None):
+        elif (int(world['day'])!=getattr(self,'_displayed_world_day',None)
+              or getattr(self,'_skip_target',None) or (world.get('skip_until') or 0)>world['day']
+              or round(max(0,world.get('pending_seconds',0))/world.get('seconds_per_day',storage.SECONDS_PER_DAY),1)!=getattr(self,'_displayed_backlog',None)):
             self.show_world_clock(world)
         if not error:
+            if 'political_notice' in world and hasattr(self,'political_button'):
+                self.update_political_notice(*world['political_notice'])
+            if 'cultivation_cooldown' in world and hasattr(self,'cultivate_button'):
+                self.show_training_cooldown(world['cultivation_cooldown'])
             if world.get('nearby') and self.tabs.get()=='World' and self.world_views.get()=='People here':
                 request,data=world['nearby']
                 if request==(self.controller.selected(),self.nearby_search.get(),self.nearby_page) and world.get('nearby_revision',0)==getattr(self,'_people_request_revision',0):self.show_people(data)
+            if hasattr(self,'rite_notice') and 'ritual_notice' in world:
+                text=world['ritual_notice']
+                if self.rite_notice.cget('text')!=text:
+                    self.rite_notice.configure(text=text)
+                    if text:self.rite_notice.pack(fill='x',before=self.world_views)
+                    else:self.rite_notice.pack_forget()
             encounter=world.get('encounter')
             self._encounter=encounter
             if hasattr(self,'encounter_notice'):
@@ -1937,11 +2437,10 @@ class App:
             if encounter and not getattr(self,'_shown_encounter',None)==encounter['id']:
                 self._shown_encounter=encounter['id'];self.show_encounter(encounter)
         if not error and getattr(self,'_map_view',None):
+            if 'armies' in world and world['armies']['day']>=self._map_view.get('armies',{}).get('day',0):
+                self._map_view['armies']=world['armies']
             self._map_view['day'] = world['day']
             if self.tabs.get()=='World' and self.world_views.get()=='Map': self.draw_region()
-        if not getattr(self,'_closing',False):
-            self.root.after(5000 if error else 10 if world.get('pending_seconds',0)>1e-6 else 1000,self.world_tick)
-
     def close_world(self):
         self._closing = True
         if self.working or getattr(self,'_world_tick_running',False):
@@ -1952,8 +2451,10 @@ class App:
                 self._closing = False
                 self.status.configure(text='Could not finish saving: '+message,text_color=BAD)
                 self.root.after(1000,self.world_tick)
+            manual=getattr(self,'_pause_started',None) is not None
+            now=self.clock_time()
             def finish():
-                result=clock.tick()
+                result=clock.tick(now,paused=manual,bank_elapsed=manual)
                 clock.close()
                 return result
             self.run_async('Saving the world…',lambda:self.controller._run('close world',finish),
@@ -1962,6 +2463,7 @@ class App:
             self.destroy_app()
 
     def destroy_app(self):
+        if hasattr(self,"_stop_monitor"):self._stop_monitor.set()
         for job in self.root.tk.splitlist(self.root.tk.call('after','info')):
             try:self.root.tk.call('after','cancel',job)
             except self.tk.TclError:pass
@@ -1993,6 +2495,7 @@ class App:
         self.map_notice.pack(fill='x',padx=10,pady=4)
         self.map_canvas=self.tk.Canvas(tab,bg='#1d252c',highlightthickness=0)
         self.map_canvas.pack(fill='both',expand=True,padx=8,pady=4)
+        self.map_canvas.tag_bind('site','<Button-1>',self.map_site_hit)
         self.map_canvas.bind('<Configure>',lambda e:self.draw_region())
         bar=self.ctk.CTkFrame(tab);bar.pack(fill='x')
         self.map_go=self.ctk.CTkButton(bar,text='Travel to destination',state='disabled',command=self.start_map_travel)
@@ -2000,6 +2503,14 @@ class App:
         self.ctk.CTkButton(bar,text='Refresh map',command=self.refresh_region).pack(side='left',padx=8)
         self.route_policy=self.ctk.CTkOptionMenu(bar,values=['Fastest','Safer'],command=lambda value:self.draw_region())
         self.route_policy.pack(side='left',padx=8)
+        army_bar=self.ctk.CTkFrame(tab,fg_color='transparent');army_bar.pack(fill='x',padx=8)
+        self.army_menu=self.ctk.CTkOptionMenu(army_bar,values=['No armies in the field'],command=self.choose_army,width=175,dynamic_resizing=False)
+        self.army_menu.pack(side='left',padx=(0,8))
+        self.army_hint=self.ctk.CTkLabel(army_bar,text='A: attackers   D: defenders   ·   Select a flag to set a travel destination.',anchor='w',wraplength=720)
+        self.army_hint.pack(side='left',fill='x',expand=True)
+        self._army_items={};self._army_hits={};self._army_places={}
+        self.map_canvas.tag_bind('army','<Enter>',self.army_hit)
+        self.map_canvas.tag_bind('army','<Button-1>',lambda event:self.army_hit(event,True))
         self.map_destination=None
         tab=self.world_views.tab('Leadership')
         self.sect_selector=self.ctk.CTkOptionMenu(tab,values=['Preparing sects…'],command=lambda value:self.refresh_leadership(reset=True))
@@ -2043,6 +2554,7 @@ class App:
         if view=='People here':self.refresh_people()
         elif view=='Population':self.refresh_world()
         elif view=='Relationships':self.refresh_relationships()
+        elif view=='Campaigns':self.refresh_campaigns()
         else:self.refresh_region()
 
     def refresh_region(self):
@@ -2050,19 +2562,107 @@ class App:
         sid=self.controller.selected()
         def done(view):
             if sid==self.controller.selected():self.show_region(view)
-        self.run_async('Reading region…',lambda:progress.region_view(sid),done)
+        include_armies=self.world_views.get()=='Map'
+        def read():
+            view=progress.region_view(sid)
+            if include_armies:
+                import warfare
+                view['armies']=warfare.map_armies()
+            return view
+        self.run_async('Reading region…',read,done)
 
     def show_region(self,view):
         self._map_view=view
-        names={r['name']:r['sect_id'] for r in view['locations'] if r['sect_id']}
+        viewer_sect = view.get('viewer_sect')
+        names = {
+            row['name'] + (' (your sect)' if row['sect_id'] == viewer_sect else ''): row['sect_id']
+            for row in view['locations'] if row['sect_id']
+        }
         self._region_sects=names
         if names:
             old=self.sect_selector.get()
             choices=sorted(names)
             if self.sect_selector.cget('values')!=choices:self.sect_selector.configure(values=choices)
-            if old not in names:self.sect_selector.set(choices[0])
+            context=(view.get('viewer'),view.get('viewer_sect'))
+            if old not in names or context!=getattr(self,'_leadership_context',None):
+                self.sect_selector.set(next((name for name in choices if names[name]==context[1]),choices[0]))
+                self.roster_page=0
+            self._leadership_context=context
         self.draw_region()
         if self.world_views.get()=='Leadership':self.refresh_leadership()
+
+    def draw_armies(self,view,places,point,reset=False):
+        snapshot=view.get('armies',{})
+        groups=snapshot.get('groups',[])
+        day=snapshot.get('day',view['day'])
+        key=(self.map_canvas.winfo_width(),self.map_canvas.winfo_height(),groups,
+             day if any(g['path'] for g in groups) else None)
+        if not reset and key==getattr(self,'_army_key',None):return
+        self._army_key=key
+        cv=self.map_canvas
+        if reset:self._army_items={}
+        edges={frozenset((r['a'],r['b'])):r['seconds'] for r in view['routes']}
+        markers={};choices={}
+        for g in groups:
+            target=g['location']
+            x,y=point(target)
+            if g['path']:
+                path=json.loads(g['path']);target=path[-1]
+                lengths=[edges[frozenset(pair)] for pair in zip(path,path[1:])]
+                fraction=max(0,min(1,(day-g['departure'])/max(1e-12,g['arrival']-g['departure'])))
+                left=fraction*sum(lengths)
+                for (a,b),length in zip(zip(path,path[1:]),lengths):
+                    x1,y1=point(a);x2,y2=point(b);k=min(1,left/length)
+                    x,y=x1+(x2-x1)*k,y1+(y2-y1)*k
+                    if left<=length:break
+                    left-=length
+                at='En route to '+places[target]['name']
+            else:at='At '+places[target]['name']
+            side='Attackers' if g['side']=='A' else 'Defenders'
+            label=f"{g['sect']} · {side} · {at} (war {g['campaign']})"
+            choices[label]=target
+            bucket=(label,round(x/10),round(y/10))
+            if bucket not in markers:markers[bucket]=[x,y,0,g['side'],label,target]
+            markers[bucket][2]+=g['troops']
+        if choices!=self._army_places:
+            self.army_hint.configure(text='A: attackers   D: defenders   ·   Select a flag to set a travel destination.' if choices else 'No active field armies.')
+        self._army_places=choices
+        options=sorted(choices) or ['No armies in the field']
+        if tuple(options)!=getattr(self,'_army_options',()):
+            self.army_menu.configure(values=options,state='normal' if choices else 'disabled')
+            self.army_menu.set('Find an army' if choices else options[0])
+            self._army_options=tuple(options)
+        used={};self._army_hits={}
+        for bucket in self._army_items.keys()-markers.keys():
+            for item in self._army_items.pop(bucket):cv.delete(item)
+        for key,(x,y,count,side,label,target) in markers.items():
+            cell=(round(x/24),round(y/14))
+            n=used.get(cell,0);used[cell]=n+1
+            # Leaders point back to the actual road/site even when flags stack.
+            bx=max(17,min(cv.winfo_width()-17,x+14));by=max(9,min(cv.winfo_height()-9,y-13+n*17))
+            if key not in self._army_items:
+                color='#f4a677' if side=='A' else '#85c5fa'
+                self._army_items[key]=(cv.create_line(0,0,0,0,fill=color,tags='army'),
+                    cv.create_rectangle(0,0,0,0,fill='#181d24',outline=color,tags='army'),
+                    cv.create_text(0,0,fill=color,font=('Arial',8,'bold'),tags='army'))
+            line,flag,text=self._army_items[key]
+            cv.coords(line,x,y,bx,by);cv.coords(flag,bx-15,by-7,bx+15,by+7);cv.coords(text,bx,by)
+            cv.itemconfigure(text,text=f'{side} {count}')
+            for item in (line,flag,text):self._army_hits[item]=(label,target,count)
+
+    def army_hit(self,event,select=False):
+        current=self.map_canvas.find_withtag('current')
+        hit=self._army_hits.get(current[0]) if current else None
+        if hit:
+            label,target,count=hit
+            if select:self.select_destination(target)
+            self.army_hint.configure(text=f'{label} · {count} troops at this marker')
+
+    def choose_army(self,label):
+        target=self._army_places.get(label)
+        if target:
+            self.select_destination(target)
+            self.army_hint.configure(text=label)
 
     def draw_region(self):
         import json
@@ -2071,27 +2671,42 @@ class App:
         canvas=self.map_canvas
         key=(canvas.winfo_width(),canvas.winfo_height(),view['locations'],view['routes'],view['location'],
              view['journey'],view['day'] if view['journey'] else None,self.route_policy.get(),self.map_destination)
-        if key==getattr(self,'_drawn_region',None):return
-        self._drawn_region=key
-        canvas.delete('all')
+        redraw=key!=getattr(self,'_drawn_region',None)
         sx=max(1,canvas.winfo_width())/1050;sy=max(1,canvas.winfo_height())/760
         places={r['id']:r for r in view['locations']}
         def point(sid):
             r=places[sid];return r['x']*sx,r['y']*sy
-        for i,(name,color,_) in enumerate(gamedata.REGION_DISTRICTS):
-            group=[r for r in places.values() if r['district']==i]
-            x1=min(r['x'] for r in group)-35;y1=min(r['y'] for r in group)-30
-            x2=max(r['x'] for r in group)+35;y2=max(r['y'] for r in group)+35
-            canvas.create_rectangle(x1*sx,y1*sy,x2*sx,y2*sy,fill=color,outline='')
-            canvas.create_text((x1+10)*sx,(y1+8)*sy,text=name,anchor='w',fill='#d4dfd5',font=('Arial',9,'bold'))
-        for road in view['routes']:
-            canvas.create_line(*point(road['a']),*point(road['b']),fill='#c18a67' if road['danger']>=2 else '#728798',width=2,dash=(4,3) if road['danger']>=2 else ())
-        for sid,r in places.items():
-            x,y=point(sid);tag='place:'+sid
-            canvas.create_oval(x-6,y-6,x+6,y+6,fill='#e3be71' if r['sect_id'] else '#b0d6d1',outline='#ffffff' if sid==self.map_destination else '',tags=tag)
-            label=r['name'] if len(r['name'])<24 else r['name'][:21]+'…'
-            canvas.create_text(x,y+13,text=label,fill='#f0f1ec',font=('Arial',8),tags=tag)
-            canvas.tag_bind(tag,'<Button-1>',lambda e,d=sid:self.select_destination(d))
+        if not redraw:
+            self.draw_armies(view,places,point)
+            return
+        self._drawn_region=key
+        base_key=(key[0],key[1],view['locations'],view['routes'])
+        rebuild=base_key!=getattr(self,'_map_base_key',None)
+        if rebuild:
+            self._map_base_key=base_key
+            canvas.delete('all')
+            for i,(name,color,_) in enumerate(gamedata.REGION_DISTRICTS + gamedata.FRONTIER_DISTRICTS):
+                group=[r for r in places.values() if r['district']==i]
+                if not group:continue
+                x1=min(r['x'] for r in group)-35;y1=min(r['y'] for r in group)-30
+                x2=max(r['x'] for r in group)+35;y2=max(r['y'] for r in group)+35
+                canvas.create_rectangle(x1*sx,y1*sy,x2*sx,y2*sy,fill=color,outline='')
+                canvas.create_text((x1+10)*sx,(y1+8)*sy,text=name,anchor='w',fill='#d4dfd5',font=('Arial',9,'bold'))
+            for road in view['routes']:
+                canvas.create_line(*point(road['a']),*point(road['b']),fill='#c18a67' if road['danger']>=2 else '#728798',width=2,dash=(4,3) if road['danger']>=2 else ())
+            for sid,r in places.items():
+                x,y=point(sid);tag='place:'+sid
+                canvas.create_oval(x-6,y-6,x+6,y+6,fill='#bd94eb' if r.get('mine')=='Large' else '#e3be71' if r['sect_id'] else '#b0d6d1',outline='#ffffff' if sid==self.map_destination else '',tags=(tag,'site'))
+                label=r['name'] if len(r['name'])<24 else r['name'][:21]+'…'
+                canvas.create_text(x,y+13,text=label,fill='#f0f1ec',font=('Arial',8),tags=(tag,'site'))
+        elif getattr(self,'_highlighted_site',None)!=self.map_destination:
+            previous=getattr(self,'_highlighted_site',None)
+            for sid,color in ((previous,''),(self.map_destination,'#ffffff')):
+                if sid:
+                    items=canvas.find_withtag('place:'+sid)
+                    if items:canvas.itemconfigure(items[0],outline=color)
+        self._highlighted_site=self.map_destination
+        canvas.delete('viewer_position')
         location=view['location'];journey=view['journey']
         travelling=journey and view['day']<journey['arrival']
         if journey:
@@ -2106,11 +2721,17 @@ class App:
                     duration=edges[frozenset((a,b))]*journey_total/road_total
                     if elapsed<=duration:
                         ax,ay=point(a);bx,by=point(b);ratio=elapsed/duration
-                        canvas.create_oval(ax+(bx-ax)*ratio-7,ay+(by-ay)*ratio-7,ax+(bx-ax)*ratio+7,ay+(by-ay)*ratio+7,fill='#ffffff',outline='#54dbe2',width=3)
+                        canvas.create_oval(ax+(bx-ax)*ratio-7,ay+(by-ay)*ratio-7,ax+(bx-ax)*ratio+7,ay+(by-ay)*ratio+7,fill='#ffffff',outline='#54dbe2',width=3,tags='viewer_position')
                         break
                     elapsed-=duration
         if location and not travelling:
-            x,y=point(location);canvas.create_oval(x-10,y-10,x+10,y+10,outline='#54dbe2',width=3)
+            x,y=point(location);canvas.create_oval(x-10,y-10,x+10,y+10,outline='#54dbe2',width=3,tags='viewer_position')
+        self.draw_armies(view,places,point,reset=rebuild)
+        site=places.get(self.map_destination,{})
+        resource=(f" · {site['mine']} mine · {site['owner'] or 'Local wardens'} · {site['yield_stones']:,} stones / 2h" if site.get('mine') else '')
+        if self.map_destination in gamedata.PUBLIC_SITES:resource+=' · Public Pavilion'
+        if site.get('strategic') in ('Pass','Headquarters'):
+            resource+=f" · {site['strategic']} held by {site['controller']}"
         if travelling:
             seconds=max(0,int((journey['arrival']-view['day'])*view['seconds_per_day'])+1)
             self.map_notice.configure(text=f'Travelling to {places[json.loads(journey["path"])[-1]]["name"]} · {seconds}s remaining · progress saves and pauses when closed')
@@ -2118,11 +2739,17 @@ class App:
         elif self.map_destination and location:
             preview=dict(view,location=location)
             plan=progress.route_plan(preview,self.map_destination,safe=self.route_policy.get()=='Safer')
-            self.map_notice.configure(text=f'{places[self.map_destination]["name"]} · {plan["seconds"]} seconds total · {len(plan["path"])-1} road segments · route danger {plan["danger"]}/3 · possible road encounter; choices pause the world')
+            self.map_notice.configure(text=f'{places[self.map_destination]["name"]} · {plan["seconds"]} seconds total · {len(plan["path"])-1} road segments · route danger {plan["danger"]}/3 · possible road encounter{resource}')
             self.map_go.configure(state='normal' if plan['seconds'] else 'disabled')
         else:
-            self.map_notice.configure(text='Click a location to preview its route. Gold: sect headquarters · Teal: landmarks · White: your cultivator')
+            self.map_notice.configure(text=site['name']+resource if site else 'Select a site · Gold: sect seat and home mine · Violet: large mine · Teal: landmark · White: your cultivator')
             self.map_go.configure(state='disabled')
+
+    def map_site_hit(self,event):
+        for tag in self.map_canvas.gettags('current'):
+            if tag.startswith('place:'):
+                self.select_destination(tag[6:])
+                return
 
     def select_destination(self,destination):
         self.map_destination=destination;self.draw_region()
@@ -2135,6 +2762,67 @@ class App:
             return progress.begin_journey(sid,destination,safe=safe)
         self.run_async('Starting journey…',lambda:self.controller._run('travel',act),self.show_region)
 
+    def build_campaign_tab(self):
+        tab=self.world_views.tab('Campaigns')
+        tools=self.ctk.CTkFrame(tab,fg_color='transparent')
+        tools.pack(fill='x',pady=4)
+        self.campaign_action=self.ctk.CTkOptionMenu(tools,values=['Orders'],command=self.choose_campaign_action,width=146)
+        self.campaign_action.pack(side='left',padx=3)
+        self.campaign_target=self.ctk.CTkOptionMenu(tools,values=['Select a campaign'],width=280,dynamic_resizing=False)
+        self.campaign_target.pack(side='left',padx=3)
+        self.campaign_go=self.ctk.CTkButton(tools,text='Issue order',width=88,command=self.issue_campaign_order)
+        self.campaign_go.pack(side='left',padx=3)
+        self.ctk.CTkButton(tools,text='Refresh',width=76,command=self.refresh_campaigns).pack(side='right',padx=3)
+        self.campaign_list=WorldCardList(tab,self)
+        self.campaign_list.pack(fill='both',expand=True)
+        self.campaign_options={}
+        self.campaign_viewer=None
+
+    def choose_campaign_action(self,action):
+        targets=self.campaign_options.get(action,{})
+        values=list(targets) or ['No orders available']
+        old=self.campaign_target.get()
+        self.campaign_target.configure(values=values)
+        self.campaign_target.set(old if old in values else values[0])
+        self.campaign_go.configure(state='normal' if targets else 'disabled')
+
+    def refresh_campaigns(self):
+        import warfare
+        if self.defer_world_refresh('Campaigns'):return
+        sid=self.controller.selected()
+        def done(board):
+            if sid!=self.controller.selected() or self.tabs.get()!='World' or self.world_views.get()!='Campaigns':return
+            self.campaign_viewer=sid
+            self.campaign_options=board['options']
+            actions=list(self.campaign_options) or ['Orders']
+            current=self.campaign_action.get()
+            self.campaign_action.configure(values=actions)
+            self.campaign_action.set(current if current in actions else actions[0])
+            self.choose_campaign_action(self.campaign_action.get())
+            self.campaign_list.show(board['rows'],('campaign',sid))
+        self.run_async('Reading campaigns…',lambda:warfare.dashboard(sid),done)
+
+    def issue_campaign_order(self):
+        import warfare
+        sid=self.controller.selected()
+        action=self.campaign_action.get()
+        label=self.campaign_target.get()
+        order=self.campaign_options.get(action,{}).get(label)
+        if not order or not sid or sid!=self.campaign_viewer:return
+        if action in ('Concede','Override council','Challenge','Propose campaign','Offer peace','Accept peace'):
+            effects={'Override council':'Mobilization costs 600 Spirit Stones. Overruling a failed vote costs 30 council confidence and respect.',
+                     'Propose campaign':'A successful majority vote mobilizes your army for 600 Spirit Stones.',
+                     'Challenge':'This is a lethal duel. Either combatant can die.',
+                     'Concede':'This accepts the opposing side’s terms and ends the campaign.',
+                     'Offer peace':'If accepted, these terms settle the current objective immediately.',
+                     'Accept peace':'Ratifying the proposed terms ends the campaign immediately.'}
+            if not messagebox.askyesno(action,f"{label}\n\n{effects[action]}",parent=self.root):return
+        value,campaign=order
+        def done(message):
+            self.status.configure(text=message)
+            self.refresh_campaigns()
+        self.run_async(action+'…',lambda:self.controller._run(action,lambda:warfare.command(sid,action,value,campaign,self.controller.key,self.controller.profiles)),done)
+
     def change_roster_page(self,delta):
         self.roster_page=max(0,self.roster_page+delta);self.refresh_leadership()
 
@@ -2144,9 +2832,10 @@ class App:
         sect=getattr(self,'_region_sects',{}).get(self.sect_selector.get())
         if not sect:return
         page=self.roster_page
+        viewer=self.controller.selected()
         def done(data):
-            if self.tabs.get()=='World' and self.world_views.get()=='Leadership' and page==self.roster_page and sect==getattr(self,'_region_sects',{}).get(self.sect_selector.get()):self.show_leadership(data)
-        self.run_async('Reading sect leadership…',lambda:storage.sect_roster(sect,page),done)
+            if self.tabs.get()=='World' and self.world_views.get()=='Leadership' and viewer==self.controller.selected() and page==self.roster_page and sect==getattr(self,'_region_sects',{}).get(self.sect_selector.get()):self.show_leadership(data)
+        self.run_async('Reading sect leadership…',lambda:storage.sect_roster(sect,page,viewer),done)
 
     def switch_leadership(self,mode):
         self.leader_panel.pack_forget();self.council_chart.pack_forget();self.roster_controls.pack_forget()
@@ -2163,12 +2852,14 @@ class App:
             return
         entries=[(f'{sect} · {data["total"]} members','Offices are separate from reputation ranks. Use the Sect tab for applications, mentorship and political intervention.',())]
         for row in data['leaders']:
-            entries.append((row['name'],row['office']+(' · Deceased (office vacant)' if row['dead'] else ''),(('View / Talk',row['actor']),)))
+            entries.append((row['name'],'Office: '+row['office']+(' · Deceased (office vacant)' if row['dead'] else ''),(('View / Talk',row['actor']),)))
         entries.append((f'Membership · Page {self.roster_page+1}','',()))
         for row in data['members']:
-            detail=row['office']+(' · Deceased' if row['dead'] else '')
-            if row['mentor_name']:detail+=' · Direct disciple of '+row['mentor_name']
-            entries.append((row['name'],detail,(('View / Talk',row['actor']),)))
+            detail='Sect rank: '+display_rank(row['rank']) if row.get('rank') else 'Sect: '+sect
+            if row['office']!='Member':detail+='    |    Office: '+row['office']
+            if row['mentor_name']:detail+='    |    Direct disciple of '+row['mentor_name']
+            if row['dead']:detail+='    |    Deceased'
+            entries.append((row['name']+(' · You' if row['actor']==self.controller.selected() else ''),detail,((('View' if row['actor']==self.controller.selected() else 'View / Talk'),row['actor']),)))
         self.leader_panel.show(entries,(sect,self.roster_page))
 
     def change_relationship_page(self,delta):
@@ -2188,7 +2879,7 @@ class App:
         if self.relationship_count.cget('text')!=header:self.relationship_count.configure(text=header)
         entries=[]
         for row in rows:
-            details=f'Trust {row["trust"]} · Respect {row["respect"]} · Fear {row["fear"]} · Hostility {row["hostility"]} · Last known: {row["known_location"] or "Unknown"}'
+            details=f'Trust: {row["trust"]}    |    Respect: {row["respect"]}    |    Fear: {row["fear"]}    |    Hostility: {row["hostility"]}\nLast known location: {row["known_location"] or "Unknown"}'
             if row.get('memory'):details+='\nKnown deed: '+row['memory']
             entries.append((row['name'],details,(('View / Talk',row['npc']),)))
         self.relationship_panel.show(entries or [('No acquaintances on this page','Speak to a cultivator in People here to begin a relationship.',())],(self.controller.selected(),self.relationship_page))
@@ -2204,7 +2895,7 @@ class App:
         context=(sid,query,page)
         def done(data):
             if revision==self._people_request_revision and context==self.people_context() and self.tabs.get()=='World' and self.world_views.get()=='People here':self.show_people(data)
-        self.run_async('Reading nearby cultivators…',lambda:storage.people_here(sid,query,page),done)
+        self.fetch_view('World',('People here',revision),lambda:storage.people_here(sid,query,page,True),done)
 
     def page_people(self,delta):
         self.nearby_page=max(0,self.nearby_page+delta);self.refresh_people()
@@ -2233,11 +2924,7 @@ class App:
         panel=self.people_panel
         header=f'{data["where"]} · {data["total"]} available cultivators · Page {self.nearby_page+1}'
         if self.nearby_header.cget('text')!=header:self.nearby_header.configure(text=header)
-        entries=[]
-        for person in data['people']:
-            detail=person['sect'] or 'Wanderer'
-            if person.get('role') not in (None,'Member','Unaffiliated'):detail+=' · '+person['role']
-            entries.append((person['name'],detail+' · '+person['activity'],(('View / Talk',person['id']),)))
+        entries=[npc_list_entry(person,data['where']) for person in data['people']]
         if not entries:
             message='No living NPCs are available here on this page. Try another location or clear the filter.'
             if data['state']=='deceased':message='Seek rebirth through Adventure before meeting people again.'
@@ -2281,7 +2968,7 @@ class App:
             def work():
                 result=progress.resolve_encounter(encounter['id'],choice,self.controller.key,self.controller.profiles)
                 clock=getattr(self.controller,'world_clock',None)
-                if clock:clock.last=storage.active_play_time()
+                if clock:clock.last=self.clock_time()
                 return result
             def done(result):
                 if self.widget_alive(dlg):dlg.destroy()
@@ -2307,13 +2994,7 @@ class App:
         rows,total=result
         header=f'{total:,} cultivators · Page {self.world_page+1} of {max(1,(total+49)//50)} · 50 per page'
         if self.world_count.cget('text')!=header:self.world_count.configure(text=header)
-        entries=[]
-        for actor in rows:
-            title=f"{actor['name']} · {actor['realm']} · Power {actor['power']:,}"
-            details=f"{actor['sect']} · {actor['role']}"
-            if actor['rank']:details+=' · Standing: '+actor['rank']
-            details+=f"\n{actor['activity']} · {actor['location']}"
-            entries.append((title,details,(('View / Talk',actor['id']),)))
+        entries=[npc_list_entry(actor) for actor in rows]
         self.world_panel.show(entries or [('No cultivators on this page','Try a different search or the previous page.',())],(self.world_search.get().strip(),self.world_page))
 
     def inspect_world_actor(self,sid):
@@ -2322,7 +3003,8 @@ class App:
                 info,_,_,c=generator.build_cultivator(sid,self.controller.key,self.controller.profiles)
                 player=self.controller.selected()
                 c['talk_reason']='Select your own cultivator first.'
-                if player:
+                if player==sid:c['talk_reason']='This is your own cultivator.'
+                elif player:
                     try:
                         storage.require_physical(player,others=(sid,))
                         c['talk_reason']=''
@@ -2334,65 +3016,106 @@ class App:
 
     def show_world_actor(self,result):
         sid,c,info=result
-        dlg=self.ctk.CTkToplevel(self.root);dlg.title(c['name']);dlg.geometry('820x760');dlg.transient(self.root)
-        body=dialog_scroll(self.ctk,dlg,fg_color=PANEL);body.pack(fill='both',expand=True,padx=12,pady=12)
-        self.section(body,c['name']+' · '+c['realm'])
-        self.paragraph(body,'Profile ID: '+sid)
-        self.table(body,cultivator_view(c,info)['rows'],content_width=700)
-        self.paragraph(body,c['backstory'],width=700)
-        self.paragraph(body,'Current location: '+c.get('presence',{}).get('name','Unknown'))
-        if c.get('injury'):self.paragraph(body,'Recovering from '+c['injury']['cause']+' until '+storage.calendar_text(c['injury']['until_day'])+' · effective power reduced 20%.')
-        self.section(body,'Conversation')
-        if c.get('talk_reason'):self.paragraph(body,c['talk_reason'])
-        self.paragraph(body,'Talk as your selected player cultivator. NPC profiles here do not change your selection.',width=700)
-        reply=self.ctk.CTkLabel(body,text='',justify='left',wraplength=700,font=self.body_font)
-        reply.pack(fill='x',padx=12,pady=8)
-        player_id=self.controller.selected()
-        def show_reply(data):
-            if self.widget_alive(reply):
-                reply.configure(text=f"{data['when']} · Trust {data['trust']}\n{data['name']}: {data['reply']}")
-        def talk(topic):
-            if not player_id:
-                reply.configure(text='Select or create your own cultivator in the Cultivator tab first.');return
-            def work():
-                def act():
-                    generator.build_cultivator(player_id,self.controller.key,self.controller.profiles)
-                    return progress.talk_to_cultivator(player_id,sid,topic)
-                return self.controller._run('conversation',act)
-            self.run_async('Talking…',work,show_reply)
-        for topic in ('Greeting','Your life','Your sect','Your activity','World news'):
-            self.ctk.CTkButton(body,text=topic,state='disabled' if c['death'] or c.get('talk_reason') else 'normal',command=lambda t=topic:talk(t)).pack(pady=3)
-        if player_id and player_id!=sid and not c['death']:
-            self.ctk.CTkButton(body,text='Set up a duel',command=lambda:self.prepare_nearby_duel(player_id,sid)).pack(pady=8)
-        def show_memory(rows):
-            if self.widget_alive(reply):
-                reply.configure(text='\n\n'.join(storage.calendar_text(r['day'])+' · '+r['topic']+'\n'+r['reply'] for r in rows[:8]) or 'No conversations yet.')
-        self.ctk.CTkButton(body,text='Remembered conversations',command=lambda:self.run_async('Reading memories…',lambda:progress.conversation_history(player_id,sid),show_memory)).pack(pady=8)
+        player=self.controller.selected()
+        context=(player,sid)
+        window=getattr(self,'actor_window',None)
+        if window is None or not self.widget_alive(window):
+            window=self.actor_window=self.ctk.CTkToplevel(self.root)
+            window.withdraw()
+            window.geometry('820x760')
+            window.transient(self.root)
+            window.protocol('WM_DELETE_WINDOW',window.withdraw)
+            self.actor_cards=WorldCardList(window,self,self.profile_action)
+            self.actor_cards.pack(fill='both',expand=True,padx=10,pady=10)
+        window.title(c['name'])
+        if self.actor_cards.context!=context:self._profile_reply=''
+        details = [f"Profile ID: {sid}"]
+        if c['death']:
+            details.append('Deceased')
+        else:
+            details.append('Current location: ' + c.get('presence',{}).get('name','Unknown'))
+        entries=[(c['name']+' · '+c['realm'],'\n'.join(details),())]
+        links=[]
+        if player and not c['death'] and not c.get('talk_reason'):
+            links.extend((topic,(player,sid,'talk',topic)) for topic in ('Greeting','Your life','Your sect','Your activity','World news'))
+        if player:links.append(('Remembered conversations',(player,sid,'memory',None)))
+        if player and player!=sid and not c['death']:links.append(('Set up a duel',(player,sid,'duel',None)))
+        self._profile_reason=c.get('talk_reason') or ''
+        entries.append(('Conversation','\n'.join(filter(None,(self._profile_reason,self._profile_reply))),tuple(links)))
+        for key,value in cultivator_view(c,info)['rows']:
+            icon=value if key=='Affinity' else 'Death risk' if key=='Death risk' else None
+            entries.append((key,value,(),icon))
+        entries.append(('Backstory',c['backstory'],()))
+        if c['death']:
+            entries.append(('The end of the road',generator.describe_death(c,info,None)[1],()))
+        self.actor_cards.show(entries,context)
+        window.deiconify();window.lift()
+
+    def profile_action(self,target):
+        player,sid,action,topic=target
+        context=(player,sid)
+        if self.working or context!=self.actor_cards.context or player!=self.controller.selected():return
+        if action=='duel':
+            self.prepare_nearby_duel(player,sid)
+            self.actor_window.withdraw()
+            return
+        def read():
+            if action=='memory':
+                rows=progress.conversation_history(player,sid)
+                return '\n\n'.join(storage.calendar_text(r['day'])+' · '+r['topic']+'\n'+r['reply'] for r in rows[:8]) or 'No conversations yet.'
+            def talk():
+                generator.build_cultivator(player,self.controller.key,self.controller.profiles)
+                data=progress.talk_to_cultivator(player,sid,topic)
+                return f"{data['when']} · Trust {data['trust']}\n{data['name']}: {data['reply']}"
+            return self.controller._run('conversation',talk)
+        def show(text):
+            if not self.widget_alive(self.actor_window) or context!=self.actor_cards.context:return
+            self._profile_reply=text
+            entries=[r['entry'] for r in self.actor_cards.rows]
+            entries[1]=('Conversation','\n'.join(filter(None,(self._profile_reason,text))),entries[1][2])
+            self.actor_cards.show(entries,context)
+        self.run_async('Reading memories…' if action=='memory' else 'Talking…',read,show,show)
+
+    def poll_visible_history(self):
+        if getattr(self,'_closing',False):return
+        try:
+            if self.tabs.get()=='World History' and 'World History' not in self._reads:
+                self.refresh_chronicle()
+        finally:
+            self.root.after(5000,self.poll_visible_history)
 
     def refresh_chronicle(self,reset=False):
         if reset:self.chronicle_page=0
         query,kind,page=self.chronicle_search.get().strip(),self.chronicle_kind.get(),self.chronicle_page
-        if self.working:
-            self._pending_world_refresh='World History'
-            return
         def done(data):
             if self.tabs.get()=='World History' and (query,kind,page)==(self.chronicle_search.get().strip(),self.chronicle_kind.get(),self.chronicle_page):
                 self.show_chronicle(data)
-        self.run_async('Reading World History…',lambda:self.controller._run('world history',lambda:storage.world_history(query,kind,page)),done)
+        self.fetch_view('World History',(query,kind,page),lambda:storage.world_history(query,kind,page),done)
 
     def change_chronicle_page(self,delta):
-        self.chronicle_page=max(0,self.chronicle_page+delta);self.refresh_chronicle()
+        page=min(getattr(self,'_chronicle_last',0),max(0,self.chronicle_page+delta))
+        if page!=self.chronicle_page:
+            self.chronicle_page=page
+            self.refresh_chronicle()
 
     def show_chronicle(self,result):
         rows,total=result
+        self._chronicle_last=max(0,(total-1)//30)
+        if self.chronicle_page>self._chronicle_last:
+            self.chronicle_page=self._chronicle_last
+            self.refresh_chronicle()
+            return
+        for button,enabled in ((self.chronicle_prev,self.chronicle_page>0),(self.chronicle_next,self.chronicle_page<self._chronicle_last)):
+            state='normal' if enabled else 'disabled'
+            if button.cget('state')!=state:button.configure(state=state)
         header=f'{total:,} major public events · Page {self.chronicle_page+1} of {max(1,(total+29)//30)}'
         if self.chronicle_count.cget('text')!=header:self.chronicle_count.configure(text=header)
         entries=[]
         for event in rows:
             title=('Rumor: ' if event['visibility']=='rumor' else '')+event['title']
-            where=event['location']
-            if event['sect_names']:where+=' · '+', '.join(event['sect_names'])
-            details=f"{event['when']} · {where}\n{event['summary']}"
+            where='Location: '+event['location']
+            if event['sect_names']:where+='    |    Sect'+('s' if len(event['sect_names'])>1 else '')+': '+', '.join(event['sect_names'])
+            details=f"{event['when']}    |    {event['kind'].title()}\n{where}\n{event['summary']}"
             links=tuple(('View '+name,sid) for name,sid in zip(event['actor_names'],event['actors']))
             entries.append((title,details,links))
         self.chronicle_panel.show(entries or [('No major public events match this search','Hidden discoveries remain secret.',())],(self.chronicle_search.get().strip(),self.chronicle_kind.get(),self.chronicle_page))
@@ -2410,22 +3133,108 @@ class App:
         self.progress.pack(side="right")
         self.progress.start()
 
+        requested=time.monotonic()
+        operation={'Reading region…':'World/Map','Reading campaigns…':'World/Campaigns',
+                   'Reading sect leadership…':'World/Leadership','Reading relationships…':'World/Relationships',
+                   'Reading the world…':'World/Population','Reading cultivator…':'Profile card',
+                   'Looking up the profile...':'Cultivator card','Visiting the sect…':'Sect',
+                   'Opening the Martial Pavilion...':'Pavilion','Reading the history...':'History',
+                   'Cultivating…':'Cultivation','Saving the world…':'Save world'}.get(label,'Action')
         def worker():
-            try:
-                self.events.put(("done", on_done, fn()))
-            except logs.SteamError as e:
-                self.events.put(("error", on_error, str(e)))
-            except BaseException as e:                      # never let a thread die silently
-                self.events.put(("error", on_error, f"Something unexpected went wrong: "
-                                                    f"{type(e).__name__}: {e}"))
+            started=time.monotonic()
+            try:kind,callback,payload='done',on_done,fn()
+            except logs.SteamError as e:kind,callback,payload='error',on_error,str(e)
+            except BaseException as e:
+                kind,callback,payload='error',on_error,f'Something unexpected went wrong: {type(e).__name__}: {e}'
+            ready=time.monotonic()
+            def complete(value):
+                applied=time.monotonic();status='OK' if kind=='done' else 'error'
+                try:
+                    if callback:callback(value)
+                except BaseException:
+                    status='render_error';raise
+                finally:
+                    end=time.monotonic()
+                    logs.timing(operation,status,worker_wait=started-requested,data=ready-started,delivery=applied-ready,apply=end-applied,total=end-requested)
+            self.events.put((kind,complete,payload))
         threading.Thread(target=worker, daemon=True).start()
+
+    def fetch_view(self,tab,key,read,display):
+        # Retain the original request time when a queued view replaces older work.
+        requested=getattr(read,'_view_requested',time.monotonic())
+        def queued_read():return read()
+        queued_read._view_requested=requested
+        request=(key,queued_read,display)
+        if tab in self._reads:
+            running,_=self._reads[tab]
+            self._reads[tab]=(running,None if running==key else request)
+            return
+        self._reads[tab]=(key,None)
+        sub=self.world_views.get() if tab=='World' and hasattr(self,'world_views') else None
+        operation=tab+('/'+sub if isinstance(sub,str) else '')
+        times={'requested':requested}
+        def measured_display(data):
+            started=time.monotonic();status='OK'
+            try:return display(data)
+            except BaseException:status='render_error';raise
+            finally:record(status,started,time.monotonic())
+        def record(status,applied=None,end=None):
+            end=time.monotonic() if end is None else end
+            applied=end if applied is None else applied
+            logs.timing(operation,status,worker_wait=times['started']-requested,data=times['ready']-times['started'],delivery=applied-times['ready'],apply=end-applied,total=end-requested)
+        measured_display._view_record=record
+        def worker():
+            times['started']=time.monotonic()
+            try:value=read();error=None
+            except Exception as exc:value=None;error=str(exc)
+            times['ready']=time.monotonic()
+            self.events.put(('view',tab,(value,error,measured_display)))
+        threading.Thread(target=worker,name=tab+' reader',daemon=True).start()
+
+    def finish_view(self,tab,result):
+        _,pending=self._reads.pop(tab)
+        data,error,display=result
+        record=getattr(display,'_view_record',lambda status:None)
+        if self.tabs.get()!=tab or getattr(self,'_closing',False):
+            record('hidden');return
+        if pending:
+            record('superseded')
+            self.fetch_view(tab,*pending)
+            return
+        if error:
+            record('error');self.status.configure(text=error,text_color=BAD)
+        else:display(data)
+
+    def monitor_gui(self,main_id):
+        # No Tk calls here. Capture function names and line numbers only, without
+        # locals, query text, character names or keys. One sample per long gap.
+        reported=False
+        while not self._stop_monitor.wait(.5):
+            gap=time.monotonic()-self._last_gui_poll
+            if gap<1.5:
+                reported=False
+            elif not reported and not getattr(self,'_closing',False):
+                reported=True
+                frames=sys._current_frames()
+                lines=[f'GUI poll delayed {gap:.2f}s']
+                for thread in threading.enumerate():
+                    frame=frames.get(thread.ident)
+                    if thread.ident==threading.get_ident() or frame is None:continue
+                    calls=[]
+                    while frame and len(calls)<10:
+                        calls.append(f'{os.path.basename(frame.f_code.co_filename)}:{frame.f_lineno} {frame.f_code.co_name}')
+                        frame=frame.f_back
+                    lines.append(('Tk' if thread.ident==main_id else thread.name)+' | '+' <- '.join(calls))
+                logs.performance_note('\n'.join(lines))
 
     def poll(self):
         """Runs on the window thread every 80 ms and handles what the worker reported."""
+        self._last_gui_poll=time.monotonic()
         try:
             while True:
                 event = self.events.get_nowait()
-                if event[0] == "world_clock":
+                if event[0]=="view":self.finish_view(event[1],event[2])
+                elif event[0] == "world_clock":
                     self.finish_world_tick(event[1],event[2])
                 elif event[0] == "cached_profiles":
                     self._cache_scan_running = False
@@ -2452,8 +3261,11 @@ class App:
                     self.finish_work(event)
         except queue.Empty:
             pass
-        if self.widget_alive(self.root):
-            self.root.after(80, self.poll)
+        finally:
+            # A render callback exception must never strand later worker results in the queue.
+            if self.widget_alive(self.root):
+                interval=12 if getattr(self,'_skip_target',None) and getattr(self,'_world_tick_running',False) else 80
+                self.root.after(interval, self.poll)
 
     def finish_work(self, event):
         kind, callback, payload = event
@@ -2482,6 +3294,8 @@ class App:
         for b in (self.look_button, self.fight_button, self.log_button):
             b.configure(state=state)
         self.bt_button.configure(state=state if self.selected else "disabled")
+        if hasattr(self,'cultivate_button'):
+            self.show_training_cooldown(getattr(self,'_training_remaining',0))
         adv = getattr(self, "adv_button", None)
         if adv is not None and self.widget_alive(adv):
             try:
@@ -2547,6 +3361,8 @@ class App:
         self.profile_title.pack(anchor='w',padx=10)
         self.adv_button=ctk.CTkButton(self.profile_head,text='Adventure',command=self.do_adventure)
         self.adv_button.pack(side='right',padx=6)
+        self.cultivate_button=ctk.CTkButton(self.profile_head,text='Cultivate (+1 day)',command=self.do_cultivate)
+        self.cultivate_button.pack(side='right',padx=6)
         self.profile_bars=[]
         for color in (ACCENT,GOOD):
             line=ctk.CTkFrame(self.profile_head,fg_color='transparent');line.pack(fill='x',padx=10,pady=1)
@@ -2642,6 +3458,8 @@ class App:
         if not self.profile_head.winfo_manager():self.profile_head.pack(before=self.card,fill='x',pady=2)
         title=v['name']+' · '+v['realm']+' · '+('Fallen' if v['dead'] else 'Alive')
         if self.profile_title.cget('text')!=title:self.profile_title.configure(text=title)
+        self._cultivator_dead=v['dead']
+        self.show_training_cooldown(getattr(self,'_training_remaining',0))
         button_text='Seek rebirth' if v['dead'] else 'Adventure'
         if self.adv_button.cget('text')!=button_text:self.adv_button.configure(text=button_text)
         stats=[(v['power_fraction'],'Power · '+v['power_caption'],v['realm_color']),
@@ -2664,13 +3482,40 @@ class App:
             entries.append((f"A tale from their life (Steam friend: {data['friend']['name']})",data['story'],()))
         elif data['note']:entries.append(('Note',data['note'],()))
         if data['death']:
-            label,text=data['death']
-            cause='Cause: ' if data['c']['death']['killer']=='lifespan' else 'Slain by: '
-            entries.append(('The end of the road',cause+label+'\n'+text,()))
+            entries.append(('The end of the road',data['death'][1],()))
         self.card.show(entries,data['steamid'])
 
         self.status.configure(text=f"Loaded {v['name']}.", text_color=GOOD)
         self.refresh_team_recent()
+
+    def do_cultivate(self):
+        if self.working:return
+        if getattr(self,'_pause_started',None) is not None:
+            self.status.configure(text='Resume the world before cultivating.',text_color=MUTED)
+            return
+        actor=self.controller.selected()
+        def train():
+            summary=progress.solo_cultivation(actor,self.controller.key,self.controller.profiles)
+            with storage.world_snapshot() as db:
+                clock=dict(db.execute('SELECT day,skip_until FROM world,cultivation_clock').fetchone())
+            return summary,self.controller._view_data(actor),clock
+        def done(result):
+            summary,data,clock=result
+            self.show_world_clock(clock)
+            self.show_cultivator(data)
+            self.show_training_cooldown(300)
+            self.status.configure(text=summary+' The world is advancing one Heavenly day.',text_color=GOOD)
+        self.run_async('Cultivating…',lambda:self.controller._run('solo cultivation',train),done)
+
+    def show_training_cooldown(self,seconds):
+        import math
+        left=math.ceil(seconds)
+        button=self.cultivate_button
+        label=f'Cultivate ({left//60}:{left%60:02})' if left else 'Cultivate (+1 day)'
+        state='disabled' if left or self.working or getattr(self,'_cultivator_dead',False) else 'normal'
+        if button.cget('text')!=label or button.cget('state')!=state:
+            button.configure(text=label,state=state)
+        self._training_remaining=left
 
     def do_adventure(self):
         self.run_async("Out on an adventure...", self.controller.adventure,
@@ -2854,6 +3699,25 @@ class App:
             ctk.CTkButton(dlg, text="Close", command=dlg.destroy, width=140).pack(pady=(0, 24))
             self.focus_dialog(dlg)
             return
+        if info.get('realm_index')==8:
+            sid=self.controller.selected()
+            status=ctk.CTkLabel(dlg,text='Spend one Dao Integration Pill and hold this site for five Heavenly days. A successful enemy strike interrupts the ritual and causes a major injury.',wraplength=460)
+            status.pack(pady=20)
+            def prepare():
+                import warfare
+                def work():
+                    c=generator.build_cultivator(sid,self.controller.key,self.controller.profiles)[3]
+                    return warfare.gather_protectors(sid,c)
+                self.run_async('Calling protectors…',lambda:self.controller._run('protectors',work),lambda n:status.configure(text=f'{n} protectors pledged. Check People here for arrivals.') if self.widget_alive(dlg) else None)
+            def begin():
+                if self.controller.selected()!=sid:return
+                dlg.destroy()
+                self.run_async('Beginning ascension…',lambda:self.controller.breakthrough(False),lambda r:self.show_cultivator(r['data']))
+            ctk.CTkButton(dlg,text='Gather protectors first',command=prepare).pack(pady=6)
+            ctk.CTkButton(dlg,text='Consume pill and begin ascension',command=begin).pack(pady=6)
+            return
+        if info.get('realm_index')==1:
+            ctk.CTkLabel(dlg,text='Cost: one Foundation Establishment Pill, consumed even on failure.').pack(pady=4)
         state = {"pill": False}
         chance = ctk.CTkLabel(dlg, text="", font=ctk.CTkFont(size=40, weight="bold"),
                               text_color=ACCENT)
@@ -2979,6 +3843,28 @@ class App:
         ctk, c = self.ctk, data["c"]
         sid=data["steamid"]
         self.buy_buttons = []
+        venues=data.get('venues',['sect'])
+        extra=[]
+        for pill in ('qi_gathering_pill','meridian_cleansing_pill'):
+            if c.get('injury') and c['pavilion']['items'].get(pill,0):
+                extra.append((gamedata.PAVILION_BY_ID[pill]['name'],gamedata.PAVILION_BY_ID[pill]['blurb'],(('Use',(sid,'heal',pill,'',0)),)))
+        if 'public' in venues:
+            extra.append(('Public Pavilion',f"{c['spirit_stones']:,} Spirit Stones",(),None,'section'))
+            for k,price in gamedata.PUBLIC_PRICES.items():
+                item=gamedata.PAVILION_BY_ID[k]
+                extra.append((item['name']+f' · {price} Spirit Stones',item['blurb'],(('Buy',(sid,'public buy',k,'',price)),) if c['spirit_stones']>=price else ()))
+            for k,n in c['pavilion']['items'].items():
+                if k!=gamedata.DAO_PILL and n:
+                    price=pavilion_shop.public_sell_price(k)
+                    extra.append((gamedata.PAVILION_BY_ID[k]['name']+f' ×{n}',f'Sell for {price} Spirit Stones',(('Sell',(sid,'public sell goods',k,'',price)),)))
+            for name in dict.fromkeys(generator.treasures_of(c)):
+                price=max(1,pavilion_shop.sale_price(name)//5)
+                extra.append((name,f'Sell for {price} Spirit Stones',(('Sell',(sid,'public sell treasure',name,'',price)),)))
+        if 'sect' not in venues:
+            self.pav_head.configure(text=f"Pavilion · {c['name']} · {c['spirit_stones']:,} Spirit Stones")
+            self.pav_msg.configure(text=data.get('message') or 'Public trading posts: '+', '.join(gamedata.PUBLIC_SITES.values())+'. Sect members may also trade at their own seat.',text_color=MUTED)
+            self.pav_list.show(extra,sid)
+            return
         self.pav_head.configure(text=f"Sect Martial Pavilion - {c['name']} of the {c['sect']}"
                                      f"     Sect points: {c['sect_points']:,}")
         if sold:
@@ -2994,20 +3880,36 @@ class App:
             self.pav_msg.configure(text="Choose something to buy. Weapons can be bought once; "
                                         "pills, treasures and talismans stack.", text_color=MUTED)
         entries=[]
-        for r in data['rows']:
-            action=(sid,'buy',r['number'],r['name'],r['price'])
-            links=(('Buy',action),) if r['can_buy'] else ()
-            entries.append((f"{r['name']} · {r['price']:,} sect points",f"{r['kind']} · {r['blurb']}\n{r['status']}",links))
-        entries.append(('Sell treasures','The pavilion pays half the value.' if data.get('sells') else 'No treasures to sell.',()))
+        categories={}
+        for item in data['rows']:categories.setdefault(item['kind'],[]).append(item)
+        for kind,items in categories.items():
+            entries.append((kind+'s',f'{len(items)} listings',(),None,'section'))
+            for r in items:
+                action=(sid,'buy',r['number'],r['name'],r['price'])
+                links=(('Buy',action),) if r['can_buy'] else ()
+                entries.append((f"{r['name']} · {r['price']:,} sect points",f"{r['kind']} · {r['blurb']}\n{r['status']}",links))
+        entries.append(('Sell treasures','The pavilion pays half the value.' if data.get('sells') else 'No treasures to sell.',(),None,'section'))
         for r in data.get('sells',[]):
             action=(sid,'sell',r['number'],r['name'],r['price'])
             entries.append((r['name'],f"Pays {r['price']:,} sect points (worth {r['value']:,})",(('Sell',action),)))
-        self.pav_list.show(entries,sid)
+        self.pav_list.show(extra+entries,sid)
 
     def pavilion_action(self,target):
         sid,action,number,name,price=target
         if not self.working and sid==self.controller.selected():
-            if action=='sell':self.do_sell(number,(sid,name,price))
+            if action.startswith('public ') or action=='heal':
+                def work():
+                    def perform():
+                        _,c=pavilion_shop.pavilion_target(self.controller.key,self.controller.profiles,self.controller.session)
+                        if self.controller.selected()!=sid:raise logs.SteamError('The selected cultivator changed.')
+                        if action=='heal':
+                            pavilion_shop.heal(sid,number)
+                            return 'Injury recovery time reduced.'
+                        return pavilion_shop.public_trade(sid,c,action.removeprefix('public '),number)
+                    message=self.controller._run('pavilion',perform)
+                    return dict(self.controller.shop(),message=message)
+                self.run_async('Using pavilion…',work,self.show_shop,self.show_buy_error)
+            elif action=='sell':self.do_sell(number,(sid,name,price))
             else:self.do_buy(number,(sid,name,price))
 
     def do_sell(self, number, expected=None):
@@ -3284,7 +4186,9 @@ class App:
     def refresh_log(self):
         if self.controller is None:
             return
-        text = self.controller.log_text()
+        self.fetch_view('Log',None,self.controller.log_text,self.show_log)
+
+    def show_log(self,text):
         if text==getattr(self,"_last_log",None):return
         previous=getattr(self,'_last_log','')
         y=self.log_box.yview()

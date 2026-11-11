@@ -2,6 +2,7 @@
 (build_cultivator), plus the rules for fate, death,
 lifespan, arsenal and treasures."""
 
+import copy
 import random
 import time
 
@@ -9,6 +10,11 @@ import gamedata
 import gametext
 import logs
 import storage
+# Public aliases retained for the editor and older integrations.
+from offline_generator import (create_local_profile, load_local_profile, local_power_base,
+                               local_power_score, local_profile_info, make_local_profile,
+                               normalize_local_name, random_local_settings, realm_power_range,
+                               resolve_local_profile, validate_local_settings)
 
 
 BETRAYAL_CHANCE = 0.05   # of those who die, chance the killer is one of their friends
@@ -60,7 +66,7 @@ def talisman_count(c):
 def describe_goods(items):
     """'Qi Gathering Pill (x2), Iron Spirit Sword' for the pavilion goods a cultivator owns."""
     parts = []
-    for item in gamedata.PAVILION_ITEMS:
+    for item in gamedata.PAVILION_BY_ID.values():
         n = items.get(item["id"], 0)
         if n and item["kind"] != "Treasure":
             parts.append(f"{item['name']} (x{n})" if n > 1 else item["name"])
@@ -142,21 +148,24 @@ def reputation_rank(points):
     return idx
 
 
-def roll_reputation(steamid, info, personalities, path=None, duel_points=0):
+def roll_reputation(steamid, info, personalities, path=None, duel_points=0, *, starting=None):
     """Badges give the base reputation; personalities and the path add to it. A
     personality with a rep_chance below 1.0 rolls for its points; the roll comes from the
     SteamID, and every group in the table draws in a fixed order, so results never shift."""
-    rng = random.Random(f"rep-{steamid}")
-    groups = list(dict.fromkeys(p.get("roll_group", p["name"]) for p in gamedata.PERSONALITIES))
-    rolls = {g: rng.random() for g in groups}
-    badge_points = info["badges"] * gamedata.REP_PER_BADGE
-    bonuses = [(p["name"], p["rep"]) for p in personalities
-               if p["rep"] and rolls[p.get("roll_group", p["name"])] < p["rep_chance"]]
-    if path and path["rep"]:
-        bonuses.append((f"{path['name']} Path", path["rep"]))
-    base_points = max(0, badge_points + sum(amount for _, amount in bonuses))
+    if starting is not None:
+        base_points,badge_points,bonuses=starting,0,[]
+    else:
+        rng = random.Random(f"rep-{steamid}")
+        groups = list(dict.fromkeys(p.get("roll_group", p["name"]) for p in gamedata.PERSONALITIES))
+        rolls = {g: rng.random() for g in groups}
+        badge_points = info["badges"] * gamedata.REP_PER_BADGE
+        bonuses = [(p["name"], p["rep"]) for p in personalities
+                   if p["rep"] and rolls[p.get("roll_group", p["name"])] < p["rep_chance"]]
+        if path and path["rep"]:
+            bonuses.append((f"{path['name']} Path", path["rep"]))
+        base_points = max(0, badge_points + sum(amount for _, amount in bonuses))
     if duel_points:                      # fame or shame won in duels (saved in the profile's file)
-        bonuses.append(("Duels", duel_points))
+        bonuses.append(("Reputation adjustment", duel_points))
     points = max(0, base_points + duel_points)
     idx = reputation_rank(points)
     return {"points": points, "badge_points": badge_points, "bonuses": bonuses,
@@ -284,11 +293,34 @@ def roll_fate(steamid, realm_index, lifespan, friend_ids, death_chance, age=None
 def describe_death(c, info, friend):
     """Returns (killer_label, text) for a cultivator that died."""
     d = c["death"]
+    account = d.get('account') or {}
+    if account.get('circumstances'):
+        when = storage.calendar_text(d['world_day'])
+        where = (' ' + account['place']) if account.get('place') else ''
+        text = f"{c['name']} {account['circumstances']}{where}. They died aged {d['age']:,} ({when})."
+        if account.get('assignment'):
+            text += ' Their final assignment was recorded as “' + account['assignment'] + '”'
+        return d['killer'].replace('_',' '), text
     if d.get('legacy'):
-        cause = 'during a sect mission' if d['killer']=='sect_mission' else 'in their previous life'
-        return cause, f"{c['name']} died {cause} before calendar synchronization, aged {d['age']:,}. Their original date is preserved in the historical save record."
+        causes = {
+            'sect_mission': 'was killed during a sect mission',
+            'sect_war': 'fell during a sect campaign',
+            'sect_politics': 'was assassinated during sect unrest',
+            'lethal_duel': 'was killed in a lethal duel',
+            'travel_encounter': 'was killed in a road encounter',
+            'lifespan': 'exhausted their remaining lifespan during a failed breakthrough',
+            'old_age': 'reached the end of their lifespan',
+            'rogue': 'was slain by a rogue cultivator',
+            'bandits': 'was killed by bandits',
+        }
+        cause = causes.get(d['killer'], 'died')
+        if d.get('friend_id'):
+            cause = f"was slain by {cultivator_name(d['friend_id'])}, a trusted friend"
+        return 'historical record', f"{c['name']} {cause}, aged {d['age']:,}. Their death predates calendar synchronization."
     if d["killer"] == "sect_mission":
         return "a sect mission", f"{c['name']} was killed during a sect mission in Year {d['year']} of the Heavenly Calendar. Their soul must await rebirth."
+    if d["killer"]=="sect_war":
+        return "a sect campaign",f"{c['name']} fell during an inter-sect campaign in Year {d['year']}. Their soul awaits rebirth."
     if d["killer"]=="sect_politics":
         return "sect intrigue",f"{c['name']} was assassinated during sect intrigue in Year {d['year']}. Their soul awaits rebirth."
     if d["killer"] in ("lethal_duel","travel_encounter"):
@@ -304,6 +336,9 @@ def describe_death(c, info, friend):
         fmt.update(friend=friend_name, friend_steam=friend["name"])
         pool = gametext.DEATH_FRIEND
         label = f"{friend_name} (Steam: {friend['name']}), a trusted friend"
+    elif d.get('friend_id'):
+        name = cultivator_name(d['friend_id'])
+        return name, f"{c['name']} was slain by {name}, a trusted friend, in Year {d['year']}."
     elif d["killer"] == "lifespan":
         pool, label = gametext.DEATH_LIFESPAN, "a failed breakthrough that used up their lifespan"
         return label, pool[sum(map(ord, c["name"])) % len(pool)].format(**fmt)
@@ -322,16 +357,17 @@ def generate_cultivator(info, steamid, friend_ids=None, inventory=None, duel_poi
     # A reborn cultivator (incarnation, saved in their file) has a new random body: new talent,
     # name, gender, sect, affinity and title. The realm, path, personalities and arsenal stay.
     talent = gamedata.TALENT_BY_NAME[incarnation["talent"]] if incarnation else roll_talent(steamid)
-    personalities = get_personalities(info, len(friend_ids or []))   # second: same reason
-    path = roll_path(steamid)          # third: the Demonic Path adds power
-    score = power_score(info, talent["power"] + sum(p["power"] for p in personalities)
-                        + path["power"])
     if overrides:
         if not incarnation:
             talent = gamedata.TALENT_BY_NAME[overrides["talent"]]
         path = next(p for p in gamedata.PATHS if p["name"] == overrides["path"])
         personalities = [p for p in gamedata.PERSONALITIES if not p.get("steam_only") and p["name"] in overrides["personalities"]]
         score = local_power_score(overrides, talent_name=talent["name"])
+    else:
+        personalities = get_personalities(info, len(friend_ids or []))   # second: same reason
+        path = roll_path(steamid)          # third: the Demonic Path adds power
+        score = power_score(info, talent["power"] + sum(p["power"] for p in personalities)
+                            + path["power"])
     eligible, _ = get_realm(score)       # the highest realm the power score allows
     # The realm they actually hold is saved in their file and only rises through a breakthrough
     # (realm_index); with nothing saved yet they start in the realm their score gives.
@@ -366,6 +402,7 @@ def generate_cultivator(info, steamid, friend_ids=None, inventory=None, duel_poi
     main_treasure = prized_treasure(owned) or gamedata.FALLBACK_TREASURE
 
     game = info["top_game"] or "the Void"
+    if overrides.get('generation')=='seed-v1':game=element
     technique = f"{rng.choice(gamedata.MOVE_ADJ)} {game} {rng.choice(gamedata.MOVE_NOUN)}"
 
     lifespan_roll = rng.randint(150, 400)            # always drawn, as before
@@ -411,7 +448,11 @@ def generate_cultivator(info, steamid, friend_ids=None, inventory=None, duel_poi
         fate["death"] = {"killer": "lifespan", "friend_id": None, "scene": 0, "age": death_age,
                          "year": fate["birth_year"] + death_age}
     age = fate["death"]["age"] if fate["death"] else age
-    reputation = roll_reputation(steamid, info, personalities, path, duel_points)
+    reputation = roll_reputation(steamid, info, personalities, path, duel_points, starting=overrides.get("starting_reputation"))
+    if overrides and "starting_reputation" not in overrides:
+        # Old local ledgers combine the creation offset, adventures, rebirth and
+        # duels. Display the verified total without attributing the offset to play.
+        reputation['legacy_local_total']=True
 
     if overrides:
         death_chance = overrides["death_chance"] if not incarnation else death_chance
@@ -429,25 +470,32 @@ def generate_cultivator(info, steamid, friend_ids=None, inventory=None, duel_poi
     sect_points = max(0, sect_points_earned + pavilion.get("bonus", 0) - pavilion["spent"])
 
     # Backstory built from the real stats (variants and template picked from the SteamID)
-    hrs, gc, lvl = info["top_hours"], info["game_count"], info["level"]
-    nums = dict(hrs=f"{hrs:,.0f}", gc=f"{gc:,}", lvl=lvl, n=f"{missions:,}", game=game, sect=sect)
-    meditation = pick_variant(hrs, gametext.MEDITATION_TIERS, rng, **nums)
-    treasury = pick_variant(gc, gametext.TREASURY_TIERS, rng, **nums)
-    dao = pick_variant(lvl, gametext.DAO_TIERS, rng, **nums)
-    mission_text = pick_variant(missions, gametext.MISSION_TIERS, rng, **nums)
+    if overrides.get('generation')=='seed-v1':
+        history_rng=random.Random(f"local-history-v1:{steamid}")
+        beginnings=("first learned to draw Qi by a mountain spring","trained for years at a roadside shrine",
+                    "left a riverside village to study the martial arts","spent a winter copying an old cultivation manual")
+        backstory=(f"{name} {history_rng.choice(beginnings)}. Now a {realm} cultivator on the {path['name']} path, "
+                   f"{name} practices {technique} with an affinity for {element}.")
+    else:
+        hrs, gc, lvl = info["top_hours"], info["game_count"], info["level"]
+        nums = dict(hrs=f"{hrs:,.0f}", gc=f"{gc:,}", lvl=lvl, n=f"{missions:,}", game=game, sect=sect)
+        meditation = pick_variant(hrs, gametext.MEDITATION_TIERS, rng, **nums)
+        treasury = pick_variant(gc, gametext.TREASURY_TIERS, rng, **nums)
+        dao = pick_variant(lvl, gametext.DAO_TIERS, rng, **nums)
+        mission_text = pick_variant(missions, gametext.MISSION_TIERS, rng, **nums)
 
-    # The reputation sentence uses its own generator so it never disturbs the picks above
-    rep_text = pick_variant(reputation["rank_index"], gametext.REPUTATION_TIERS,
-                            random.Random(f"repphrase-{steamid}"),
-                            sect=sect, rank=reputation["rank"])
+        # The reputation sentence uses its own generator so it never disturbs the picks above
+        rep_text = pick_variant(reputation["rank_index"], gametext.REPUTATION_TIERS,
+                                random.Random(f"repphrase-{steamid}"),
+                                sect=sect, rank=reputation["rank"])
 
-    article = "an" if title[0] in "AEIOU" else "a"
-    backstory = rng.choice(gametext.BACKSTORIES).format(
-        personality=personality_phrase(personalities), reputation=rep_text,
-        steam=info["name"], name=name, sect=sect, a_title=f"{article} {title}",
-        talent=talent["blurb"], dao=dao, meditation=meditation, treasury=treasury,
-        missions=mission_text, treasure=main_treasure, element=element, technique=technique,
-        game=game, realm=realm)
+        article = "an" if title[0] in "AEIOU" else "a"
+        backstory = rng.choice(gametext.BACKSTORIES).format(
+            personality=personality_phrase(personalities), reputation=rep_text,
+            steam=info["name"], name=name, sect=sect, a_title=f"{article} {title}",
+            talent=talent["blurb"], dao=dao, meditation=meditation, treasury=treasury,
+            missions=mission_text, treasure=main_treasure, element=element, technique=technique,
+            game=game, realm=realm)
 
     if incarnation:
         backstory += (f" This is not {name}'s first life: after the old body died, the soul "
@@ -466,6 +514,7 @@ def generate_cultivator(info, steamid, friend_ids=None, inventory=None, duel_poi
         "arsenal": incarnation["arsenal"] if incarnation else build_arsenal(steamid, element, path["name"]),
         "missions": missions, "sect_points": sect_points,
         "sect_points_earned": sect_points_earned, "pavilion": pavilion,
+        "starting_sect_adjustment": (overrides["sect_points"] - overrides["missions"] * gamedata.SECT_POINTS_PER_MISSION) if overrides else 0,
         "personalities": personalities, "reputation": reputation, "death_chance": death_chance,
         "path": path,
     }
@@ -477,15 +526,19 @@ def points_left(c):
 
 
 def sect_points_text(c):
-    """'1,200 (earned 1,000, spent 300, +500 from sales and rebirth)' for the card."""
+    """Show ledger categories without inventing sales or rebirth history."""
     spent, bonus = c.get("pavilion", {}).get("spent", 0), c.get("pavilion", {}).get("bonus", 0)
     parts = []
-    if spent or bonus:
-        parts.append(f"earned {c['sect_points_earned']:,}")
+    if (spent or bonus) and c['sect_points_earned']:
+        parts.append(f"base credits {c['sect_points_earned']:,}")
     if spent:
         parts.append(f"spent {spent:,}")
-    if bonus:
-        parts.append(f"{bonus:+,} from sales and rebirth")
+    starting=c.get("starting_sect_adjustment",0)
+    if starting:
+        label="starting allocation" if starting>0 else "initial balance adjustment"
+        parts.append(f"{starting:+,} {label}")
+    if bonus-starting:
+        parts.append(f"{bonus-starting:+,} other changes")
     return f"{c['sect_points']:,}" + (f" ({', '.join(parts)})" if parts else "")
 
 
@@ -538,7 +591,7 @@ def build_cultivator(steamid, key, profiles, refresh=False):
     duel_points, _ = storage.read_duel_rep(steamid)
     state = storage.read_realm_state(steamid)
     life = storage.read_life(steamid)
-    calendar = storage.load_profile_cache(steamid).get("calendar")
+    calendar = storage.profile_field(steamid,"calendar")
     if calendar and not local and state["vitals"] is None and calendar.get('incarnation') == (life.get('incarnation') or {}).get('count',0):
         state["vitals"] = {"base_lifespan":calendar['base_lifespan'], "age":18,
                            "birth_year":max(0,int(calendar['birth_day'])//storage.DAYS_PER_YEAR)}
@@ -551,7 +604,9 @@ def build_cultivator(steamid, key, profiles, refresh=False):
                                      incarnation=life["incarnation"],
                                      overrides=local["character"] if local else None,
                                      vitals=state["vitals"], starting_treasure=starting_treasure)
-    override=storage.load_profile_cache(steamid).get('sect_override')
+    saved_profile=storage.load_profile_cache(steamid)
+    cultivator['missions']+=saved_profile.get('completed_sect_missions',0)
+    override=saved_profile.get('sect_override')
     if override is not None:
         old_sect=cultivator['sect'];cultivator['sect']=override
         cultivator['backstory']=cultivator['backstory'].replace(old_sect,override)
@@ -575,11 +630,15 @@ def build_cultivator(steamid, key, profiles, refresh=False):
                       f"{cultivator['name']}, {cultivator['realm']}, age {cultivator['age']}, "
                       f"{'died' if cultivator['death'] else 'alive'}")
     cultivator["spirit_stones"] = storage.read_spirit_stones(steamid)
+    if cultivator['realm_index']==8:
+        with storage.world_transaction() as db:
+            ritual=db.execute('SELECT l.name site,r.ends FROM ascensions r JOIN locations l ON l.id=r.site WHERE r.actor=?',(steamid,)).fetchone()
+            if ritual:cultivator['ascension']=dict(ritual)
     cultivator["sect_status"] = storage.ensure_sect(steamid, cultivator)
-    cultivator["sect_choice_needed"] = not storage.load_profile_cache(steamid).get("world_npc") and cultivator["sect"]!="Wanderer" and storage.chartered_sect(cultivator["sect"]) is None
+    cultivator["sect_choice_needed"] = not storage.profile_field(steamid,"world_npc") and cultivator["sect"]!="Wanderer" and storage.chartered_sect(cultivator["sect"]) is None
     cultivator['traits'] = cultivator['personalities']
     cultivator['world_personalities'] = storage.actor_disposition(steamid)
-    training=storage.load_profile_cache(steamid).get('mentor_power',0)
+    training=storage.profile_field(steamid,'mentor_power',0)
     cultivator['score']+=training
     cultivator['eligible_realm_index']=get_realm(cultivator['score'])[0]
     cultivator['injury'] = storage.injury_state(steamid)
@@ -592,228 +651,6 @@ def build_cultivator(steamid, key, profiles, refresh=False):
         cultivator['sect_role']=storage.member_role(affiliation)
         db.execute('INSERT OR REPLACE INTO actor_measures VALUES(?,?,?,?)',(steamid,cultivator.get('healthy_score',cultivator['score']),cultivator['realm_index'],storage.world_state()['day']))
     return info, friend_ids, note, cultivator
-
-
-# ============================================================================
-# Offline profiles — randomized templates, explicit stats, local lookup, creation
-# ============================================================================
-
-import copy
-import json
-from pathlib import Path
-import secrets
-import unicodedata
-
-def normalize_local_name(text):
-    return unicodedata.normalize("NFKC", text).strip().casefold()
-
-
-def random_local_settings(*, player_start=False, rng=None):
-    """Developer rolls span all realms; player starts use bounded beginner rolls."""
-    rng = rng or random.Random(secrets.randbits(128))
-    sid = str(rng.randrange(10**19, 10**20))
-    realm = rng.randrange(2 if player_start else len(gamedata.REALMS))
-    gender = rng.choice(("male", "female"))
-    lifespan = rng.randint(*gamedata.REALM_LIFESPANS[realm])
-    return {
-        "name": make_name(rng, gender), "gender": gender,
-        "sect": rng.choice(storage.sect_names())["name"],
-        "element": rng.choice(gamedata.ELEMENTS),
-        "talent": rng.choices(gamedata.TALENTS, weights=[t["weight"] for t in gamedata.TALENTS], k=1)[0]["name"],
-        "path": rng.choice(gamedata.PATHS)["name"],
-        "score": rng.randint(*realm_power_range(realm)),
-        "realm_index": realm, "born_realm": realm,
-        "age": rng.randint(16, max(16, lifespan // 2)), "birth_year": rng.randint(1000, 9000),
-        "lifespan": lifespan, "death_chance": 0.08,
-        "title": "", "technique": "", "personalities": rng.sample([p["name"] for p in gamedata.PERSONALITIES if not p.get("steam_only")], rng.randrange(4)),
-        "missions": rng.randint(0, 120 if player_start else 5000),
-        "sect_points": rng.randint(0, 600 if player_start else 30000), "spirit_stones": 0,
-        "reputation": rng.randint(0, 50 if player_start else 3000),
-        "level": rng.randint(0, 200), "game_count": rng.randint(1, 1000),
-        "top_game": "Dao Meditation", "top_hours": rng.randint(0, 10000),
-        "badges": rng.randint(0, 300), "seed": sid,
-    }
-
-
-def validate_local_settings(s):
-    if not isinstance(s, dict):
-        raise ValueError("Settings must be a JSON object.")
-    if type(s.get("spirit_stones", 0)) is not int or s.get("spirit_stones", 0) < 0:
-        raise ValueError("Spirit Stones must be a nonnegative whole number.")
-    if "power_offset" in s and (type(s["power_offset"]) is not int or abs(s["power_offset"]) > 10**9):
-        raise ValueError("Power adjustment must be a whole number between -1,000,000,000 and 1,000,000,000.")
-    required = {"name", "gender", "sect", "element", "talent", "path", "score", "realm_index", "born_realm", "age", "birth_year", "lifespan", "death_chance", "title", "technique", "personalities", "missions", "sect_points", "reputation", "level", "game_count", "top_game", "top_hours", "badges", "seed"}
-    if required - s.keys():
-        raise ValueError("Missing settings: " + ", ".join(sorted(required - s.keys())))
-    for field in ("name", "sect", "top_game", "title", "technique"):
-        value = s[field]
-        if not isinstance(value, str) or len(value) > 300 or (field in ("name", "sect", "top_game") and not value.strip()):
-            raise ValueError(f"{field} must be text (1–300 characters; title/technique can be blank).")
-        if any(ord(c) < 32 for c in value):
-            raise ValueError(f"{field} cannot contain control characters.")
-    if not isinstance(s["seed"], str) or not s["seed"].isascii() or not s["seed"].isdigit() or len(s["seed"]) != 20:
-        raise ValueError("Seed must be a 20-digit local identifier.")
-    for field, options in (("gender", ("male", "female")), ("element", gamedata.ELEMENTS), ("talent", gamedata.TALENT_BY_NAME), ("path", [p["name"] for p in gamedata.PATHS])):
-        if s[field] not in options:
-            raise ValueError(f"Invalid {field}.")
-    for field in ("score", "realm_index", "born_realm", "age", "birth_year", "lifespan", "missions", "sect_points", "reputation", "level", "game_count", "top_hours", "badges"):
-        if type(s[field]) is not int or not (-10**9 if field == "birth_year" else 0) <= s[field] <= 10**9:
-            raise ValueError(f"{field} must be a whole number between 0 and 1,000,000,000.")
-    if not 0 <= s["realm_index"] < len(gamedata.REALMS) or not 0 <= s["born_realm"] < len(gamedata.REALMS):
-        raise ValueError("Realm indexes are out of range.")
-    if not 0 <= s["age"] < s["lifespan"]:
-        raise ValueError("Age must be smaller than lifespan for a new living character.")
-    if type(s["death_chance"]) not in (int, float) or not 0 <= s["death_chance"] <= 1:
-        raise ValueError("Death risk must be between 0 and 1.")
-    if not isinstance(s["personalities"], list) or any(p not in [v["name"] for v in gamedata.PERSONALITIES] for p in s["personalities"]) or len(set(s["personalities"])) != len(s["personalities"]):
-        raise ValueError("Personalities must be a list of unique personality names from the game.")
-
-
-def realm_power_range(realm_index):
-    """Inclusive creation range; Immortal has no gameplay cap, so draws stop at 15,000."""
-    low = gamedata.REALMS[realm_index][0]
-    high = gamedata.REALMS[realm_index + 1][0] - 1 if realm_index + 1 < len(gamedata.REALMS) else 15000
-    return low, high
-
-
-def local_power_base(s, talent_name=None):
-    """Same contributors as Steam power; local scores are rounded to whole points."""
-    bonus = gamedata.TALENT_BY_NAME[talent_name or s["talent"]]["power"]
-    bonus += next(p["power"] for p in gamedata.PATHS if p["name"] == s["path"])
-    bonus += sum(p["power"] for p in gamedata.PERSONALITIES if not p.get("steam_only") and p["name"] in s["personalities"])
-    return round(s["level"] * 10 + s["game_count"] * 2 + s["top_hours"] / 10 + bonus)
-
-
-def local_power_score(s, talent_name=None):
-    # Old saves keep their exact score until edited with the reactive controls.
-    return max(0, local_power_base(s, talent_name) + s["power_offset"]) if "power_offset" in s else s["score"]
-
-
-def local_profile_info(s):
-    return {"name": s["name"], "account_created": None,
-            "level": s["level"], "game_count": s["game_count"],
-            "top_game": s["top_game"], "top_hours": s["top_hours"], "total_hours": s["top_hours"],
-            "achievements": s["missions"], "achievements_hidden": False, "achievements_new": None,
-            "ach_stats": None, "badges": s["badges"], "badges_hidden": False, "offline": True}
-
-
-def make_local_profile(settings):
-    s = copy.deepcopy(settings)
-    for key in ("name", "sect", "title", "technique", "top_game"):
-        if isinstance(s.get(key), str):
-            s[key] = s[key].strip()
-    validate_local_settings(s)
-    sid = s["seed"]
-    info = local_profile_info(s)
-    c = generate_cultivator(info, sid, [], realm_index=s["realm_index"], born_realm=s["born_realm"], overrides=s)
-    earned = s["missions"] * gamedata.SECT_POINTS_PER_MISSION
-    return {"version": 1, "steamid": sid, "sections": {},
-            "wallet": {"spirit_stones": s.get("spirit_stones", 0)},
-            "offline": {"version": 1, "info": info, "character": s},
-            "realm_state": {"realm_index": s["realm_index"], "born_realm": s["born_realm"], "lifespan_lost": 0, "last_failed": None},
-            "life": {"dead": None, "last_roll": None, "incarnation": None, "rebirths": 0},
-            "inventory": {"treasures": c["treasures"], "history": []},
-            "pavilion": {"items": {}, "spent": 0, "earned": earned, "bonus": s["sect_points"] - earned, "history": []},
-            "duel_reputation": {"points": s["reputation"] - c["reputation"]["base_points"], "history": []},
-            "activity": [{"at": time.time(), "type": "adventure", "summary": "Created locally with the developer profile generator."}]}
-
-
-def load_local_profile(steamid):
-    data = storage.load_profile_cache(steamid)
-    local = data.get("offline")
-    if local is None:
-        return None
-    try:
-        if not isinstance(local, dict) or local.get("version") != 1:
-            raise ValueError("Unsupported local profile version.")
-        validate_local_settings(local["character"])
-        if local["character"]["seed"] != str(steamid):
-            raise ValueError("Local seed does not match profile ID.")
-        if not isinstance(local["info"], dict):
-            raise ValueError("Local inputs must be an object.")
-    except (ValueError, KeyError, TypeError) as exc:
-        raise logs.SteamError(f"Invalid local profile {steamid}: {exc}")
-    local = copy.deepcopy(local)
-    local["info"] = local_profile_info(local["character"])
-    return local
-
-
-def resolve_local_profile(text):
-    """Exact normalized name, local:<name>, local:<ID>, or numeric ID. Never contacts Steam."""
-    text = str(text).strip()
-    explicit = text.lower().startswith("local:")
-    if explicit:
-        text = text[6:].strip()
-    if text.isascii() and text.isdigit():
-        # A picker already knows the ID; don't open every profile to resolve it.
-        data = storage.load_profile_cache(text)
-        if (data and data.get("steamid") == text and isinstance(data.get("offline"), dict)):
-            return text
-        if explicit:
-            raise logs.SteamError("No local profile with that ID exists in this game's cache.")
-        return None
-    matches = []
-    for data in storage.all_profiles():
-        if not isinstance(data.get("offline"), dict):
-            continue
-        sid = data["steamid"]
-        character = data["offline"].get("character")
-        names = [character.get("name", "")] if isinstance(character, dict) else []
-        life = data.get("life")
-        incarnation = life.get("incarnation") if isinstance(life, dict) else None
-        if isinstance(incarnation, dict):
-            names.append(incarnation.get("name", ""))
-        if text == sid or any(normalize_local_name(text) == normalize_local_name(n) for n in names if isinstance(n, str) and n):
-            matches.append(sid)
-    if len(matches) > 1:
-        raise logs.SteamError("Several local profiles have that name. Use local:<ID> instead.")
-    if matches:
-        return matches[0]
-    if explicit:
-        raise logs.SteamError("No local profile with that name or ID exists in this game's cache.")
-    return None
-
-
-def create_local_profile(cache, data):
-    """Create only; existing files and duplicate local names are never replaced."""
-    sid = data.get("steamid", "")
-    storage.validate_profile_data(data, sid)
-    local = data.get("offline", {})
-    validate_local_settings(local.get("character"))
-    if sid != local["character"]["seed"]:
-        raise ValueError("Profile ID must equal its local seed.")
-    cache = Path(cache)
-    cache.mkdir(parents=True, exist_ok=True)
-    name = normalize_local_name(local["character"]["name"])
-    with storage.world_transaction(cache) as db:
-        for saved in storage.all_profiles(cache):
-            offline = saved.get("offline")
-            character = offline.get("character") if isinstance(offline, dict) else None
-            names = [character.get("name", "")] if isinstance(character, dict) else []
-            life = saved.get("life")
-            incarnation = life.get("incarnation") if isinstance(life, dict) else None
-            if isinstance(incarnation, dict):
-                names.append(incarnation.get("name", ""))
-            if any(isinstance(n, str) and n and normalize_local_name(n) == name for n in names):
-                raise ValueError("That local name is already in use. Choose a different name.")
-        if db.execute('SELECT 1 FROM profiles WHERE id=?',(sid,)).fetchone():
-            raise FileExistsError('This profile ID already exists.')
-        data=copy.deepcopy(data)
-        world=db.execute('SELECT day FROM world WHERE id=1').fetchone()
-        day=world[0]
-        char=data['offline']['character']
-        data['calendar']={'birth_day':day-char['age']*storage.DAYS_PER_YEAR,'incarnation':0,
-                          'synchronized_day':day,'base_lifespan':char['lifespan']}
-        for event in data.get('activity',[]): event['world_day']=day
-        storage._write_profile(db,data)
-        choice=storage.chartered_sect(char['sect'],cache)
-        if choice:
-            db.execute('INSERT OR IGNORE INTO affiliations(actor,sect_id) VALUES(?,?)',(sid,choice['id']))
-            home=db.execute('SELECT id FROM locations WHERE sect_id=?',(choice['id'],)).fetchone()
-            if home:db.execute('INSERT OR IGNORE INTO positions VALUES(?,?)',(sid,home[0]))
-        return cache / f"{sid}.profile.json"  # logical editor locator, no JSON is written
-
-
 
 
 # ============================================================================
@@ -860,6 +697,8 @@ def synchronize_calendar(steamid, c, life):
             c['age'] = death_age
             dead = {'killer':'old_age','friend_id':None,'scene':0,'age':death_age,
                     'year':int(end)//storage.DAYS_PER_YEAR,'world_day':end}
+            if int(end) == int(now):
+                dead['account'] = storage.death_account(steamid,'reached the end of their natural lifespan')
             c['death'] = dead
             storage.write_life(steamid,dead=dead)
             import progress

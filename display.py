@@ -63,8 +63,8 @@ def print_cultivator(c, info):
     print(f"  Path        : {generator.path_label(c['path'])}")
     rep = c["reputation"]
     print(f"  Reputation  : {rep['rank']} ({rep['points']:,} points)")
-    if rep["bonuses"]:
-        print("  Fame boosts : " + ", ".join(f"{n} {a:+d}" for n, a in rep["bonuses"]))
+    if rep["bonuses"] and not rep.get("legacy_local_total"):
+        print("  Fame modifiers : " + ", ".join(f"{n} {a:+d}" for n, a in rep["bonuses"]))
     print(f"  Death risk  : {c['death_chance'] * 100:g}%")
     print(f"  Affinity    : {c['element']}")
     print(f"  Matchups    : strong vs {', '.join(gamedata.ELEMENT_BEATS.get(c['element'], []))}; "
@@ -108,19 +108,22 @@ def print_cultivator(c, info):
     if c["lightning"]:
         print(f"  Tribulations: survived {c['lightning']} heavenly lightning strikes")
     print(line)
-    print("  Locally generated stats:" if info.get("offline") else "  Source stats from Steam:")
-    if info.get("account_created") and c.get("account_years") is not None:
-        year = datetime.datetime.fromtimestamp(info["account_created"], datetime.timezone.utc).year
-        print(f"    Account age : {c['account_years']:.1f} years (created {year})")
-    print(f"    {'Training lvl' if info.get('offline') else 'Steam level'} : {info['level']}")
-    print(f"    {'Library size' if info.get('offline') else 'Paid games '} : {info['game_count']:,}")
-    print(f"    Achievements: {info['achievements']:,}")
-    if info["badges_hidden"]:
-        print("    Badges      : 0 (Steam is hiding your badges)")
+    if info.get("local_seed"):
+        print(f"  Offline origin: cultivation seed {info['local_seed']}")
     else:
-        print(f"    Badges      : {info['badges']:,}")
-    if info["top_game"]:
-        print(f"    Most played : {info['top_game']} ({info['top_hours']:,.0f} h)")
+        print("  Locally generated stats:" if info.get("offline") else "  Source stats from Steam:")
+        if info.get("account_created") and c.get("account_years") is not None:
+            year = datetime.datetime.fromtimestamp(info["account_created"], datetime.timezone.utc).year
+            print(f"    Account age : {c['account_years']:.1f} years (created {year})")
+        print(f"    {'Training lvl' if info.get('offline') else 'Steam level'} : {info['level']}")
+        print(f"    {'Library size' if info.get('offline') else 'Paid games '} : {info['game_count']:,}")
+        print(f"    Achievements: {info['achievements']:,}")
+        if info["badges_hidden"]:
+            print("    Badges      : 0 (Steam is hiding your badges)")
+        else:
+            print(f"    Badges      : {info['badges']:,}")
+        if info["top_game"]:
+            print(f"    Most played : {info['top_game']} ({info['top_hours']:,.0f} h)")
     print(line)
     print()
     wrap_print(c["backstory"])
@@ -178,7 +181,7 @@ def print_death(c, info, friend):
     label, text = generator.describe_death(c, info, friend)
     print("  The end of the road")
     print("  " + "-" * 62)
-    print(f"  {'Cause   ' if c['death']['killer'] == 'lifespan' else 'Slain by'} : {label}")
+    print(f"  Cause: {label}")
     print()
     wrap_print(text)
     print("=" * 64 + "\n")

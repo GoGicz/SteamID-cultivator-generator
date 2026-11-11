@@ -7,6 +7,7 @@ import time
 import gamedata
 import gametext
 import generator
+import offline_generator
 import logs
 import steam_api
 import storage
@@ -119,8 +120,12 @@ def perform_sect_mission(steamid, c, offer_id, rng=random, now=None):
         life = storage.read_life(steamid)
         life["dead"] = {"killer": "sect_mission", "friend_id": None, "scene": 0,
                         "age": age, "year": int(storage.world_state()["day"])//storage.DAYS_PER_YEAR, "world_day": storage.world_state()["day"]}
+        circumstance = "succumbed to injuries sustained during a sect mission" if lost else "was killed during a sect mission"
+        life["dead"]["account"] = storage.death_account(steamid, circumstance)
+        life["dead"]["account"]["assignment"] = offer["text"]
         pc["life"] = life
     if outcome == "success":
+        pc["completed_sect_missions"]=pc.get("completed_sect_missions",0)+1
         member["points"] += offer["reputation"]
         pav = storage.read_pavilion(steamid)
         pav["bonus"] += offer["sect_points"]
@@ -138,7 +143,7 @@ def perform_sect_mission(steamid, c, offer_id, rng=random, now=None):
         raise logs.SteamError("Mission could not be saved. Check cache write permissions before continuing.")
     if lost and outcome!='death':storage.injure(steamid,'Sect mission')
     if outcome=='death':storage.retire_dead(steamid)
-    record_world_action('mission',c['name']+' completed a sect mission',result['summary'],[(steamid,c)],outcome='mission_success' if outcome=='success' else outcome,importance=2 if outcome=='death' else 1)
+    record_world_action('mission',c['name']+(' died on a sect mission' if outcome=='death' else ' completed a sect mission'),result['summary'],[(steamid,c)],outcome='mission_success' if outcome=='success' else outcome,importance=2 if outcome=='death' else 1)
     return result
 
 
@@ -241,6 +246,15 @@ def perform_adventure(steamid, c, info, friend_ids, key, rng=random, now=None):
         out["text"] = rng.choice(gametext.ADVENTURE_NOTHING).format(**fmt)
     out["kind"] = kind
     out["title"] = gametext.ADVENTURE_TITLES[kind]
+    if rng.random()<.05:
+        stones=rng.randint(10,20)
+        pc=storage.load_profile_cache(steamid)
+        pc.setdefault('wallet',{})['spirit_stones']=storage.read_spirit_stones(steamid)+stones
+        storage.save_profile_cache(pc,durable=True)
+        found=f'Found {stones} Spirit Stones.'
+        out['stones']=stones
+        out['text']+=' '+found
+        summary=(summary+' · ' if summary else '')+found
     if summary:
         storage.add_activity(steamid, {"at": now, "type": "adventure", "kind": kind, "summary": summary,
                                        "rep": out["rep"]})
@@ -396,6 +410,7 @@ def breakthrough_risk_text(st):
 
 
 def breakthrough_result_text(name, r):
+    if r.get("ritual"):return r["ritual"]
     if r["success"]:
         return (f"SUCCESS! Heavenly lightning rolls across the sky. {name} breaks through to "
                 f"{r['to']}!")
@@ -423,8 +438,12 @@ def breakthrough_status(c, now=None):
     if c["death"]:
         st["reason"] = (f"{c['name']} died in Year {c['death']['year']} of the Heavenly "
                         f"Calendar. The dead cannot break through.")
+    elif c.get('ascension'):
+        st['reason']=f"Ascending at {c['ascension']['site']} until {storage.calendar_text(c['ascension']['ends'])}."
     elif top:
         st["reason"] = f"{c['name']} already stands in the highest realm, {c['realm']}."
+    elif idx in (1,8) and not c['pavilion']['items'].get('foundation_pill' if idx==1 else gamedata.DAO_PILL):
+        st['reason']='Requires one '+('Foundation Establishment Pill.' if idx==1 else 'Dao Integration Pill to begin a five-day ascension.')
     elif c["eligible_realm_index"] <= idx:
         need = gamedata.REALMS[idx + 1][0]
         st["reason"] = (f"Not ready yet: {gamedata.REALMS[idx + 1][1]} needs a power score of {need:,}, "
@@ -454,10 +473,16 @@ def attempt_breakthrough(steamid, c, use_pill=False, rng=random, now=None):
     if use_pill and st["pills"] <= 0:
         raise logs.SteamError(f"{c['name']} owns no Heaven-Defying Breakthrough Pill. "
                               f"One can be bought at the Martial Pavilion.")
+    if c['realm_index']==8:
+        import warfare
+        return warfare.begin_ascension(steamid,c)
+    if c['realm_index']==1:
+        import pavilion_shop
+        pavilion_shop.consume(steamid,'foundation_pill')
     bd = breakthrough_chance(c, use_pill)
     success = rng.random() < bd["total"]
     if use_pill:
-        goods = dict(c["pavilion"]["items"])
+        goods = storage.read_pavilion(steamid)["items"]
         goods[BREAKTHROUGH_PILL_ID] -= 1
         storage.write_pavilion(steamid, goods, c["pavilion"]["spent"],
                                {"at": now, "type": "pill used", "item": gamedata.PAVILION_BY_ID[BREAKTHROUGH_PILL_ID]["name"],
@@ -476,7 +501,8 @@ def attempt_breakthrough(steamid, c, use_pill=False, rng=random, now=None):
     if not success and st['fatal']:
         day=storage.world_state()['day']
         storage.write_life(steamid,dead={'killer':'lifespan','friend_id':None,'scene':0,
-                                       'age':c['age'],'year':int(day)//storage.DAYS_PER_YEAR,'world_day':day})
+                                       'age':c['age'],'year':int(day)//storage.DAYS_PER_YEAR,'world_day':day,
+                                       'account':storage.death_account(steamid,f"exhausted their remaining lifespan attempting to reach {st['next']}")})
     storage.add_activity(steamid, {"at": now, "type": "breakthrough", "success": success,
                                    "from": st["current"], "to": st["next"], "chance": bd["total"],
                                    "pill": bool(use_pill), "lost": lost,
@@ -527,19 +553,21 @@ def initialize_world(count=2500):
     with storage.world_transaction() as db:
         weights = [rng.uniform(.7,1.3) for _ in sects]
         for index in range(existing,count):
-            s = generator.random_local_settings(rng=rng)
+            sid=str(rng.randrange(10**19,10**20))
+            while db.execute('SELECT 1 FROM profiles WHERE id=?',(sid,)).fetchone():
+                sid=str(rng.randrange(10**19,10**20))
+            s=offline_generator.random_local_settings(native=True,seed=sid,sect_names=sects)
+            birth_rng=random.Random('npc-birth-v1:'+sid)
             # Common cultivators outnumber the rare ancient masters.
-            realm = rng.choices(range(10),weights=[45,25,14,8,4,2,1,.6,.3,.1])[0]
-            lifespan = rng.randint(*gamedata.REALM_LIFESPANS[realm])
-            age = rng.randint(16,max(16,lifespan//2))
+            realm = birth_rng.choices(range(10),weights=[45,25,14,8,4,2,1,.6,.3,.1])[0]
+            lifespan = birth_rng.randint(*gamedata.REALM_LIFESPANS[realm])
+            age = birth_rng.randint(16,max(16,lifespan//2))
             s.update(realm_index=realm,born_realm=realm,lifespan=lifespan,age=age,
                      birth_year=int(world['day'])//storage.DAYS_PER_YEAR-age,
-                     score=rng.randint(*generator.realm_power_range(realm)),
-                     sect='Wanderer' if index >= int(count*.9) else rng.choices(sects,weights=weights)[0],
-                     missions=rng.randint(0,20*(realm+1)),sect_points=rng.randint(0,100*(realm+1)))
-            while db.execute('SELECT 1 FROM profiles WHERE id=?',(s['seed'],)).fetchone():
-                s['seed'] = str(rng.randrange(10**19,10**20))
-            pc = generator.make_local_profile(s)
+                     score=birth_rng.randint(*generator.realm_power_range(realm)),
+                     sect='Wanderer' if index >= int(count*.9) else birth_rng.choices(sects,weights=weights)[0],
+                     missions=birth_rng.randint(0,20*(realm+1)),sect_points=birth_rng.randint(0,100*(realm+1)))
+            pc = offline_generator.make_local_profile(s)
             pc['world_npc'] = True
             pc['calendar'] = {'birth_day':world['day']-age*storage.DAYS_PER_YEAR,
                               'incarnation':0,'synchronized_day':world['day'],'base_lifespan':lifespan}
@@ -600,7 +628,9 @@ def talk_to_cultivator(player_id,npc_id,topic):
         elif topic == 'Your activity':
             reply = f"I am {npc['activity'].lower()} at {storage.presence(npc_id)['name']}. My next plans are due around {storage.calendar_text(npc['next_day'])}."
         else:
-            news=known_news(npc_id,1)
+            with storage.world_transaction() as db:
+                visible=db.execute("SELECT p.name,l.name FROM ascensions r JOIN profiles p ON p.id=r.actor JOIN locations l ON l.id=r.site ORDER BY r.tick LIMIT 1").fetchone()
+            news=([{'source':'Witnessed','summary':f"The sky above {visible[1]} trembles as {visible[0]} attempts Immortal Ascension."}] if visible else known_news(npc_id,1))
             reply=((('I witnessed this: ' if news[0]['source']=='Witnessed' else 'A local report says: ')+news[0]['summary']) if news else 'I have heard no recent local news.')
         if topic == 'Greeting' and last != int(day):
             trust = min(100,trust+1); last = int(day)
@@ -628,6 +658,7 @@ def initialize_region():
         if db.execute('SELECT initialized FROM region_meta').fetchone()[0]:
             # Population expansions add affiliations without rerolling established offices.
             seed_region_actors(db)
+            initialize_frontiers(db)
             return
         population_sects = {storage.decode_profile_json(r[0])['offline']['character']['sect'] for r in db.execute('SELECT p.data FROM profiles p JOIN npcs n ON n.id=p.id')}
         storage.sect_names()
@@ -672,6 +703,7 @@ def initialize_region():
                 for disciple in candidates[:3 if i==0 else 2]:
                     db.execute('UPDATE affiliations SET mentor=? WHERE actor=?',(mentor['actor'],disciple['actor']))
                 candidates=candidates[3 if i==0 else 2:]
+        initialize_frontiers(db)
         db.execute('UPDATE region_meta SET initialized=1')
 
 
@@ -685,7 +717,7 @@ def seed_region_actors(db, actor=None):
         name=settings['sect']
         sect=storage.sect_identity(name) if name!='Wanderer' else None
         db.execute('INSERT INTO affiliations(actor,sect_id) VALUES(?,?)',(row['id'],sect['id'] if sect else None))
-        place=db.execute('SELECT id FROM locations WHERE sect_id=?',(sect['id'],)).fetchone() if sect else None
+        place=storage.seat_location(db,sect['id']) if sect else None
         location=place[0] if place else 'r0_4'
         db.execute('INSERT OR IGNORE INTO positions VALUES(?,?)',(row['id'],location))
         personality=storage.actor_disposition(row['id'])
@@ -706,12 +738,25 @@ def complete_journeys(db, day):
         path=json.loads(journey['path'])
         db.execute('UPDATE positions SET location=? WHERE actor=?',(path[-1],journey['actor']))
         db.execute('DELETE FROM journeys WHERE actor=?',(journey['actor'],))
+        db.execute('UPDATE campaign_forces SET assembled=1 WHERE actor=? AND muster=?',(journey['actor'],path[-1]))
         db.execute("UPDATE npcs SET location=(SELECT name FROM locations WHERE id=?),activity='Arrived' WHERE id=?",(path[-1],journey['actor']))
         storage.add_activity(journey['actor'],{'at':time.time(),'type':'adventure','summary':'Arrived at '+db.execute('SELECT name FROM locations WHERE id=?',(path[-1],)).fetchone()[0]+'.'})
 
 
-@storage.atomic
 def region_view(actor=None):
+    # UI navigation normally only reads. A first visit or an overdue arrival still
+    # uses the gameplay path, with all prerequisites rechecked under the writer lock.
+    with storage.world_snapshot() as db:
+        if not storage.region_ready(db):raise logs.SteamError('The starting region is still being prepared.')
+        ready=not actor or db.execute("SELECT 1 FROM affiliations a JOIN positions p ON p.actor=a.actor WHERE a.actor=?",(actor,)).fetchone()
+        due=db.execute('SELECT 1 FROM journeys WHERE arrival<=(SELECT day FROM world) LIMIT 1').fetchone()
+        if ready and not due:
+            if not actor or not db.execute("SELECT 1 FROM journeys j JOIN profiles p ON j.actor=p.id WHERE j.actor=? AND json_extract(p.data,'$.life.dead') IS NOT NULL",(actor,)).fetchone():
+                return _region_view(actor,False)
+    return _region_view(actor,True)
+
+
+def _region_view(actor,prepare):
     import json
     with storage.world_transaction() as db:
         if not db.execute('SELECT initialized FROM region_meta').fetchone()[0]:
@@ -719,20 +764,24 @@ def region_view(actor=None):
         if actor:
             pc=storage.load_profile_cache(actor)
             if not pc.get('calendar'): raise logs.SteamError('Load a cultivator before entering the map.')
-            seed_region_actors(db, actor)
+            if prepare:seed_region_actors(db, actor)
             if not db.execute('SELECT 1 FROM affiliations WHERE actor=?',(actor,)).fetchone():
                 db.execute('INSERT INTO affiliations(actor) VALUES(?)',(actor,))
-            db.execute('INSERT OR IGNORE INTO positions VALUES(?,?)',(actor,'r0_4'))
+            if prepare:db.execute('INSERT OR IGNORE INTO positions VALUES(?,?)',(actor,'r0_4'))
         day=storage.world_state()['day']
-        if actor and pc.get('life',{}).get('dead'):
+        if prepare and actor and pc.get('life',{}).get('dead'):
             db.execute('DELETE FROM journeys WHERE actor=?',(actor,))
-        complete_journeys(db,day)
+        if prepare:complete_journeys(db,day)
         journey=db.execute('SELECT * FROM journeys WHERE actor=?',(actor,)).fetchone()
         position=db.execute('SELECT location FROM positions WHERE actor=?',(actor,)).fetchone()
-        locations=[dict(r) for r in db.execute('SELECT * FROM locations')]
+        locations=[dict(r) for r in db.execute(
+            'SELECT l.*,m.kind AS mine,m.yield_stones,s.name AS owner,c.kind strategic,t.name controller FROM locations l '
+            'LEFT JOIN campaign_sites c ON c.site=l.id LEFT JOIN sects t ON t.id=c.owner '
+            'LEFT JOIN spirit_mines m ON m.location=l.id LEFT JOIN sects s ON s.id=m.owner')]
         routes=[dict(r) for r in db.execute('SELECT * FROM routes')]
         validate_region(locations,routes,journey,position)
-        return dict(locations=locations,
+        affiliation=db.execute('SELECT sect_id FROM affiliations WHERE actor=?',(actor,)).fetchone()
+        return dict(viewer=actor,viewer_sect=affiliation[0] if affiliation else None,locations=locations,
                     routes=routes,
                     location=position[0] if position else None,
                     journey=dict(journey) if journey else None,day=day,
@@ -785,9 +834,9 @@ def validate_region(locations,routes,journey,position):
     import json,math
     try:
         ids={r['id'] for r in locations}
-        if len(ids)!=40: raise ValueError('Expected 40 landmarks')
+        if len(ids)!=52: raise ValueError('Expected 52 landmarks')
         for row in locations:
-            if type(row['district']) is not int or not 0<=row['district']<5 or not isinstance(row['name'],str): raise ValueError('Invalid landmark')
+            if type(row['district']) is not int or not 0<=row['district']<9 or not isinstance(row['name'],str): raise ValueError('Invalid landmark')
             if any(type(row[k]) not in (int,float) or not math.isfinite(row[k]) for k in ('x','y')): raise ValueError('Invalid map coordinates')
         edges={frozenset((r['a'],r['b'])) for r in routes}
         for row in routes:
@@ -795,7 +844,7 @@ def validate_region(locations,routes,journey,position):
         if position and position[0] not in ids: raise ValueError('Invalid position')
         if journey:
             path=json.loads(journey['path'])
-            if not isinstance(path,list) or not 2<=len(path)<=40 or any(not isinstance(v,str) or v not in ids for v in path): raise ValueError('Invalid journey path')
+            if not isinstance(path,list) or not 2<=len(path)<=len(ids) or any(not isinstance(v,str) or v not in ids for v in path): raise ValueError('Invalid journey path')
             if any(frozenset((a,b)) not in edges for a,b in zip(path,path[1:])): raise ValueError('Invalid journey road')
             if any(type(journey[k]) not in (int,float) or not math.isfinite(journey[k]) for k in ('departure','arrival')) or not 0<=journey['departure']<journey['arrival']<=1e12: raise ValueError('Invalid journey dates')
     except (ValueError,TypeError,KeyError) as exc:
@@ -828,9 +877,12 @@ def record_world_action(kind,title,summary,actors,*,subject=None,outcome='',impo
         witnesses.update(a[0] for a in actors)
         for observer in witnesses:learn_event(db,event,observer,day,'Witnessed',facts)
         if importance>=2 and location:
-            # A bounded geographic news wave. No world-wide pairwise broadcasts.
+            # Ordinary news stays regional or reaches the participants' sects.
+            # Exceptional achievements and major events still travel worldwide.
             district=db.execute('SELECT district FROM locations WHERE id=?',(location,)).fetchone()[0]
-            for place in db.execute('SELECT id,district FROM locations WHERE id<>?',(location,)):
+            sects={r['sect'] for r in snapshots if r['sect']}
+            for place in db.execute('SELECT id,district,sect_id FROM locations WHERE id<>?',(location,)):
+                if importance<3 and outcome!='upset' and place['district']!=district and place['sect_id'] not in sects:continue
                 delay=(.4 if place['district']==district else 2)+random.Random(str(event)+place['id']).random()
                 db.execute('INSERT INTO news_queue VALUES(?,?,?)',(event,place['id'],day+delay))
         if importance>=3:
@@ -878,10 +930,23 @@ def learn_event(db,event,observer,day,source,facts=None):
 
 
 def spread_news(db,day):
-    for news in db.execute('SELECT * FROM news_queue WHERE due<=? ORDER BY due LIMIT 80',(day,)).fetchall():
-        for row in db.execute('SELECT p.actor FROM positions p JOIN profiles x ON x.id=p.actor LEFT JOIN journeys j ON j.actor=p.actor WHERE p.location=? AND j.actor IS NULL AND json_extract(x.data,\'$.life.dead\') IS NULL',(news['location'],)).fetchall():
-            learn_event(db,news['event'],row[0],day,'Local report')
-        db.execute('DELETE FROM news_queue WHERE event=? AND location=?',(news['event'],news['location']))
+    """Bound recipient work, retaining unfinished waves transactionally."""
+    remaining=128
+    for news in db.execute('SELECT * FROM news_queue WHERE due<=? ORDER BY due,event,location LIMIT 80',(day,)).fetchall():
+        facts_row=db.execute('SELECT facts FROM event_facts WHERE event=?',(news['event'],)).fetchone()
+        facts=json.loads(facts_row[0]) if facts_row else None
+        rows=db.execute("""SELECT p.actor FROM positions p JOIN profiles x ON x.id=p.actor
+            LEFT JOIN journeys j ON j.actor=p.actor
+            WHERE p.location=? AND j.actor IS NULL AND json_extract(x.data,'$.life.dead') IS NULL
+            AND NOT EXISTS(SELECT 1 FROM event_knowledge k WHERE k.actor=p.actor AND k.event=?)
+            ORDER BY p.actor LIMIT ?""",(news['location'],news['event'],remaining)).fetchall()
+        for row in rows:learn_event(db,news['event'],row[0],day,'Local report',facts)
+        if len(rows)<remaining:
+            db.execute('DELETE FROM news_queue WHERE event=? AND location=?',(news['event'],news['location']))
+        remaining-=len(rows)
+        if not remaining:break
+    metrics=getattr(storage._world_local,'batch_metrics',None)
+    if metrics is not None:metrics['news_delivered']=metrics.get('news_delivered',0)+128-remaining
 
 
 def known_news(actor,limit=5):
@@ -913,6 +978,8 @@ def initialize_living_actions():
     with storage.world_transaction() as db:
         # Additive, backward-compatible indexes, checked once at world startup.
         # The existing primary keys start with actor/disciple, not event.
+        db.execute("""CREATE INDEX IF NOT EXISTS public_chronicle_dates ON world_events(day DESC,id DESC)
+            WHERE visibility IN ('public','rumor') AND importance>=2""")
         db.execute('CREATE INDEX IF NOT EXISTS knowledge_event_lookup ON event_knowledge(event)')
         db.execute('CREATE INDEX IF NOT EXISTS political_event_lookup ON political_events(event)')
         db.execute('CREATE INDEX IF NOT EXISTS mentor_reward_event_lookup ON mentor_rewards(event)')
@@ -954,16 +1021,49 @@ def _npc_step(row,seed):
         if here['state']!='present':
             journey=db.execute('SELECT arrival FROM journeys WHERE actor=?',(sid,)).fetchone()
             db.execute('UPDATE npcs SET next_day=? WHERE id=?',(max(day+.01,journey[0] if journey else day+.1),sid));return
+        import warfare
+        if warfare.ritual_duty(db,sid,day) or warfare.duty(db,sid,day):
+            return
+        guard=db.execute('SELECT location FROM mine_wardens WHERE actor=?',(sid,)).fetchone()
+        if guard and here['location']!=guard[0]:
+            view=region_view(sid)
+            plan=route_plan(view,guard[0],safe=True)
+            start_journey(sid,plan,view,encounters=False)
+            db.execute("UPDATE npcs SET next_day=?,activity='Travelling to guard post',steps=steps+1 WHERE id=?",
+                       (day+plan['seconds']/pace,sid))
+            return
         if political_duty(sid):return
-        npc_membership_choices(sid,rng)
+        if not guard:
+            npc_membership_choices(sid,rng)
         if storage.presence(sid)['state']!='present':
             db.execute('UPDATE npcs SET next_day=? WHERE id=?',(day+60/storage.world_state()['seconds_per_day'],sid));return
-        if storage.load_profile_cache(sid).get('sect_override',c['sect'])!=c['sect']:
+        if storage.profile_field(sid,'sect_override',c['sect'])!=c['sect']:
             c=generator.build_cultivator(sid,'',{})[3]
         personality=storage.actor_disposition(sid)
+        import pavilion_shop
+        if not guard and pavilion_shop.shop_duty(db,sid,c,personality,here,day,rng):
+            return
+        mission=storage.profile_field(sid,'npc_mission')
+        if mission:
+            if not isinstance(mission,dict):mission={}
+            status=storage.ensure_sect(sid,c)
+            offer=next((o for o in status.get('offers',[]) if o['id']==mission.get('offer')),None)
+            valid=(c['sect']!='Wanderer' and status['identity']['id']==mission.get('sect') and offer is not None)
+            if valid and offer.get('location_id')==here['location'] and status['ready_at']<=time.time():
+                if not offer['hard'] or not storage.injury_state(sid):
+                    perform_sect_mission(sid,c,offer['id'],rng=rng)
+                    pc=storage.load_profile_cache(sid);pc.pop('npc_mission',None);storage.save_profile_cache(pc,durable=True)
+                    if pc.get('life',{}).get('dead'):storage.retire_dead(sid)
+                    else:db.execute("UPDATE npcs SET next_day=?,activity='Sect duties',steps=steps+1 WHERE id=?",(day+rng.uniform(120,480)/pace,sid))
+                    return
+            # Cancel stale, interrupted, or no longer feasible commitments. Existing
+            # duties/healing above can supersede a mission; never teleport to finish.
+            pc=storage.load_profile_cache(sid);pc.pop('npc_mission',None);storage.save_profile_cache(pc,durable=True)
         weights=npc_weights(personality,bool(storage.injury_state(sid)))
         if c['spirit_stones']<50 and c['sect']!='Wanderer':weights[1]*=1.5
         action=rng.choices(('Cultivating','Sect duties','Adventuring','Travelling','Duelling','Socializing'),weights=weights)[0]
+        if guard and action in ('Travelling','Adventuring','Sect duties'):
+            action='Guarding the mine'
         delay=rng.uniform(120,480)/pace
         if action=='Cultivating':
             pc=storage.load_profile_cache(sid);s=pc['offline']['character'];gain=rng.randint(1,3)
@@ -976,7 +1076,7 @@ def _npc_step(row,seed):
                 try:claim_mentor_reward(sid)
                 except logs.SteamError:pass
             c=generator.build_cultivator(sid,'',{})[3]
-            if not storage.injury_state(sid) and breakthrough_status(c)['can'] and rng.random()<(.65 if 'Ambitious' in personality else .25):attempt_breakthrough(sid,c,rng=rng)
+            if (c['realm_index']!=8 or warfare.available_escort(db,sid)) and not storage.injury_state(sid) and breakthrough_status(c)['can'] and rng.random()<(.65 if 'Ambitious' in personality else .25):attempt_breakthrough(sid,c,use_pill=c['realm_index']<8 and bool(c['pavilion']['items'].get(BREAKTHROUGH_PILL_ID)),rng=rng)
         elif action=='Sect duties':
             if c['sect']=='Wanderer':action='Resting'
             else:
@@ -987,14 +1087,16 @@ def _npc_step(row,seed):
                         offer=rng.choice(offers)
                         if offer.get('location_id') and offer['location_id']!=here['location']:
                             view=region_view(sid);plan=route_plan(view,offer['location_id'],safe='Cautious' in personality)
-                            start_journey(sid,plan,view,encounters=True,rng=rng);delay=plan['seconds']/pace+.01;action='Travelling to mission'
+                            start_journey(sid,plan,view,encounters=True,rng=rng)
+                            pc=storage.load_profile_cache(sid);pc['npc_mission']={'offer':offer['id'],'sect':board['identity']['id']};storage.save_profile_cache(pc,durable=True)
+                            delay=plan['seconds']/pace+.01;action='Travelling to mission'
                         else:perform_sect_mission(sid,c,offer['id'],rng=rng)
         elif action=='Adventuring':perform_adventure(sid,c,info,friends,'',rng=rng)
         elif action=='Travelling':
             view=region_view(sid)
             choices=[r for r in view['locations'] if r['id']!=here['location']]
             if 'Loyal' in personality:
-                home=db.execute('SELECT l.id FROM affiliations a JOIN locations l ON l.sect_id=a.sect_id WHERE a.actor=?',(sid,)).fetchone()
+                home=storage.seat_location(db,storage.sect_identity(c['sect'])['id']) if c['sect']!='Wanderer' else None
                 dest=home[0] if home and home[0]!=here['location'] and rng.random()<.6 else rng.choice(choices)['id']
             else:dest=rng.choice(choices)['id']
             plan=route_plan(view,dest,safe='Cautious' in personality)
@@ -1002,6 +1104,9 @@ def _npc_step(row,seed):
             delay=plan['seconds']/pace+.01
         elif action in ('Duelling','Socializing'):
             peers=storage.people_here(sid)['people']
+            if action=='Duelling' and db.execute('SELECT 1 FROM ascensions LIMIT 1').fetchone():
+                channeling={r[0] for r in db.execute('SELECT actor FROM ascensions')}
+                peers=[p for p in peers if p['id'] not in channeling]
             if peers:
                 feelings=_peer_feelings(db,sid,peers)
                 peer_weights=[1+max(0,feelings.get(p['id'],{}).get('trust' if action=='Socializing' else 'hostility',0))/10 for p in peers]
@@ -1019,7 +1124,7 @@ def _npc_step(row,seed):
                     opponent=generator.build_cultivator(other,'',{})[3]
                     if not opponent['death'] and combat.duel_ready(sid,other):combat.perform_battle([sid,other],'',{},rng=rng,mode=mode)
             else:action='Resting'
-        if storage.load_profile_cache(sid).get('life',{}).get('dead'):
+        if storage.profile_field(sid,'life',{}).get('dead'):
             storage.retire_dead(sid);return
         db.execute('UPDATE npcs SET next_day=?,activity=?,steps=steps+1 WHERE id=?',(day+delay,action,sid))
         storage.add_activity(sid,{'at':time.time(),'type':'adventure','summary':action+' at '+here['name']+'.'})
@@ -1030,6 +1135,7 @@ def _npc_step(row,seed):
 def start_journey(actor,plan,view,*,encounters=True,rng=random):
     import uuid
     with storage.world_transaction() as db:
+        if db.execute('SELECT 1 FROM ascensions WHERE actor=?',(actor,)).fetchone():return
         seconds=plan['seconds'];depart=view['day'];arrival=depart+seconds/view['seconds_per_day']
         trigger=depart+(arrival-depart)*.5 if encounters and plan['danger'] and rng.random()<.08*plan['danger'] else None
         db.execute('INSERT INTO journeys(actor,path,departure,arrival,encounter_day) VALUES(?,?,?,?,?)',(actor,json.dumps(plan['path']),depart,arrival,trigger))
@@ -1068,7 +1174,7 @@ def open_due_encounter(db,day):
                 pc=storage.load_profile_cache(actor);pc.setdefault('wallet',{})['spirit_stones']=storage.read_spirit_stones(actor)+25
                 storage.save_profile_cache(pc,durable=True);outcome='victory';text=c['name']+' overcame a road threat and earned 25 Spirit Stones.'
             elif rng.random()<data['death_on_loss']:
-                storage.mark_dead(actor,c,'travel_encounter');outcome='death';text=c['name']+' died fighting a road threat.'
+                storage.mark_dead(actor,c,'travel_encounter',circumstances=f"was killed fighting {data['enemy']}");outcome='death';text=c['name']+' died fighting a road threat.'
             else:
                 storage.injure(actor,'Road encounter');outcome='injured';text=c['name']+' survived a road fight with injuries.'
         if outcome in ('death','injured'):db.execute('DELETE FROM journeys WHERE actor=?',(actor,))
@@ -1106,7 +1212,7 @@ def resolve_encounter(encounter_id,choice,key='',profiles=None,rng=random):
                 storage.save_profile_cache(pc,durable=True)
                 text='You overcame the threat, found 25 Spirit Stones, and continued your journey.'
             elif rng.random()<odds['death_on_loss']:
-                outcome='death';storage.mark_dead(actor,c,'travel_encounter');text='The road encounter ended your life. Seek rebirth through Adventure.'
+                outcome='death';storage.mark_dead(actor,c,'travel_encounter',circumstances=f"was killed fighting {odds['enemy']}");text='The road encounter ended your life. Seek rebirth through Adventure.'
             else:outcome='injured';storage.injure(actor,'Road encounter');text='You survived the fight with an injury and returned to your departure point.'
         record_world_action('encounter',c['name']+' faced a road encounter',text,[(actor,c)],outcome=outcome,importance=1,location_override=encounter_place)
         if not continue_trip:db.execute('DELETE FROM journeys WHERE actor=?',(actor,))
@@ -1128,6 +1234,7 @@ def advance_world(elapsed_seconds, *, max_work_seconds=None):
         target=world['day']+(elapsed_seconds+world['pending_seconds'])/world['seconds_per_day']
         if target>1e12:raise logs.SteamError('Calendar advancement exceeds the supported range.')
         processed=0;yielded=False
+        metrics={'npc_decisions':0,'events':0};storage._world_local.batch_metrics=metrics
         while processed<200:
             if processed and deadline is not None and time.perf_counter()>=deadline:
                 yielded=True;break
@@ -1135,30 +1242,47 @@ def advance_world(elapsed_seconds, *, max_work_seconds=None):
             arrival=db.execute('SELECT min(arrival) FROM journeys WHERE arrival<=?',(target,)).fetchone()[0]
             encounter=db.execute('SELECT min(encounter_day) FROM journeys WHERE encounter_day<=?',(target,)).fetchone()[0]
             governance=db.execute('SELECT min(next_tick) FROM sect_governance WHERE next_tick<=?',(target,)).fetchone()[0]
-            due=[v for v in (npc['next_day'] if npc else None,arrival,encounter,governance) if v is not None]
+            payroll=db.execute('SELECT due,sect_id FROM sect_payroll WHERE due<=? ORDER BY due,sect_id LIMIT 1',(target,)).fetchone()
+            ritual=db.execute('SELECT actor,tick FROM ascensions WHERE tick<=? ORDER BY tick LIMIT 1',(target,)).fetchone()
+            due=[v for v in (ritual['tick'] if ritual else None,payroll['due'] if payroll else None,npc['next_day'] if npc else None,arrival,encounter,governance) if v is not None]
             if not due:break
             next_day=max(storage.world_state()['day'],min(due))
             db.execute('UPDATE world SET day=? WHERE id=1',(next_day,))
             if encounter is not None and encounter<=next_day and open_due_encounter(db,next_day):
-                db.execute('UPDATE world SET pending_seconds=0')
+                # Choice encounters discard ordinary elapsed time, but an awarded cultivation
+                # day must survive the interruption, including closing and reopening the game.
+                db.execute("""UPDATE world SET pending_seconds=max(0,
+                    (coalesce((SELECT skip_until FROM cultivation_clock WHERE id=1),0)-day)*seconds_per_day)""")
+                metrics['events']=processed
                 return dict(storage.world_state(),encounter=storage.pending_encounter())
             complete_journeys(db,next_day)
-            if governance is not None and governance<=next_day:politics_tick(next_day)
-            if npc and npc['next_day']<=next_day:_npc_step(dict(npc),world['seed'])
+            if ritual and ritual['tick']<=next_day:
+                import warfare
+                warfare.ritual_tick(db,ritual['actor'],next_day)
+            if governance is not None and governance<=next_day:
+                politics_tick(next_day,limit=1 if deadline is not None else -1)
+                if deadline is not None:
+                    processed+=1
+                    continue
+            if payroll and payroll['due']<=next_day:
+                pay_sect_salaries(payroll['sect_id'],next_day)
+            if npc and npc['next_day']<=next_day:
+                _npc_step(dict(npc),world['seed']);metrics['npc_decisions']+=1
             processed+=1
+        metrics['events']=processed
         pending=0
         if processed==200 or yielded:
             reached=storage.world_state()['day'];pending=max(0,(target-reached)*world['seconds_per_day']);target=reached
         db.execute('UPDATE world SET day=?,pending_seconds=? WHERE id=1',(target,pending))
         complete_journeys(db,target)
-        politics_tick(target)
         spread_news(db,target)
         prune_routine_events(db,target)
-        # Catch-up keeps priority over optional storage housekeeping. Persisted
-        # retention queues resume once scheduled simulation work has caught up.
-        if pending<=1e-6:storage.maintain_storage(db,target)
+        # Backlog must never starve retention. One bounded round-robin job during
+        # catch-up preserves simulation priority without abandoning cleanup.
+        storage.maintain_storage(db,target,max_jobs=1 if pending>1e-6 else 8)
         db.execute('DELETE FROM injuries WHERE until_day<=?',(target,))
-        return dict(storage.world_state(),encounter=None)
+        ritual=db.execute('SELECT p.name,l.name,z.ends FROM ascensions z JOIN profiles p ON p.id=z.actor JOIN locations l ON l.id=z.site ORDER BY z.tick LIMIT 1').fetchone()
+        return dict(storage.world_state(),encounter=None,ritual_notice=(f'{ritual[0]} is ascending at {ritual[1]} · {max(0,ritual[2]-target):.1f} days remaining' if ritual else ''))
 
 
 
@@ -1216,12 +1340,20 @@ def initialize_politics():
         for sect in storage.sect_names():
             delay=random.Random('politics:'+sect['id']).uniform(1800,5400)/pace
             db.execute('INSERT OR IGNORE INTO sect_governance(sect_id,next_tick,next_plot) VALUES(?,?,?)',(sect['id'],day,day+delay))
+            opened=db.execute('INSERT OR IGNORE INTO sect_payroll(sect_id,due) VALUES(?,?)',
+                              (sect['id'],day+1800/pace)).rowcount
+            if opened:
+                db.execute('UPDATE sect_governance SET treasury=treasury+10000 WHERE sect_id=?',(sect['id'],))
+        import warfare
+        warfare.initialize(db,day,pace)
         db.execute('INSERT OR IGNORE INTO membership_terms(actor,next_salary,npc_review) SELECT actor,?,? FROM affiliations',(day+1800/pace,day+14400/pace))
         db.execute("INSERT OR IGNORE INTO positions(actor,location) SELECT a.actor,coalesce(l.id,'r0_4') FROM affiliations a LEFT JOIN locations l ON l.sect_id=a.sect_id")
 
 
 def ensure_member_term(actor):
     with storage.world_transaction() as db:
+        existing=db.execute('SELECT * FROM membership_terms WHERE actor=?',(actor,)).fetchone()
+        if existing:return dict(existing)
         day=storage.world_state()['day']
         db.execute('INSERT OR IGNORE INTO membership_terms(actor,next_salary,npc_review) VALUES(?,?,?)',(actor,day+political_seconds(gamedata.SECT_SALARY_SECONDS),day+political_seconds(14400)))
         return dict(db.execute('SELECT * FROM membership_terms WHERE actor=?',(actor,)).fetchone())
@@ -1230,7 +1362,7 @@ def ensure_member_term(actor):
 def political_event(sect,kind,text,*,actor=None,plot=None,public=True,data=None):
     with storage.world_transaction() as db:
         # Routine sect reports remain in sect affairs; the world chronicle is reserved for major changes.
-        major=kind in ('Appointment','Elder assassinated','Sect civil conflict','Takeover succeeded','Takeover failed','Conspiracy exposed')
+        major=kind in ('Council abdication','Appointment','Elder assassinated','Sect civil conflict','Takeover succeeded','Takeover failed','Conspiracy exposed')
         sect_row=db.execute('SELECT name FROM sects WHERE id=?',(sect,)).fetchone()
         sect_name=sect_row['name'] if sect_row else sect
         event=storage.world_event('politics',kind,f'{sect_name} — {text}',actors=[actor] if actor and public else [],sects=[sect],importance=2,visibility=('public' if major else 'local') if public else 'hidden')
@@ -1310,7 +1442,11 @@ def achievement_count(actor):
 
 
 def office_role(state):
-    return state['office'] if state['office'] in gamedata.SECT_SALARIES else 'Direct Disciple' if state['mentor'] else ''
+    if state['office'] in ('Sect Master','Acting Master','Elder'):
+        return state['office']
+    if state['mentor']:
+        return 'Direct Disciple'
+    return 'Member' if state['sect_id'] else ''
 
 
 def appoint(actor,office,*,reason):
@@ -1328,6 +1464,8 @@ def appoint(actor,office,*,reason):
         ensure_member_term(actor)
         db.execute('UPDATE membership_terms SET next_salary=?,paid_role=? WHERE actor=?',(day+political_seconds(gamedata.SECT_SALARY_SECONDS),office,actor))
         db.execute('UPDATE sect_governance SET revision=revision+1 WHERE sect_id=?',(sect,))
+        if office=='Sect Master':
+            db.execute('UPDATE sect_payroll SET incumbent=?,confidence=100 WHERE sect_id=?',(actor,sect))
         prior_role=storage.member_role(state)
         political_event(sect,'Appointment',f"{prior_role} {state['name']} became {office}. {reason}",actor=actor,
                         data={'former_role':prior_role,'new_role':office})
@@ -1356,6 +1494,52 @@ def apply_direct_disciple(actor,mentor):
         return 'Your mentorship is established.'
 
 
+def add_training_power(pc,gain):
+    if pc.get('offline'):
+        character=pc['offline']['character']
+        if character.get('generation')=='seed-v1':
+            character['score']+=gain
+        else:
+            character['power_offset']=character.get('power_offset',character['score']-generator.local_power_base(character))+gain
+    else:
+        pc['mentor_power']=pc.get('mentor_power',0)+gain
+
+
+@storage.atomic
+def solo_cultivation(actor,key='',profiles=None,rng=random):
+    import math
+    import warfare
+    with storage.world_transaction() as db:
+        clock=db.execute('SELECT cooldown,skip_until FROM cultivation_clock WHERE id=1').fetchone()
+        world=storage.world_state()
+        if clock and clock['cooldown']>0:
+            raise logs.SteamError(f"Solo cultivation is ready in {math.ceil(clock['cooldown'])} seconds of active play.")
+        if clock and clock['skip_until']>world['day']+1e-7:
+            raise logs.SteamError('The previous cultivation day is still advancing.')
+        if not actor or storage.profile_field(actor,'world_npc'):
+            raise logs.SteamError('Select your own cultivator to train.')
+        c=generator.build_cultivator(actor,key,profiles or {})[3]
+        if c['death']:raise logs.SteamError('The dead cannot cultivate.')
+        here=storage.require_physical(actor,dangerous=True)
+        home=db.execute('SELECT 1 FROM affiliations a JOIN locations l ON l.sect_id=a.sect_id WHERE a.actor=? AND l.id=?',(actor,here['location'])).fetchone()
+        if not home and here['location'] not in gamedata.PUBLIC_SITES:
+            raise logs.SteamError('Train at your sect headquarters or a public pavilion site.')
+        if not warfare.available_escort(db,actor):
+            raise logs.SteamError('Finish your military or ritual assignment before training.')
+        if ensure_member_term(actor)['train_ready']>world['day']:
+            raise logs.SteamError('You are still recovering from mentor training.')
+        realm=c['realm_index']
+        gain=rng.randint(2,4)+max(0,realm-1)
+        pc=storage.load_profile_cache(actor)
+        add_training_power(pc,gain)
+        storage.save_profile_cache(pc,durable=True)
+        summary=f"Solo cultivation at {here['name']}: +{gain} power."
+        storage.add_activity(actor,dict(at=time.time(),type='adventure',summary=summary))
+        db.execute('INSERT OR REPLACE INTO cultivation_clock VALUES(1,?,300,?,1)',(actor,world['day']+1))
+        db.execute('UPDATE world SET pending_seconds=pending_seconds+seconds_per_day WHERE id=1')
+        return summary
+
+
 @storage.atomic
 def mentor_training(actor):
     a=political_actor(actor);mentor=a['mentor']
@@ -1366,9 +1550,9 @@ def mentor_training(actor):
     if day<term['train_ready']:raise logs.SteamError('Mentor training is available every ten minutes of active play.')
     with storage.world_transaction() as db:
         pc=storage.load_profile_cache(actor);gain=3+min(4,max(0,m['realm']-a['realm']))
-        if pc.get('offline'):
-            s=pc['offline']['character'];s['power_offset']=s.get('power_offset',s['score']-generator.local_power_base(s))+gain
-        else:pc['mentor_power']=pc.get('mentor_power',0)+gain
+        if db.execute('SELECT 1 FROM cultivation_clock WHERE actor=? AND cooldown>0',(actor,)).fetchone():
+            raise logs.SteamError('You are still recovering from solo cultivation.')
+        add_training_power(pc,gain)
         storage.save_profile_cache(pc,durable=True)
         db.execute('UPDATE membership_terms SET train_ready=? WHERE actor=?',(day+political_seconds(gamedata.SECT_TRAIN_SECONDS),actor))
         db.execute('INSERT OR IGNORE INTO relationships(player,npc) VALUES(?,?)',(actor,mentor))
@@ -1472,7 +1656,7 @@ def apply_office(actor,office='Elder'):
     votes=support_count(a['sect_id'],actor,'elder' if office=='Elder' else 'master')
     if votes<max(1,(len(others)+1)//2):raise logs.SteamError('Secure support from at least half of the other council members first.')
     with storage.world_transaction() as db:
-        home=db.execute('SELECT id FROM locations WHERE sect_id=?',(a['sect_id'],)).fetchone()
+        home=storage.seat_location(db,a['sect_id'])
         if home and storage.presence(actor)['location']!=home[0]:raise logs.SteamError('Attend the sect headquarters for an appointment.')
         if office=='Elder':
             if a['office']!='Member':raise logs.SteamError('You already hold a council office.')
@@ -1489,24 +1673,101 @@ def apply_office(actor,office='Elder'):
 
 
 def pay_sect_salaries(sect,day):
+    """Settle one shared pay period atomically. Never mint wages to cover a deficit."""
     with storage.world_transaction() as db:
-        actors=db.execute("SELECT a.actor FROM affiliations a JOIN profiles p ON p.id=a.actor WHERE sect_id=? AND (office IN ('Elder','Sect Master','Acting Master') OR mentor IS NOT NULL) AND json_extract(p.data,'$.life.dead') IS NULL",(sect,)).fetchall()
-        for row in actors:
-            a=political_actor(row[0]);role=office_role(a);term=ensure_member_term(a['actor'])
-            if not role:continue
-            if term['paid_role'] and term['paid_role']!=role:
-                db.execute('UPDATE membership_terms SET next_salary=?,paid_role=? WHERE actor=?',(day+political_seconds(1800),role,a['actor']));continue
-            if day+1e-8<term['next_salary']:continue
-            periods=1+int((day-term['next_salary']+1e-8)/political_seconds(1800));amount=gamedata.SECT_SALARIES[role]*periods
-            token=f"salary:{a['actor']}:{term['next_salary']:.8f}"
-            inserted=db.execute('INSERT OR IGNORE INTO sect_ledger(sect_id,actor,day,kind,amount,token) VALUES(?,?,?,?,?,?)',(sect,a['actor'],day,'salary',amount,token)).rowcount
-            if inserted:
-                # Stipend funding is isolated here for a future territory/economy provider.
-                db.execute('UPDATE sect_governance SET treasury=treasury+? WHERE sect_id=?',(amount,sect))
-                pc=storage.load_profile_cache(a['actor']);pc.setdefault('wallet',{})['spirit_stones']=storage.read_spirit_stones(a['actor'])+amount;storage.save_profile_cache(pc,durable=True)
-                db.execute('UPDATE sect_governance SET treasury=treasury-? WHERE sect_id=?',(amount,sect))
-                storage.add_activity(a['actor'],dict(at=time.time(),type='adventure',summary=f'{role} salary: {amount} Spirit Stones.'))
-            db.execute('UPDATE membership_terms SET next_salary=?,paid_role=? WHERE actor=?',(term['next_salary']+periods*political_seconds(1800),role,a['actor']))
+        payroll=db.execute('SELECT * FROM sect_payroll WHERE sect_id=?',(sect,)).fetchone()
+        if not payroll or day+1e-8<payroll['due']:
+            return
+        due=payroll['due']
+        interval=political_seconds(gamedata.SECT_SALARY_SECONDS)
+        cycle=payroll['cycles']
+        yields=db.execute('SELECT yield_stones FROM spirit_mines WHERE owner=?',(sect,))
+        income=sum(((cycle%4+1)*r[0])//4-((cycle%4)*r[0])//4 for r in yields)
+        import warfare
+        upkeep=warfare.occupation_cost(db,sect)
+        balance=db.execute('SELECT treasury FROM sect_governance WHERE sect_id=?',(sect,)).fetchone()[0]+income
+        balance=max(0,balance-upkeep)
+        roster=db.execute("""SELECT a.*,p.kind,t.next_salary FROM affiliations a JOIN profiles p ON p.id=a.actor
+            LEFT JOIN membership_terms t ON t.actor=a.actor WHERE a.sect_id=? AND json_extract(p.data,'$.life.dead') IS NULL""",(sect,)).fetchall()
+        debts={r['actor']:r for r in db.execute('SELECT * FROM wage_debts WHERE sect_id=?',(sect,))}
+        owed={actor:r['amount'] for actor,r in debts.items()}
+        eligible=[]
+        for member in roster:
+            if member['next_salary'] is None:
+                ensure_member_term(member['actor'])
+                continue
+            if member['next_salary']>due+1e-8:
+                continue
+            actor=member['actor']
+            eligible.append(actor)
+            owed[actor]=owed.get(actor,0)+gamedata.SECT_SALARIES[office_role(member)]
+        total=sum(owed.values())
+        spend=min(total,balance)
+        payments={actor:amount*spend//total for actor,amount in owed.items()}
+        # Largest remainders distribute the final whole stones without overspending.
+        remainder=spend-sum(payments.values())
+        if remainder:
+            priority=sorted(owed,key=lambda actor:(-(owed[actor]*spend%total),actor))
+            for actor in priority[:remainder]:
+                payments[actor]+=1
+        for actor,paid in payments.items():
+            if paid:
+                db.execute("""INSERT INTO salary_credits(actor,amount) VALUES(?,?) ON CONFLICT(actor)
+                    DO UPDATE SET amount=amount+excluded.amount""",(actor,paid))
+            arrears=owed[actor]-paid
+            if arrears:
+                db.execute("""INSERT INTO wage_debts VALUES(?,?,?,1) ON CONFLICT(sect_id,actor)
+                    DO UPDATE SET amount=excluded.amount,misses=misses+1""",(sect,actor,arrears))
+            elif actor in debts:
+                db.execute('DELETE FROM wage_debts WHERE sect_id=? AND actor=?',(sect,actor))
+        for member in roster:
+            actor=member['actor']
+            if member['kind']!='npc' and actor in payments:
+                paid=payments[actor]
+                arrears=owed[actor]-paid
+                summary=f"{office_role(member)} salary: {paid} Spirit Stones."
+                if arrears:
+                    summary+=f" The treasury still owes you {arrears}."
+                storage.add_activity(actor,dict(at=time.time(),type='adventure',summary=summary))
+        db.executemany('UPDATE membership_terms SET next_salary=? WHERE actor=?',((due+interval,a) for a in eligible))
+        db.execute('UPDATE sect_governance SET treasury=? WHERE sect_id=?',(balance-spend,sect))
+        db.execute('UPDATE sect_payroll SET due=?,cycles=cycles+1,last_due=?,last_paid=? WHERE sect_id=?',
+                   (due+interval,total,spend,sect))
+        master=next((r for r in roster if r['office']=='Sect Master'),None)
+        if master:
+            confidence=payroll['confidence'] if master['actor']==payroll['incumbent'] else 100
+            if spend<total:
+                confidence=max(0,confidence-15)
+                unpaid=[r for r in roster if owed.get(r['actor'],0)>payments.get(r['actor'],0) and r['actor']!=master['actor']]
+                db.executemany("""INSERT INTO relationships(player,npc,respect) VALUES(?,?,-5)
+                    ON CONFLICT(player,npc) DO UPDATE SET respect=max(-100,respect-5)""",
+                    ((master['actor'],r['actor']) for r in unpaid))
+                db.execute("UPDATE council_support SET backing=0 WHERE sect_id=? AND candidate=? AND purpose='master'",(sect,master['actor']))
+            else:
+                confidence=min(100,confidence+5)
+            db.execute('UPDATE sect_payroll SET confidence=?,incumbent=? WHERE sect_id=?',(confidence,master['actor'],sect))
+            if confidence<=25 and any(r['office']=='Elder' for r in roster):
+                actor=master['actor']
+                db.execute("UPDATE affiliations SET office='Member',mentor=NULL WHERE actor=?",(actor,))
+                db.execute('UPDATE affiliations SET mentor=NULL WHERE mentor=?',(actor,))
+                db.execute('DELETE FROM council_support WHERE candidate=?',(actor,))
+                political_event(sect,'Council abdication',political_actor(actor)['name']+' was removed as Sect Master after repeated unpaid wages.',
+                                actor=actor)
+                reconcile_leadership(sect,day)
+
+
+def treasury_summary(db,sect):
+    row=db.execute("""SELECT g.treasury,p.last_due,p.last_paid,p.confidence,p.due,
+        (SELECT coalesce(sum(amount),0) FROM wage_debts WHERE sect_id=p.sect_id) arrears,
+        (SELECT coalesce(sum(yield_stones),0) FROM spirit_mines WHERE owner=p.sect_id) income
+        FROM sect_payroll p JOIN sect_governance g USING(sect_id) WHERE p.sect_id=?""",(sect,)).fetchone()
+    if not row:
+        return None
+    result=dict(row)
+    result['wages']=sum(gamedata.SECT_SALARIES[office_role(member)] for member in db.execute(
+        """SELECT a.* FROM affiliations a JOIN profiles p ON p.id=a.actor
+           WHERE a.sect_id=? AND json_extract(p.data,'$.life.dead') IS NULL""",(sect,)))
+    return result
 
 
 def reconcile_leadership(sect,day):
@@ -1515,6 +1776,8 @@ def reconcile_leadership(sect,day):
         for row in dead:
             db.execute("UPDATE affiliations SET office='Former '||office,mentor=NULL WHERE actor=?",(row['actor'],))
             db.execute('UPDATE affiliations SET mentor=NULL WHERE mentor=?',(row['actor'],))
+        if db.execute("SELECT 1 FROM affiliations WHERE sect_id=? AND office='Sect Master' LIMIT 1",(sect,)).fetchone():
+            return
         council=council_members(sect)
         master=next((a for a in council if a['office']=='Sect Master'),None)
         acting=next((a for a in council if a['office']=='Acting Master'),None)
@@ -1544,13 +1807,14 @@ def reconcile_leadership(sect,day):
 
 
 def npc_membership_choices(actor,rng):
-    a=political_actor(actor);term=ensure_member_term(actor);day=storage.world_state()['day']
+    term=ensure_member_term(actor);day=storage.world_state()['day']
+    pending=storage.profile_field(actor,'sect_application')
+    if not pending and day<term['npc_review']:return
+    a=political_actor(actor)
     if not a['npc'] or a['dead']:return
     with storage.world_transaction() as db:
-        pc=storage.load_profile_cache(actor)
-        pending=pc.get('sect_application')
         if pending and not a['sect_id']:
-            target=db.execute('SELECT l.id FROM locations l JOIN sect_charters c ON c.sect_id=l.sect_id WHERE l.sect_id=?',(pending,)).fetchone()
+            target=storage.seat_location(db,pending)
             here=storage.presence(actor)
             if target and here['state']=='present' and day>=term['ready_day']:
                 if here['location']!=target[0]:
@@ -1564,9 +1828,17 @@ def npc_membership_choices(actor,rng):
         if term['ready_day']>day:return
         if not a['sect_id']:
             if rng.random()<.15:
+                pc=storage.load_profile_cache(actor)
                 pc['sect_application']=rng.choice(storage.sect_names())['id'];storage.save_profile_cache(pc,durable=True)
             return
-        if 'Loyal' in a['personalities']:return
+        if 'Loyal' in a['personalities'] or a['office'] in ('Acting Master','Sect Master'):return
+        unpaid=db.execute('SELECT misses FROM wage_debts WHERE sect_id=? AND actor=?',(a['sect_id'],actor)).fetchone()
+        # Reviewed on the existing membership schedule, with smaller risks for office holders.
+        if unpaid:
+            rate={'Member':.06,'Direct Disciple':.045,'Elder':.025}.get(office_role(a),0)
+            if rng.random()<min(.65,rate*unpaid[0]) and storage.presence(actor)['state']=='present':
+                change_sect(actor,None,npc=True)
+                return
         # Concrete dissatisfaction, reviewed every 4–8 active hours, not every action.
         office=a['office']!='Member' or a['mentor']
         hostility=db.execute('SELECT avg(hostility) FROM relationships r JOIN affiliations x ON x.actor=r.player WHERE r.npc=? AND x.sect_id=?',(actor,a['sect_id'])).fetchone()[0] or 0
@@ -1585,10 +1857,10 @@ def active_plot(sect):
         return dict(row) if row else None
 
 
-def start_plot(actor,rng=random):
+def start_plot(actor,rng=random,*,force=False):
     import uuid
     a=political_actor(actor)
-    if a['dead'] or a['office'] not in ('Elder','Acting Master') or 'Loyal' in a['personalities'] or not any(p in a['personalities'] for p in ('Ambitious','Schemer')):raise logs.SteamError('This cultivator will not instigate a takeover.')
+    if a['dead'] or a['office'] not in ('Elder','Acting Master') or (not force and ('Loyal' in a['personalities'] or not any(p in a['personalities'] for p in ('Ambitious','Schemer')))):raise logs.SteamError('This cultivator will not instigate a takeover.')
     with storage.world_transaction() as db:
         if active_plot(a['sect_id']):raise logs.SteamError('A succession plot is already active in this sect.')
         pid=uuid.uuid4().hex;day=storage.world_state()['day']
@@ -1632,11 +1904,13 @@ def resolve_plot(plot,success,reason):
 
 def political_duty(actor):
     """Mobilize NPCs through normal journeys; no distant fights or teleporting."""
-    a=political_actor(actor)
-    plot=active_plot(a['sect_id']) if a['sect_id'] else None
-    if not plot or plot['stage']!='conflict' or a['office'] not in ('Elder','Sect Master','Acting Master'):return False
     with storage.world_transaction() as db:
-        home=db.execute('SELECT id FROM locations WHERE sect_id=?',(a['sect_id'],)).fetchone()
+        council=db.execute("""SELECT sect_id FROM affiliations WHERE actor=?
+            AND office IN ('Elder','Sect Master','Acting Master')""",(actor,)).fetchone()
+        if not council:return False
+        plot=active_plot(council['sect_id'])
+        if not plot or plot['stage']!='conflict':return False
+        home=storage.seat_location(db,council['sect_id'])
         here=storage.presence(actor)
         if home and here['state']=='present' and here['location']!=home[0]:
             view=region_view(actor);start_journey(actor,route_plan(view,home[0],safe=True),view,encounters=False)
@@ -1678,7 +1952,7 @@ def progress_plot(plot,day,rng):
                 if victims:
                     victim=rng.choice(victims);db.execute('UPDATE sect_plots SET assassination_attempted=1 WHERE id=?',(plot['id'],))
                     if rng.random()<.3:
-                        c=generator.build_cultivator(victim['actor'],'',{})[3];storage.mark_dead(victim['actor'],c,'sect_politics')
+                        c=generator.build_cultivator(victim['actor'],'',{})[3];storage.mark_dead(victim['actor'],c,'sect_politics',circumstances=f"was assassinated during a struggle for control of {c['sect']}")
                         record_world_action('death','An elder was assassinated',victim['name']+' died during sect unrest.',[(victim['actor'],c)],subject=victim['actor'],outcome='death',importance=2)
                         political_event(plot['sect_id'],'Elder assassinated',victim['name']+' was found assassinated. The organizer has not been established publicly.',actor=victim['actor'],plot=plot['id'],data={'victim':victim['actor']})
                     else:political_event(plot['sect_id'],'Assassination thwarted','A loyal elder survived an assassination attempt; the organizer remains uncertain.',plot=plot['id'])
@@ -1700,7 +1974,7 @@ def progress_plot(plot,day,rng):
             return
         if plot['stage']=='conflict' and day>=plot['due']:
             import combat
-            home=db.execute('SELECT id FROM locations WHERE sect_id=?',(plot['sect_id'],)).fetchone()[0]
+            home=storage.seat_location(db,plot['sect_id'])[0]
             left=[x for x in attackers if x['npc'] and storage.presence(x['actor'])['state']=='present' and storage.presence(x['actor'])['location']==home and not storage.injury_state(x['actor'])]
             right=[x for x in defenders if x['npc'] and storage.presence(x['actor'])['state']=='present' and storage.presence(x['actor'])['location']==home and not storage.injury_state(x['actor'])]
             won=False
@@ -1717,13 +1991,14 @@ def progress_plot(plot,day,rng):
             if rounds>=3:resolve_plot(plot,wins>=2,'Three confrontations decided control of the sect.')
 
 
-def politics_tick(day):
+def politics_tick(day,*,limit=-1):
     with storage.world_transaction() as db:
-        for gov in db.execute('SELECT * FROM sect_governance WHERE next_tick<=? ORDER BY next_tick,sect_id',(day,)).fetchall():
+        for gov in db.execute('SELECT * FROM sect_governance WHERE next_tick<=? ORDER BY next_tick,sect_id LIMIT ?',(day,limit)).fetchall():
             sect=gov['sect_id'];rng=random.Random(f"politics:{sect}:{gov['next_tick']:.8f}")
             db.execute('UPDATE sect_governance SET next_tick=? WHERE sect_id=?',(day+political_seconds(gamedata.SECT_POLITICS_SECONDS),sect))
             reconcile_leadership(sect,day)
-            pay_sect_salaries(sect,day)
+            import warfare
+            warfare.review(db,sect,day,rng)
             npc_candidate_progress(sect,rng)
             plot=active_plot(sect)
             if plot:progress_plot(plot,day,rng)
@@ -1749,7 +2024,7 @@ def intervene(actor,action,rng=random):
     plot=active_plot(a['sect_id'])
     if not plot:raise logs.SteamError('There are no public warning signs to investigate yet.')
     with storage.world_transaction() as db:
-        home=db.execute('SELECT id FROM locations WHERE sect_id=?',(a['sect_id'],)).fetchone()
+        home=storage.seat_location(db,a['sect_id'])
         if not home or storage.presence(actor)['location']!=home[0]:raise logs.SteamError('Attend sect headquarters to intervene.')
         row=db.execute('SELECT * FROM plot_evidence WHERE plot=? AND observer=?',(plot['id'],actor)).fetchone()
         evidence=row['points'] if row else 0;day=storage.world_state()['day']
@@ -1813,6 +2088,19 @@ def fight_for_sect(actor,side,key='',profiles=None,rng=random):
         if rounds>=3:resolve_plot(plot,wins>=2,'Player and NPC confrontations settled the struggle.')
     return result['story']
 
+def political_notice(actor):
+    """Read only actionable, known plots for the selected living character."""
+    with storage.world_snapshot() as db:
+        row=db.execute("""SELECT p.id,p.stage,p.round,s.name FROM affiliations a
+            JOIN sect_plots p ON p.sect_id=a.sect_id JOIN sects s ON s.id=a.sect_id
+            JOIN profiles v ON v.id=a.actor
+            WHERE a.actor=? AND p.stage IN ('gathering','preparing','conflict')
+            AND json_extract(v.data,'$.life.dead') IS NULL AND
+            (EXISTS(SELECT 1 FROM plot_evidence WHERE plot=p.id AND observer=a.actor AND points>0)
+            OR EXISTS(SELECT 1 FROM political_events WHERE sect_id=a.sect_id AND plot=p.id AND public=1))""",(actor,)).fetchone()
+        return tuple(row) if row else None
+
+
 def sect_management(actor):
     with storage.world_transaction() as db:
         a=political_actor(actor);term=ensure_member_term(actor);day=storage.world_state()['day']
@@ -1820,25 +2108,39 @@ def sect_management(actor):
         council=council_members(a['sect_id']) if registered else []
         for voter in council:
             voter['location']=storage.presence(voter['actor'])
-            voter['disciples']=db.execute('SELECT count(*) FROM affiliations WHERE mentor=?',(voter['actor'],)).fetchone()[0]
+            voter['disciples']=db.execute("SELECT count(*) FROM affiliations a JOIN profiles p ON p.id=a.actor WHERE mentor=? AND json_extract(p.data,'$.life.dead') IS NULL",(voter['actor'],)).fetchone()[0]
             voter['capacity']=2 if voter['office']=='Elder' else 3
             voter['support_chance']=support_chance(a,voter)
             voter['elder_backing']=bool(db.execute("SELECT 1 FROM council_support WHERE sect_id=? AND candidate=? AND voter=? AND purpose='elder' AND backing=1",(a['sect_id'],actor,voter['actor'])).fetchone())
-        reports=[dict(r) for r in db.execute('SELECT e.title,e.summary,e.day FROM political_events p JOIN world_events e ON e.id=p.event WHERE p.sect_id=? AND p.public=1 ORDER BY p.id DESC LIMIT 12',(a['sect_id'],))]
+        reports=[dict(r) for r in db.execute('SELECT e.title,e.summary,e.day,p.plot FROM political_events p JOIN world_events e ON e.id=p.event WHERE p.sect_id=? AND p.public=1 ORDER BY p.id DESC LIMIT 12',(a['sect_id'],))]
         plot=active_plot(a['sect_id']) if registered else None;known=None
         if plot:
             row=db.execute('SELECT points,ready_day FROM plot_evidence WHERE plot=? AND observer=?',(plot['id'],actor)).fetchone()
             evidence=row['points'] if row else 0
             public=bool(db.execute('SELECT 1 FROM political_events WHERE plot=? AND public=1',(plot['id'],)).fetchone())
             if public or evidence:
-                known=dict(stage=plot['stage'],round=plot['round'],evidence=evidence,
+                known=dict(id=plot['id'],stage=plot['stage'],round=plot['round'],evidence=evidence,
                            organizer=political_actor(plot['actor'])['name'] if evidence>=2 or plot['stage']=='conflict' else 'Unconfirmed',
                            choices={action:intervention_chance(actor,action,evidence) for action in ('Investigate','Warn council','Accuse','Negotiate','Back challenger','Defend leadership')})
         role=office_role(a)
-        return dict(actor=a,term=term,catalog=catalog,council=council,reports=reports,plot=known,spirit_stones=storage.read_spirit_stones(actor),
+        economy=treasury_summary(db,a['sect_id'])
+        payday=term['next_salary']
+        if economy:
+            import math
+            interval=political_seconds(gamedata.SECT_SALARY_SECONDS)
+            skipped=max(0,math.ceil((payday-economy['due']-1e-8)/interval))
+            payday=economy['due']+skipped*interval
+        # Read-only dashboard context; action functions remain authoritative.
+        here=storage.presence(actor)
+        home=storage.seat_location(db,a['sect_id']) if registered else None
+        members=db.execute('SELECT count(*) FROM affiliations WHERE sect_id=?',(a['sect_id'],)).fetchone()[0] if registered else 0
+        readiness=dict(presence=here,headquarters=home[0] if home else None,
+                       elder_capacity=max(3,min(6,members//25)),
+                       votes={role:support_count(a['sect_id'],actor,role) for role in ('elder','master')})
+        return dict(readiness=readiness,economy=economy,actor=a,term=term,catalog=catalog,council=council,reports=reports,plot=known,spirit_stones=storage.read_spirit_stones(actor),
                     needs_choice=not registered and a['sect_id'] is not None and not term['repair_used'],
-                    salary=gamedata.SECT_SALARIES.get(role,0),role=role or 'Member',day=day,
-                    salary_seconds=max(0,(term['next_salary']-day)*storage.world_state()['seconds_per_day']),
+                    salary=gamedata.SECT_SALARIES.get(role,0) if registered else 0,role=role or 'Member',day=day,
+                    salary_seconds=max(0,(payday-day)*storage.world_state()['seconds_per_day']),
                     change_seconds=max(0,(term['ready_day']-day)*storage.world_state()['seconds_per_day']))
 
 
@@ -1866,7 +2168,7 @@ def npc_candidate_progress(sect,rng):
         if not voters:return
         purpose='master' if vacancy else 'elder'
         if support_count(sect,a['actor'],purpose)>=max(1,(len(voters)+1)//2):
-            home=db.execute('SELECT id FROM locations WHERE sect_id=?',(sect,)).fetchone()[0]
+            home=storage.seat_location(db,sect)[0]
             here=storage.presence(a['actor'])
             if here['state']=='present':
                 if here['location']!=home:
@@ -1883,3 +2185,31 @@ def npc_candidate_progress(sect,rng):
         try:seek_support(a['actor'],voter['actor'],purpose,bribe,rng)
         except logs.SteamError:pass
 
+
+
+def initialize_frontiers(db):
+    if db.execute('SELECT 1 FROM spirit_mines LIMIT 1').fetchone():
+        # The legacy and new ranges do not overlap. Preserve each established mine's
+        # relative richness and ownership, including worlds reopened after interruption.
+        db.execute("UPDATE spirit_mines SET yield_stones=(3*yield_stones+1)/2 WHERE kind='Small' AND yield_stones BETWEEN 12000 AND 15000")
+        return
+    seed=storage.world_state()['seed']
+    def mine(place,kind,owner,low,high):
+        amount=random.Random(f'{seed}:ore:{place}').randint(low,high)
+        db.execute('INSERT INTO spirit_mines VALUES(?,?,?,?)',(place,kind,owner,amount))
+    for row in db.execute('SELECT id,sect_id FROM locations WHERE sect_id IS NOT NULL').fetchall():
+        mine(row['id'],'Small',row['sect_id'],18000,22500)
+    # Two approach roads per frontier allow through travel between neighboring old districts.
+    borders=((180,100,'r1_7','r4_1'),(820,100,'r1_3','r2_1'),
+             (820,600,'r2_5','r3_3'),(180,600,'r3_7','r4_5'))
+    for district,((cx,cy,left,right),(_,_,names)) in enumerate(zip(borders,gamedata.FRONTIER_DISTRICTS),5):
+        gate,hold,lode=sites=[f'r{district}_{i}' for i in range(3)]
+        for site,name,(dx,dy) in zip(sites,names,((-80,0),(50,-35),(60,55))):
+            db.execute('INSERT INTO locations VALUES(?,?,?,?,?,NULL)',(site,name,district,cx+dx,cy+dy))
+        for src,dst,seconds,danger in ((left,gate,80,2),(right,hold,90,1),(gate,hold,25,1),(hold,lode,30,2)):
+            db.execute('INSERT INTO routes VALUES(?,?,?,?)',(*sorted((src,dst)),seconds,danger))
+        mine(lode,'Large',None,25000,35000)
+    volunteers=db.execute('''SELECT n.id FROM npcs n JOIN affiliations a ON a.actor=n.id JOIN profiles p ON p.id=n.id
+        WHERE a.sect_id IS NULL AND json_extract(p.data,'$.life.dead') IS NULL ORDER BY n.id LIMIT 12''').fetchall()
+    for i,row in enumerate(volunteers):
+        db.execute('INSERT INTO mine_wardens VALUES(?,?)',(row[0],f'r{5+i%4}_2'))

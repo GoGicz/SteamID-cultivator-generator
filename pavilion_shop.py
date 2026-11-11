@@ -46,7 +46,7 @@ def buy_pavilion_item(steamid, c, number):
     are spent, and the item is written into their JSON file (a treasure goes into the
     treasure inventory, everything else into the pavilion goods). One write, so a purchase is
     never half done. Raises SteamError if the choice is not valid or too expensive."""
-    storage.require_physical(steamid)
+    require_market(steamid,"sect")
     try:
         n = int(str(number).strip().lstrip("#"))
     except ValueError:
@@ -140,7 +140,7 @@ def sell_rows(c):
 def sell_treasure(steamid, c, number):
     """Sells treasure number `number` (as listed by sell_rows) for half its value. The treasure
     leaves the inventory and the sect points are credited, in one write. Raises SteamError."""
-    storage.require_physical(steamid)
+    require_market(steamid,"sect")
     rows = sell_rows(c)
     if not rows:
         raise logs.SteamError(f"{c['name']} owns no treasure to sell.")
@@ -178,3 +178,132 @@ def sell_treasure(steamid, c, number):
     logs.RUN_LOG.note(f"sell: {c['name']} ({steamid}) sold {row['name']} for {row['price']} sect points "
                       f"(worth {row['value']}), now {c['sect_points']}")
     return row
+
+
+def markets(actor):
+    here=storage.presence(actor)
+    site=here.get('location') if here['state']=='present' else None
+    result=[]
+    if site in gamedata.PUBLIC_SITES:result.append('public')
+    with storage.world_transaction() as db:
+        row=db.execute('SELECT a.sect_id FROM affiliations a JOIN sect_charters c ON c.sect_id=a.sect_id WHERE a.actor=?',(actor,)).fetchone()
+        if row and site:
+            seat=storage.seat_location(db,row[0])
+            # Refuge can house multiple councils. Each trader uses their own stock and discount.
+            if seat and seat[0]==site:result.append('sect')
+    return result
+
+
+def require_market(actor,market):
+    storage.require_physical(actor)
+    if storage.load_profile_cache(actor).get('life',{}).get('dead'):
+        raise logs.SteamError('The dead cannot trade.')
+    if market not in markets(actor):
+        raise logs.SteamError('Visit one of the five public markets.' if market=='public' else 'Return to your own sect seat to use the Martial Pavilion.')
+
+
+def consume(actor,item):
+    pav=storage.read_pavilion(actor)
+    if pav['items'].get(item,0)<1:raise logs.SteamError('You need one '+gamedata.PAVILION_BY_ID[item]['name']+'.')
+    pav['items'][item]-=1
+    storage.write_pavilion(actor,pav['items'],pav['spent'],dict(at=time.time(),type='pill used',item=gamedata.PAVILION_BY_ID[item]['name']))
+
+
+@storage.atomic
+def heal(actor,item):
+    storage.require_physical(actor)
+    if item not in ('qi_gathering_pill','meridian_cleansing_pill'):raise logs.SteamError('Choose a healing pill.')
+    injury=storage.injury_state(actor)
+    if not injury or storage.load_profile_cache(actor).get('life',{}).get('dead'):raise logs.SteamError('A living, injured cultivator is required.')
+    day=storage.world_state()['day']
+    fraction=.5 if item=='meridian_cleansing_pill' else .15
+    until=day+(injury['until_day']-day)*(1-fraction)
+    consume(actor,item)
+    with storage.world_transaction() as db:db.execute('UPDATE injuries SET until_day=? WHERE actor=?',(until,actor))
+    return until
+
+
+def public_sell_price(item):
+    if item in gamedata.PUBLIC_PRICES:return gamedata.PUBLIC_PRICES[item]//2
+    return max(1,gamedata.PAVILION_BY_ID[item]['price']//10)
+
+
+@storage.atomic
+def public_trade(actor,c,action,item):
+    require_market(actor,'public')
+    pc=storage.load_profile_cache(actor)
+    balance=storage.read_spirit_stones(actor)
+    pav=storage.read_pavilion(actor)
+    goods=pav['items']
+    if action=='buy':
+        if item not in gamedata.PUBLIC_PRICES:raise logs.SteamError('This item is unavailable.')
+        price=gamedata.PUBLIC_PRICES[item]
+        if balance<price:raise logs.SteamError('Not enough Spirit Stones.')
+        goods[item]=goods.get(item,0)+1
+        delta=-price
+    elif action=='sell goods':
+        if item==gamedata.DAO_PILL or item not in gamedata.PAVILION_BY_ID or goods.get(item,0)<1:raise logs.SteamError('This item cannot be sold.')
+        delta=public_sell_price(item)
+        goods[item]-=1
+        if not goods[item]:del goods[item]
+    elif action=='sell treasure':
+        inv=pc.get('inventory')
+        if not inv or item not in inv['treasures']:raise logs.SteamError('This treasure is no longer owned.')
+        inv['treasures'].remove(item)
+        delta=max(1,sale_price(item)//5)
+        inv['history']=(inv['history']+[dict(at=time.time(),type='sold',item=item,other='public pavilion',price=delta)])[-storage.INVENTORY_HISTORY_LIMIT:]
+    else:raise logs.SteamError('Unknown trade.')
+    name=item if action=='sell treasure' else gamedata.PAVILION_BY_ID[item]['name']
+    pc['pavilion']=pav
+    pc.setdefault('wallet',{})['spirit_stones']=balance+delta
+    storage.save_profile_cache(pc,durable=True)
+    receipt=f"{'Bought' if delta<0 else 'Sold'} {name} for {abs(delta)} Spirit Stones."
+    storage.add_activity(actor,dict(at=time.time(),type='adventure',summary=receipt))
+    return receipt
+
+
+def shop_duty(db,actor,c,nature,here,day,rng):
+    import progress
+    items=c['pavilion']['items']
+    injury=c.get('injury')
+    ready=c['eligible_realm_index']>c['realm_index']
+    need=None
+    if ready and c['realm_index']==1 and not items.get('foundation_pill'):need='foundation_pill'
+    elif ready and c['realm_index'] in range(2,8) and 'Lazy' in nature and not items.get('breakthrough_pill'):need='breakthrough_pill'
+    elif 'Lazy' in nature:return False
+    elif injury and any(items.get(i) for i in ('meridian_cleansing_pill','qi_gathering_pill')):
+        pc=storage.load_profile_cache(actor)
+        if pc.get('last_healing_until')!=injury['until_day']:
+            item='meridian_cleansing_pill' if items.get('meridian_cleansing_pill') else 'qi_gathering_pill'
+            until=heal(actor,item)
+            pc=storage.load_profile_cache(actor);pc['last_healing_until']=until
+            storage.save_profile_cache(pc,durable=True)
+            db.execute("UPDATE npcs SET steps=steps+1,activity='Taking a healing pill',next_day=? WHERE id=?",(day+.1,actor))
+            return True
+        return False
+    elif ready and c['realm_index'] in range(2,8) and 'Ambitious' in nature and not items.get('breakthrough_pill'):need='breakthrough_pill'
+    elif items.get('qi_gathering_pill',0)<(3 if 'Cautious' in nature else 1):need='qi_gathering_pill'
+    elif 'Cautious' in nature and not items.get('meridian_cleansing_pill'):need='meridian_cleansing_pill'
+    if not need:return False
+    candidates=[]
+    if need in gamedata.PUBLIC_PRICES and c['spirit_stones']>=gamedata.PUBLIC_PRICES[need]:
+        candidates.extend((site,'public') for site in gamedata.PUBLIC_SITES)
+    index=next((i for i,v in enumerate(gamedata.PAVILION_ITEMS,1) if v['id']==need),None)
+    if index and c['sect']!='Wanderer' and discounted_item(c,gamedata.PAVILION_BY_ID[need])['price']<=c['sect_points']:
+        row=db.execute('SELECT a.sect_id FROM affiliations a JOIN sect_charters s ON s.sect_id=a.sect_id WHERE a.actor=?',(actor,)).fetchone()
+        seat=storage.seat_location(db,row[0]) if row else None
+        if seat:candidates.append((seat[0],'sect'))
+    if not candidates:return False
+    local=next((market for site,market in candidates if site==here['location']),None)
+    if local:
+        if local=='public':public_trade(actor,c,'buy',need)
+        else:buy_pavilion_item(actor,c,index)
+        delay=60;activity='Buying '+gamedata.PAVILION_BY_ID[need]['name']
+    else:
+        view=progress.region_view(actor)
+        plans=[progress.route_plan(view,site) for site,_ in candidates]
+        plan=min(plans,key=lambda p:(p['seconds'],p['road_seconds']))
+        progress.start_journey(actor,plan,view,encounters=True,rng=rng)
+        delay=plan['seconds'];activity='Travelling to a pavilion'
+    db.execute('UPDATE npcs SET steps=steps+1,activity=?,next_day=? WHERE id=?',(activity,day+delay/storage.world_state()['seconds_per_day'],actor))
+    return True

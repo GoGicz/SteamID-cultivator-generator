@@ -52,7 +52,7 @@ the cache folder (or a profile's JSON file) resets it to the starting treasure.
 Duels also change reputation, by realm only: when the winner is in a lower realm than the
 loser, the winner gains 25 reputation per realm of difference and the loser loses 20 per
 realm (only 10 per realm if both are Righteous). Same realm, or the stronger realm winning,
-changes nothing. The points are saved in the profile's JSON file and shown as "Duels" in
+changes nothing. The points are saved in the profile's JSON file and included in "Reputation adjustment" in
 the card's fame boosts; reputation never goes below 0. The dead cannot duel: a cultivator
 who died in their fate cannot be used in "mocb".
 Type "pavilion" to open the sect's Martial Pavilion for the cultivator you looked up
@@ -219,6 +219,14 @@ def run_breakthrough(args, key, profiles, session):
     display.wrap_words("  ", f"BREAKTHROUGH  -  {c['name']}: {st['current']} to {st['next']}")
     print(line)
     use_pill = False
+    if c['realm_index']==8:
+        import warfare
+        if input('Gather protectors before starting? [y/N] ').lower()=='y':
+            print(warfare.gather_protectors(steamid,c),'protectors pledged.')
+        if input('Consume the Dao Integration Pill and hold this site for five days? [y/N] ').lower()=='y':
+            print(progress.attempt_breakthrough(steamid,c)['ritual'])
+        return
+    if c['realm_index']==1:print('One Foundation Establishment Pill is consumed even on failure.')
     for ln in progress.breakthrough_lines(st["chance"]):
         display.wrap_words("  ", ln)
     display.wrap_words("  ", progress.breakthrough_risk_text(st))

@@ -3,7 +3,7 @@ elements, treasures and pavilion goods, signature moves."""
 
 import time
 
-VERSION = "v0.6.5-DEV"    # shared GUI and terminal version
+VERSION = "v0.9.14-DEV"    # shared GUI and terminal version
 
 SECT_RANKS = [(0, "Random sect initiate"), (200, "Sect Junior outer disciple"),
               (400, "Sect Outer disciple"), (600, "Sect Inner disciple"),
@@ -245,11 +245,11 @@ TALISMAN_ID = "spatial_escape_talisman"
 TALISMAN_SINGLE_USE = True
 PAVILION_ITEMS = [
     {"id": "qi_gathering_pill", "name": "Qi Gathering Pill", "kind": "Pill", "price": 100,
-     "blurb": "Gathers a little Qi. Nobody has ever complained about it."},
+     "blurb": "Reduces remaining injury time by 15%."},
     {"id": "meridian_cleansing_pill", "name": "Meridian Cleansing Pill", "kind": "Pill",
-     "price": 250, "blurb": "Clears blocked meridians. Tastes like swamp water."},
+     "price": 250, "blurb": "Reduces remaining injury time by 50%."},
     {"id": "foundation_pill", "name": "Foundation Establishment Pill", "kind": "Pill",
-     "price": 600, "blurb": "Steadies the Dao foundation before a breakthrough."},
+     "price": 600, "blurb": "Required and consumed for each Foundation Establishment attempt."},
     {"id": "soul_restoring_pill", "name": "Nine-Turn Soul Restoring Pill", "kind": "Pill",
      "price": 1200, "blurb": "Calls a wounded soul back from the edge."},
     {"id": "breakthrough_pill", "name": "Heaven-Defying Breakthrough Pill", "kind": "Pill",
@@ -277,7 +277,18 @@ PAVILION_ITEMS = [
      "blurb": "Single use: when a Demonic winner tries to steal your treasure, space folds "
               "and the treasure slips out of reach."},
 ]
-PAVILION_BY_ID = {item["id"]: item for item in PAVILION_ITEMS}
+PUBLIC_SITES = {'r0_4':'Jade Market','r1_5':'Snowfall Village','r4_5':'Red Canyon',
+                'r2_4':'Mistwood Valley','r3_5':'Reed Village'}
+PUBLIC_PRICES = {'qi_gathering_pill':30,'meridian_cleansing_pill':100,'foundation_pill':300,
+                 'basic_cauldron':100,'silverleaf':10,'cloudroot':15,'moonlotus':20}
+PUBLIC_GOODS = [
+    dict(id='basic_cauldron',name='Basic Alchemy Cauldron',kind='Cauldron',blurb='A vessel for preparing remedies.'),
+    dict(id='silverleaf',name='Silverleaf Bundle',kind='Herb',blurb='Freshly gathered silverleaf.'),
+    dict(id='cloudroot',name='Cloudroot Bundle',kind='Herb',blurb='A bundle of fragrant cloudroot.'),
+    dict(id='moonlotus',name='Moon Lotus Bundle',kind='Herb',blurb='Moon lotus blossoms for alchemy.')]
+DAO_PILL='dao_integration_pill'
+PAVILION_BY_ID = {item["id"]: item for item in list(PAVILION_ITEMS)+PUBLIC_GOODS}
+PAVILION_BY_ID[DAO_PILL]=dict(id=DAO_PILL,name='Dao Integration Pill',kind='Inheritance',blurb='Begins the five-day ascension ritual.')
 PAVILION_TREASURE_RANKS = {item["name"]: item["rank"] for item in PAVILION_ITEMS
                            if item["kind"] == "Treasure"}
 
@@ -332,7 +343,7 @@ ELEMENT_BEATS = {
 
 
 # World personalities are independent of the legacy trait bonus definitions.
-WORLD_PERSONALITIES = ('Ambitious', 'Cautious', 'Loyal', 'Competitive',
+WORLD_PERSONALITIES = ('Lazy', 'Ambitious', 'Cautious', 'Loyal', 'Competitive',
                        'Adventurous', 'Sociable', 'Schemer')
 # Fixed geography: four headquarters and four public landmarks per district.
 REGION_DISTRICTS = (
@@ -346,6 +357,7 @@ REGION_DISTRICTS = (
 
 # Behavior weights: cultivation, mission, adventure, travel, duel, conversation.
 NPC_ACTIVITY_WEIGHTS = {
+    'Lazy': (50,12,8,5,2,18),
     'Ambitious': (45,20,10,10,12,3), 'Cautious': (50,22,4,12,1,11),
     'Loyal': (30,40,5,10,5,10), 'Competitive': (25,10,8,15,35,7),
     'Adventurous': (15,10,32,32,8,3), 'Sociable': (15,12,8,25,5,35),
@@ -360,7 +372,7 @@ INJURY_RECOVERY_SECONDS = 600
 
 # Political policies use active-play seconds; future economy/diplomacy can replace
 # funding and rivalry providers without changing membership or event identities.
-SECT_SALARIES = {'Direct Disciple':50,'Elder':200,'Sect Master':500,'Acting Master':500}
+SECT_SALARIES = {'Member':20,'Direct Disciple':50,'Elder':200,'Sect Master':500,'Acting Master':500}
 SECT_SALARY_SECONDS = 1800
 SECT_CHANGE_SECONDS = 7200
 SECT_TRAIN_SECONDS = 600
@@ -369,3 +381,11 @@ SECT_ELDER_REPUTATION = 1200
 
 SECT_SUCCESSION_SECONDS = 5400
 SECT_EARLY_ELECTION_SECONDS = 600
+
+# New regions occupy the four corners around the original five districts.
+FRONTIER_DISTRICTS = (
+    ('Frostglass Reach','#364958',('Rimegate Pass','Lantern Hold','Frostglass Lode')),
+    ('Amber Vale','#504a32',('Saffron Pass','Amberwatch','Sunstone Lode')),
+    ('Cinnabar Coast','#523f43',('Gullwing Pass','Tidewatch','Cinnabar Lode')),
+    ('Moonreed Fen','#384a49',('Heron Pass','Reedwatch','Moonwell Lode')),
+)

@@ -93,37 +93,86 @@ def profile_cache_path(steamid):
     return os.path.join(CACHE_DIR, f"{steamid}.profile.json")
 
 
-def load_profile_cache(steamid, cache=None):
+def _profile_read(steamid,cache,field,default):
     with world_transaction(cache) as db:
-        row = db.execute('SELECT data FROM profiles WHERE id=?', (str(steamid),)).fetchone()
+        # A world transaction/snapshot owns one stable SQLite view. Any DML,
+        # including salary credits or direct profile edits, invalidates raw reads.
+        token=(id(db),db.total_changes,db.in_transaction)
+        raw_reads=getattr(_world_local,'raw_profile_reads',None)
+        if raw_reads is None or raw_reads[0]!=token:
+            raw_reads=(token,{});_world_local.raw_profile_reads=raw_reads
+        rows=raw_reads[1];actor=str(steamid)
+        if actor not in rows:
+            if len(rows)>=64:rows.clear()
+            rows[actor]=paid_profile_row(db,steamid)
+        row=rows[actor]
         if not row:
-            return {"version": PROFILE_CACHE_VERSION, "steamid": str(steamid), "sections": {}}
+            return default if field is not None else {"version": PROFILE_CACHE_VERSION, "steamid": str(steamid), "sections": {}}
+        raw=row[0]
+        cache_data=getattr(_world_local,'profile_reads',None)
+        if cache_data is None:
+            cache_data={};_world_local.profile_reads=cache_data
+        previous=cache_data.get(str(steamid))
         try:
-            data=decode_profile_json(row[0])
-            if not isinstance(data,dict) or data.get('steamid')!=str(steamid) or data.get('version')!=PROFILE_CACHE_VERSION or not isinstance(data.get('sections'),dict):
-                raise ValueError('Invalid profile identity or format.')
-            return data
+            if previous and previous[0]==raw:
+                # Compare authoritative bytes refreshed after database writes.
+                # Cached values never escape to mutable callers.
+                if field is None:return json.loads(raw)
+                data=previous[1]
+                if data is None:
+                    data=json.loads(raw);cache_data[str(steamid)]=(raw,data)
+            else:
+                data=decode_profile_json(raw)
+                if not isinstance(data,dict) or data.get('steamid')!=str(steamid) or data.get('version')!=PROFILE_CACHE_VERSION or not isinstance(data.get('sections'),dict):
+                    raise ValueError('Invalid profile identity or format.')
+                if len(cache_data)>=64:cache_data.clear()
+                cache_data[str(steamid)]=(raw,None if field is None else data)
+                if field is None:return data
+            return copy.deepcopy(data.get(field,default))
         except (ValueError,TypeError) as exc:
             raise logs.SteamError(f'Invalid saved profile {steamid}: {exc}. Restore a backup or repair it in Developer tools.') from exc
+
+
+def load_profile_cache(steamid, cache=None):
+    return _profile_read(steamid,cache,None,None)
+
+
+def profile_field(steamid,field,default=None):
+    return _profile_read(steamid,None,field,default)
 
 
 def save_profile_cache(pc, *, durable=False):
     # All gameplay writes are durable now; retained keyword keeps callers compatible.
     with world_transaction() as db:
-        old = load_profile_cache(pc['steamid'])
-        value = copy.deepcopy(pc)
-        def events(data):
-            result = list(data.get('activity', []))
-            for section in ('inventory','pavilion','duel_reputation'):
-                result += (data.get(section) or {}).get('history', [])
-            for member in (data.get('sect_memberships') or {}).values():
-                result += member.get('history', [])
-            return result
-        previous = [e for e in events(old) if isinstance(e,dict)]
-        day = world_state()['day']
-        for event in events(value):
-            if isinstance(event,dict) and 'world_day' not in event and event not in previous:
-                event['world_day'] = day
+        # Copy only history lists containing a newly dated event. Other fields
+        # are serialized synchronously without changing caller-owned objects.
+        value=pc.copy()
+        previous=None
+        day=None
+        def dated(container,key):
+            nonlocal previous,day
+            entries=container.get(key,[])
+            result=entries
+            for index,event in enumerate(entries):
+                if not isinstance(event,dict) or 'world_day' in event:continue
+                if previous is None:
+                    old=load_profile_cache(pc['steamid'])
+                    previous=list(old.get('activity',[]))
+                    for section in ('inventory','pavilion','duel_reputation'):
+                        previous.extend((old.get(section) or {}).get('history',[]))
+                    for member in (old.get('sect_memberships') or {}).values():
+                        previous.extend(member.get('history',[]))
+                if event in previous:continue
+                if day is None:day=world_state()['day']
+                if result is entries:result=list(entries)
+                result[index]=dict(event,world_day=day)
+            return container if result is entries else dict(container,**{key:result})
+        value=dated(value,'activity')
+        for section in ('inventory','pavilion','duel_reputation'):
+            if value.get(section):value[section]=dated(value[section],'history')
+        if value.get('sect_memberships'):
+            value['sect_memberships']={sect:dated(member,'history') for sect,member in value['sect_memberships'].items()}
+        fold_salary_credit(db,steamid=value['steamid'])
         _write_profile(db, value)
         return True
 
@@ -136,7 +185,7 @@ def inventory_valid(inv):
 
 def read_inventory(steamid):
     """(treasures, history) saved for this profile, or None if it has no inventory yet."""
-    inv = load_profile_cache(steamid).get("inventory")
+    inv = profile_field(steamid,"inventory")
     if not inventory_valid(inv):
         return None
     return list(inv["treasures"]), [e for e in inv["history"] if isinstance(e, dict)]
@@ -160,7 +209,7 @@ def read_pavilion(steamid):
     """{'items': {id: count}, 'spent': sect points spent, 'earned': the most sect points ever
     credited, 'history': [...]} saved for this profile; all empty if nothing was ever bought
     here (or the saved data is damaged)."""
-    d = load_profile_cache(steamid).get("pavilion")
+    d = profile_field(steamid,"pavilion")
     empty = {"items": {}, "spent": 0, "earned": 0, "bonus": 0, "history": []}
     def whole(v, low):
         return isinstance(v, int) and not isinstance(v, bool) and v >= low
@@ -197,7 +246,7 @@ PEAK_FIELDS = ("level", "game_count", "top_hours", "badges")
 
 
 def read_peaks(steamid):
-    d = load_profile_cache(steamid).get("peaks")
+    d = profile_field(steamid,"peaks")
     if not isinstance(d, dict):
         return {}
     good = {}
@@ -253,7 +302,7 @@ def read_life(steamid):
     """{'dead': the death record saved when they died (None if alive), 'last_roll': time of the
     last rebirth roll, 'incarnation': the new body of a reborn cultivator, 'rebirths': how
     many times they were reborn}. Damaged data counts as 'nothing saved'."""
-    d = load_profile_cache(steamid).get("life")
+    d = profile_field(steamid,"life")
     out = {"dead": None, "last_roll": None, "incarnation": None, "rebirths": 0}
     if not isinstance(d, dict):
         return out
@@ -280,7 +329,7 @@ def write_life(steamid, dead=_KEEP, last_roll=_KEEP, incarnation=_KEEP, rebirths
     """Saves the parts given (None clears dead/incarnation) and keeps the rest."""
     cur = read_life(steamid)
     if isinstance(dead,dict) and 'world_day' not in dead:
-        clock=load_profile_cache(steamid).get('calendar')
+        clock=profile_field(steamid,'calendar')
         if clock:
             dead=dict(dead,world_day=world_state()['day'],year=int(world_state()['day'])//DAYS_PER_YEAR)
     for k, v in (("dead", dead), ("last_roll", last_roll), ("incarnation", incarnation),
@@ -295,7 +344,7 @@ def write_life(steamid, dead=_KEEP, last_roll=_KEEP, incarnation=_KEEP, rebirths
 def read_realm_state(steamid):
     """{'realm_index': the realm they hold (None if never saved), 'last_failed': time of the
     last failed breakthrough or None}. The realm only changes through a breakthrough."""
-    d = load_profile_cache(steamid).get("realm_state")
+    d = profile_field(steamid,"realm_state")
     out = {"realm_index": None, "last_failed": None, "lifespan_lost": 0, "born_realm": None, "vitals": None}
     if isinstance(d, dict):
         v = d.get("vitals")
@@ -343,7 +392,10 @@ ACTIVITY_LIMIT = 200
 
 def read_activity(steamid):
     """What this cultivator did recently that nothing else records: duels and breakthroughs."""
-    d = load_profile_cache(steamid).get("activity")
+    return _activity_entries(profile_field(steamid,"activity"))
+
+
+def _activity_entries(d):
     return [e for e in d if isinstance(e, dict) and isinstance(e.get("at"), (int, float))] \
         if isinstance(d, list) else []
 
@@ -352,7 +404,7 @@ def add_activity(steamid, event):
     pc = load_profile_cache(steamid)
     if pc.get('world_npc'):
         event=dict(event,routine=not significant_activity(event))
-    pc["activity"] = (read_activity(steamid) + [event])[-ACTIVITY_LIMIT:]
+    pc["activity"] = (_activity_entries(pc.get('activity')) + [event])[-ACTIVITY_LIMIT:]
     return save_profile_cache(pc)
 
 
@@ -462,7 +514,7 @@ def history_entries(steamid, limit=80):
 
 def read_duel_rep(steamid):
     """(points, history) of the fame or shame this profile won in duels; (0, []) if none."""
-    d = load_profile_cache(steamid).get("duel_reputation")
+    d = profile_field(steamid,"duel_reputation")
     if (isinstance(d, dict) and isinstance(d.get("points"), int) and not isinstance(d["points"], bool)
             and isinstance(d.get("history"), list)):
         return d["points"], [e for e in d["history"] if isinstance(e, dict)]
@@ -647,9 +699,14 @@ def validate_profile_data(data, steamid):
         raise ValueError("SteamID must match the filename; sections must be an object.")
     if 'sect_override' in data and (not isinstance(data['sect_override'],str) or not data['sect_override'].strip() or len(data['sect_override'])>300):raise ValueError('Invalid membership override.')
     if 'mentor_power' in data and (type(data['mentor_power']) is not int or not 0<=data['mentor_power']<=1000000000):raise ValueError('Invalid mentor training power.')
+    partners=data.get('practice_partners',{})
+    if not isinstance(partners,dict) or any(not isinstance(sid,str) or type(until) not in (int,float)
+            or not 0<=until<=1e12+1 for sid,until in partners.items()):
+        raise ValueError('Invalid duel practice cooldowns.')
     def whole(value, label, low=None, high=None):
         if type(value) is not int or (low is not None and value < low) or (high is not None and value > high):
             raise ValueError(f"{label}: expected integer" + (f" >= {low}" if low is not None else "") + (f" <= {high}" if high is not None else ""))
+    whole(data.get("completed_sect_missions",0),"Completed sect missions",0)
     for section in ("realm_state", "pavilion", "inventory", "life", "duel_reputation", "peaks"):
         if section in data and not isinstance(data[section], dict):
             raise ValueError(f"{section} must be an object.")
@@ -841,7 +898,7 @@ def ensure_sect(steamid, c):
 
 def read_spirit_stones(steamid):
     """Unspent placeholder currency; legacy profiles start at zero."""
-    wallet = load_profile_cache(steamid).get("wallet", {})
+    wallet = profile_field(steamid,"wallet", {})
     value = wallet.get("spirit_stones", 0) if isinstance(wallet, dict) else 0
     return value if type(value) is int and value >= 0 else 0
 
@@ -867,11 +924,12 @@ class EditableProfile:
         self.path = Path(path)  # logical ID locator for the existing editor UI
         self.steamid = self.path.name.removesuffix('.profile.json')
         with world_transaction(self.path.parent) as db:
-            row = db.execute('SELECT data,revision FROM profiles WHERE id=?',(self.steamid,)).fetchone()
+            row = paid_profile_row(db,self.steamid)
             if row is None:
                 raise ValueError('No such profile in the world database.')
             self.data = json.loads(row['data'])
             self.revision = row['revision']
+            self.credit = row['credit']
         self.original = json.dumps(self.data,ensure_ascii=False).encode('utf-8')
         validate_profile_data(self.data,self.steamid)
 
@@ -882,8 +940,8 @@ class EditableProfile:
         with _world_lock:
             backup = backup_world(self.path.parent)
             with world_transaction(self.path.parent) as db:
-                row = db.execute('SELECT revision FROM profiles WHERE id=?',(self.steamid,)).fetchone()
-                if row is None or row[0] != self.revision:
+                row = paid_profile_row(db,self.steamid)
+                if row is None or row['revision'] != self.revision or row['credit'] != self.credit:
                     raise ValueError('The game or another editor changed this save. Reload before saving.')
                 value = copy.deepcopy(data)
                 # Explicit age edits reanchor this incarnation to the shared date.
@@ -898,7 +956,9 @@ class EditableProfile:
                     value['calendar']={'birth_day':day-after['age']*DAYS_PER_YEAR,
                                        'synchronized_day':day,'incarnation':inc.get('count',0),
                                        'base_lifespan':vitals.get('base_lifespan',after['lifespan'])}
+                fold_salary_credit(db,self.steamid)
                 _write_profile(db,value)
+                self.credit=0
                 self.revision += 1
         self.data = value
         self.original = payload
@@ -918,6 +978,29 @@ import time
 import uuid
 
 _world_lock = threading.RLock()
+# Entries exist only while a session owns an open local WAL connection.
+_checkpoint_worlds = set()
+# Physical paths are pinned only for the lifetime of the owning world session.
+# Other caches (including editor previews) retain independent identities.
+_session_paths = {}
+_session_path_lock = threading.Lock()
+
+
+def _database_key(cache=None):
+    return os.path.normcase(os.path.abspath(os.path.join(os.fspath(cache or CACHE_DIR), 'world.db')))
+
+
+def _world_path(cache=None):
+    with _session_path_lock:
+        pinned = _session_paths.get(_database_key(cache))
+    return pinned[1] if pinned else database_path(cache).resolve()
+
+
+def _release_world_paths(owner):
+    with _session_path_lock:
+        for key in [key for key, value in _session_paths.items() if value[0] == owner]:
+            del _session_paths[key]
+
 _world_local = threading.local()
 WORLD_YEAR = 3200
 DAYS_PER_YEAR = 365
@@ -993,14 +1076,16 @@ def _migrate_calendar_epoch(db, path):
 
 
 def _open_world(cache=None):
-    path = database_path(cache)
+    with _session_path_lock:
+        pinned = _session_paths.get(_database_key(cache))
+    path = pinned[1] if pinned else database_path(cache)
     path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(path, timeout=15, isolation_level=None)
     db.row_factory = sqlite3.Row
     try:
         db.execute("PRAGMA foreign_keys=ON")
         version = db.execute("PRAGMA user_version").fetchone()[0]
-        if version > 6:
+        if version > 9:
             raise logs.SteamError("This world was saved by a newer game version. Please upgrade the game.")
         if version == 0:
             db.execute("BEGIN IMMEDIATE")
@@ -1059,6 +1144,18 @@ def _open_world(cache=None):
             _migrate_sect_politics(db,path)
         if db.execute("PRAGMA user_version").fetchone()[0] == 5:
             _migrate_storage_retention(db,path)
+        if db.execute("PRAGMA user_version").fetchone()[0] == 6:
+            _migrate_territory(db,path)
+        if db.execute('PRAGMA user_version').fetchone()[0]==7:
+            import warfare
+            warfare.migrate(db,path)
+        if db.execute('PRAGMA user_version').fetchone()[0]==8:
+            import warfare
+            warfare.migrate_rituals(db,path)
+        db.execute("""CREATE TABLE IF NOT EXISTS cultivation_clock(
+            id INTEGER PRIMARY KEY CHECK(id=1), actor TEXT NOT NULL, cooldown REAL NOT NULL,
+            skip_until REAL NOT NULL, first_tick INTEGER NOT NULL)""")
+        _apply_retention_policy(db,path)
         return db
     except BaseException:
         db.rollback()
@@ -1067,25 +1164,33 @@ def _open_world(cache=None):
 
 
 @contextlib.contextmanager
-def world_transaction(cache=None):
+def world_transaction(cache=None, *, _connection=None):
     """One committed action, including all participants; nested actions share it."""
     # Nested calls already own the outer lock/connection. Compare the lexical key
     # first; only an explicit alternate spelling needs filesystem canonicalization.
-    key = os.path.normcase(os.path.abspath(os.path.join(os.fspath(cache or CACHE_DIR), 'world.db')))
+    cache = cache or getattr(_world_local,'debug_cache',None)
+    key = _database_key(cache)
     active = getattr(_world_local, 'active', None)
     if active:
-        if active[2] != key and active[0] != str(database_path(cache).resolve()):
+        if active[2] != key and active[0] != str(_world_path(cache)):
             raise logs.SteamError('Cannot write two worlds in the same action.')
         yield active[1]
         return
-    path = str(database_path(cache).resolve())
+    path = str(_world_path(cache))
+    started=time.monotonic()
     with _world_lock:
-        db = _open_world(cache)
+        acquired=time.monotonic()
+        db = _connection if _connection is not None else _open_world(cache)
         try:
+            if path in _checkpoint_worlds:
+                db.execute('PRAGMA wal_autocheckpoint=0')
             db.execute('BEGIN IMMEDIATE')
             _world_local.active = (path, db, key)
+            opened=time.monotonic()
             yield db
+            committing=time.monotonic()
             db.commit()
+            committed=time.monotonic()
         except sqlite3.Error as exc:
             db.rollback()
             raise logs.SteamError(f'World save failed; the action was rolled back: {exc}') from exc
@@ -1094,7 +1199,50 @@ def world_transaction(cache=None):
             raise
         finally:
             _world_local.active = None
+            _world_local.last_profile = None
+            _world_local.profile_reads = None
+            _world_local.raw_profile_reads = None
+            if _connection is None:db.close()
+    finished=time.monotonic()
+    if finished-started>=.25 and threading.current_thread() is not threading.main_thread():
+        logs.performance_note(f'{threading.current_thread().name} transaction: lock {acquired-started:.2f}s, open/begin {opened-acquired:.2f}s, work {committing-opened:.2f}s, commit {committed-committing:.2f}s, close {finished-committed:.2f}s')
+
+
+@contextlib.contextmanager
+def world_snapshot():
+    """Read one committed view; gameplay nested inside a writer sees that writer's state."""
+    if getattr(_world_local,'active',None):
+        with world_transaction() as db:
+            yield db
+        return
+    cache=getattr(_world_local,'debug_cache',None)
+    path=_world_path(cache)
+    if path.is_file():
+        started=time.monotonic()
+        db=sqlite3.connect(path.as_uri()+'?mode=ro',uri=True,timeout=15,isolation_level=None)
+        try:
+            db.row_factory=sqlite3.Row
+            db.execute('BEGIN')
+            if db.execute('PRAGMA user_version').fetchone()[0]==9:
+                key=os.path.normcase(os.path.abspath(database_path(cache)))
+                _world_local.active=(str(path),db,key)
+                acquired=time.monotonic()
+                try:yield db
+                finally:
+                    _world_local.active=None
+                    _world_local.last_profile=None
+                    _world_local.profile_reads=None
+                    _world_local.raw_profile_reads=None
+                return
+        except sqlite3.Error as exc:
+            raise logs.SteamError(f'Could not read the world: {exc}') from exc
+        finally:
             db.close()
+            finished=time.monotonic()
+            if 'acquired' in locals() and finished-started>=.25 and threading.current_thread() is not threading.main_thread():
+                logs.performance_note(f'{threading.current_thread().name} snapshot: open/lock {acquired-started:.2f}s, read {finished-acquired:.2f}s')
+    # Creation and legacy migrations still use the normal exclusive writer path.
+    with world_transaction(cache) as db:yield db
 
 
 def atomic(fn):
@@ -1113,7 +1261,11 @@ def profile_ids(cache=None, include_npcs=True):
 
 def all_profiles(cache=None, include_npcs=True):
     with world_transaction(cache) as db:
-        return [json.loads(r[0]) for r in db.execute('SELECT data FROM profiles' + ('' if include_npcs else " WHERE kind != 'npc'"))]
+        table='paid_profiles' if db.execute('PRAGMA user_version').fetchone()[0]>=7 else 'profiles'
+        query='SELECT data FROM '+table
+        if not include_npcs:
+            query+=" WHERE kind != 'npc'"
+        return [json.loads(r[0]) for r in db.execute(query)]
 
 
 def world_state(cache=None):
@@ -1152,7 +1304,7 @@ def world_event(kind, title, summary, *, actors=(), sects=(), location='The cult
 def world_history(query='', kind='All', page=0, limit=30):
     validate_page(query,page,limit)
     if not isinstance(kind,str): raise logs.SteamError('Choose an event category.')
-    with world_transaction() as db:
+    with world_snapshot() as db:
         where = "visibility IN ('public','rumor') AND importance>=2"
         args = []
         sect_names=dict(db.execute('SELECT id,name FROM sects'))
@@ -1210,17 +1362,32 @@ def member_role(affiliation):
     return affiliation['office']
 
 
-def world_population(query='', page=0, limit=50):
+def npc_card_fields(row,data):
     from generator import local_power_score
+    c=data['offline']['character']
+    dead=bool((data.get('life') or {}).get('dead'))
+    realm=data.get('realm_state',{}).get('realm_index',c['realm_index'])
+    incarnation=data.get('life',{}).get('incarnation') or {}
+    power=local_power_score(c,talent_name=incarnation.get('talent',c['talent']))+data.get('mentor_power',0)
+    if row['factor'] and not dead:
+        power=round(power*row['factor'])
+    standing=data.get('sect_memberships',{}).get(row['sect_id'],{}).get('points',gamedata.SECT_INITIAL_REPUTATION[realm])
+    rank=next(name for threshold,name in reversed(gamedata.SECT_RANKS) if standing>=threshold)
+    return dict(power=power,realm=gamedata.REALMS[realm][1],rank=rank if row['sect_id'] else None)
+
+
+def world_population(query='', page=0, limit=50):
     validate_page(query,page,limit)
-    with world_transaction() as db:
+    with world_snapshot() as db:
         where = "p.kind='npc' AND (instr(lower(p.name),lower(?))>0 OR instr(p.id,?)>0)"
         args = [query,query]
         count = db.execute('SELECT count(*) FROM profiles p WHERE '+where,args).fetchone()[0]
         rows = []
         for row in db.execute('''SELECT p.id,p.name,p.data,n.activity,a.sect_id,a.office,a.mentor,s.name AS sect,
-                i.factor FROM profiles p JOIN npcs n ON n.id=p.id
+                i.factor,l.name place,d.name destination FROM profiles p JOIN npcs n ON n.id=p.id
                 LEFT JOIN affiliations a ON a.actor=p.id LEFT JOIN sects s ON s.id=a.sect_id
+                LEFT JOIN positions pos ON pos.actor=p.id LEFT JOIN locations l ON l.id=pos.location
+                LEFT JOIN journeys j ON j.actor=p.id LEFT JOIN locations d ON d.id=json_extract(j.path,'$[#-1]')
                 LEFT JOIN injuries i ON i.actor=p.id AND i.until_day>(SELECT day FROM world)
                 WHERE '''+where+' ORDER BY p.name COLLATE NOCASE,p.id LIMIT ? OFFSET ?',args+[limit,max(0,page)*limit]):
             try:
@@ -1231,18 +1398,11 @@ def world_population(query='', page=0, limit=50):
             except (ValueError,TypeError,KeyError) as exc:
                 raise logs.SteamError(f"Invalid saved world cultivator {row['id']}: {exc}. Restore a database backup.") from exc
             dead = (data.get('life') or {}).get('dead')
-            realm=data['realm_state']['realm_index']
-            incarnation=data.get('life',{}).get('incarnation') or {}
-            power=local_power_score(c,talent_name=incarnation.get('talent',c['talent']))+data.get('mentor_power',0)
-            if row['factor'] and not dead:
-                power=round(power*row['factor'])
-            standing=data.get('sect_memberships',{}).get(row['sect_id'],{}).get('points',gamedata.SECT_INITIAL_REPUTATION[realm])
-            rank=next(name for threshold,name in reversed(gamedata.SECT_RANKS) if standing>=threshold)
-            where_now=presence(row['id'])
-            rows.append(dict(id=row['id'],name=row['name'],sect=row['sect'] or 'Wanderer',
-                             role=member_role(row),rank=rank if row['sect_id'] else None,power=power,
-                             realm=gamedata.REALMS[realm][1],location=where_now['name'],
-                             activity='Deceased' if dead else 'Travelling' if where_now['state']=='travelling' else row['activity']))
+            card=npc_card_fields(row,data)
+            card.update(id=row['id'],name=row['name'],sect=row['sect'] or 'Wanderer',role=member_role(row),
+                        location=row['place'] or 'Unmapped',destination=row['destination'],
+                        activity='Deceased' if dead else 'Travelling' if row['destination'] else row['activity'])
+            rows.append(card)
         return rows,count
 
 
@@ -1265,33 +1425,176 @@ def active_play_time():
     return time.monotonic()
 
 
+WAL_RECLAIM_BYTES = 64 * 1024 * 1024
+
+
+def _reclaim_wal(keeper, path, frames, copied):
+    """Try reclaiming a large, checkpointed WAL; never wait for reader/writer locks.
+
+    This runs only in the checkpoint worker, outside the world lock. TRUNCATE
+    still performs SQLite's durability checks and may flush a concurrent tail;
+    a busy reader/writer makes it defer, never delete or invalidate that WAL.
+    """
+    try:
+        allocated = Path(str(path)+'-wal').stat().st_size
+    except FileNotFoundError:
+        return False
+    if allocated < WAL_RECLAIM_BYTES:
+        return False
+    if frames < 0 or copied < frames:
+        return True
+    timeout = keeper.execute('PRAGMA busy_timeout').fetchone()[0]
+    try:
+        keeper.execute('PRAGMA busy_timeout=0')
+        started = time.monotonic()
+        busy, remaining, done = keeper.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
+        if not busy:
+            logs.performance_note(f'Background WAL reclaimed {allocated} bytes in {time.monotonic()-started:.2f}s')
+        return bool(busy)
+    finally:
+        keeper.execute(f'PRAGMA busy_timeout={int(timeout)}')
+
+
+def _checkpoint_loop(keeper,path,stop):
+    """PASSIVE copies committed pages without waiting for readers or taking the game lock."""
+    # data_version changes on commits from other connections. WAL allocation can
+    # stay large after a successful checkpoint and is not evidence of new work.
+    version = None
+    incomplete = False
+    reclaim_pending = False
+    last_reclaim_notice = 0
+    delay = 2
+    while not stop.wait(delay):
+        try:
+            current = keeper.execute('PRAGMA data_version').fetchone()[0]
+            if current == version and not incomplete and not reclaim_pending:
+                continue
+            started=time.monotonic()
+            busy,frames,copied=keeper.execute('PRAGMA wal_checkpoint(PASSIVE)').fetchone()
+            took=time.monotonic()-started
+            incomplete = bool(busy or (frames >= 0 and copied < frames))
+            reclaim_pending = _reclaim_wal(keeper,path,frames,copied)
+            if reclaim_pending and time.monotonic()-last_reclaim_notice >= 30:
+                last_reclaim_notice = time.monotonic()
+                logs.performance_note(f'Background WAL reclaim deferred: {copied}/{frames} frames copied; waiting for a safe reset window')
+            # A long-lived reader may pin old pages. Retry without spinning;
+            # new writes restore the normal cadence. Never block readers.
+            delay = min(10, delay * 2) if incomplete and current == version else 2
+            version = current  # Sampled before checkpoint: concurrent commits remain visible.
+            if took>=1.5:
+                logs.performance_note(f'Background WAL checkpoint {took:.2f}s, {copied}/{frames} frames, busy={busy}')
+        except (OSError,sqlite3.Error) as exc:
+            logs.performance_note(f'Background WAL checkpoint deferred: {exc}')
+            delay = 5
+
+
+
+def _stop_checkpoint(path,keeper,stop,thread):
+    with _world_lock:_checkpoint_worlds.discard(str(path))
+    stop.set()
+    thread.join()
+    keeper.close()
+
+
 class WorldClock:
     """Session-only monotonic clock; wall-clock gaps on restart never advance time."""
     def __init__(self, now=None):
         self.last = active_play_time() if now is None else now
         self.owner = uuid.uuid4().hex
-        with world_transaction() as db:
+        cache=getattr(_world_local,'debug_cache',None)
+        path=_world_path(cache)
+        self._cache=path.parent
+        with world_transaction(self._cache) as db:
             row=db.execute('SELECT owner,expires FROM simulation_lease WHERE id=1').fetchone()
             if row and row['expires'] > time.time():
                 raise logs.SteamError('This world is already running in another game session. Close that session first.')
             db.execute('INSERT OR REPLACE INTO simulation_lease VALUES(1,?,?)',(self.owner,time.time()+30))
 
-    def tick(self, now=None):
+        import weakref
+        with _session_path_lock:
+            for key in (_database_key(cache), _database_key(path.parent)):
+                _session_paths[key] = (self.owner, path)
+        self._close_paths=weakref.finalize(self,_release_world_paths,self.owner)
+
+        # Keep WAL open between short-lived transactions. Reads can then finish
+        # against a committed snapshot even while the simulator flushes pages.
+        self._tick_db=None
+        self._journal_keeper=None
+        if os.name=='nt' and ctypes.windll.kernel32.GetDriveTypeW(str(path.anchor)) in (3,6):
+            with _world_lock:
+                keeper=sqlite3.connect(path,isolation_level=None,timeout=.2,check_same_thread=False)
+                try:
+                    if keeper.execute('PRAGMA journal_mode=WAL').fetchone()[0]=='wal':
+                        import weakref
+                        writer=sqlite3.connect(path,isolation_level=None,timeout=15,check_same_thread=False)
+                        writer.row_factory=sqlite3.Row
+                        writer.execute('PRAGMA foreign_keys=ON')
+                        writer.execute('PRAGMA cache_size=-16384')
+                        self._tick_db=writer
+                        self._close_writer=weakref.finalize(self,writer.close)
+                        self._journal_keeper=keeper
+                        stop=threading.Event()
+                        thread=threading.Thread(target=_checkpoint_loop,args=(keeper,path,stop),name='World WAL checkpoint',daemon=True)
+                        thread.start()
+                        _checkpoint_worlds.add(str(path))
+                        self._close_journal=weakref.finalize(self,_stop_checkpoint,path,keeper,stop,thread)
+                except sqlite3.OperationalError as exc:
+                    if getattr(exc,'sqlite_errorcode',None) not in (sqlite3.SQLITE_BUSY,sqlite3.SQLITE_LOCKED):
+                        self.close()
+                        raise
+                finally:
+                    if self._journal_keeper is None:keeper.close()
+
+    def tick(self, now=None, *, paused=False, bank_elapsed=False):
         import progress
+        measured_start=time.monotonic()
+        _world_local.batch_metrics={}
         now = active_play_time() if now is None else now
         elapsed = max(0, now-self.last)
-        with world_transaction() as db:
+        with world_transaction(self._cache,_connection=self._tick_db) as db:
             row=db.execute('SELECT owner FROM simulation_lease WHERE id=1').fetchone()
             if not row or row['owner'] != self.owner:
                 raise logs.SteamError('Another session owns this world clock. Close and reopen this game.')
-            result = progress.advance_world(elapsed, max_work_seconds=.1)
+            if paused and bank_elapsed and elapsed and not db.execute('SELECT 1 FROM encounters LIMIT 1').fetchone():
+                db.execute('UPDATE world SET pending_seconds=pending_seconds+? WHERE id=1',(elapsed,))
+            result = world_state() if paused else progress.advance_world(elapsed, max_work_seconds=.1)
+            training=db.execute('SELECT cooldown,first_tick,skip_until FROM cultivation_clock WHERE id=1').fetchone()
+            if training and training['cooldown']>0 and not paused and not result.get('encounter'):
+                # The tick in flight when cultivation was requested can include time before training.
+                remaining=max(0,training['cooldown']-(0 if training['first_tick'] else elapsed))
+                db.execute('UPDATE cultivation_clock SET cooldown=?,first_tick=0 WHERE id=1',(remaining,))
+            else:
+                remaining=training['cooldown'] if training else 0
+            result['cultivation_cooldown']=remaining
+            result['skip_until']=training['skip_until'] if training else None
             db.execute('UPDATE simulation_lease SET expires=? WHERE id=1',(time.time()+30,))
         self.last = now
+        duration=time.monotonic()-measured_start
+        metrics=getattr(_world_local,'batch_metrics',{})
+        samples=getattr(self,'_performance_samples',{'batches':0,'npc_decisions':0,'events':0,'elapsed':0,'maximum':0})
+        samples['batches']+=1;samples['elapsed']+=duration;samples['maximum']=max(samples['maximum'],duration)
+        for key in ('npc_decisions','events'):samples[key]+=metrics.get(key,0)
+        for key in ('retention_jobs','retention_removed','retention_ms','news_delivered'):
+            samples[key]=samples.get(key,0)+metrics.get(key,0)
+        if time.monotonic()-getattr(self,'_last_performance_note',0)>=30:
+            logs.metric('Simulation',batches=samples['batches'],npc_decisions=samples['npc_decisions'],events=samples['events'],work_ms=round(samples['elapsed']*1000,2),max_batch_ms=round(samples['maximum']*1000,2),pending_seconds=round(result['pending_seconds'],2))
+            logs.metric('Retention',jobs=samples['retention_jobs'],reports_received=samples['news_delivered'],reports_removed=samples['retention_removed'],work_ms=round(samples['retention_ms'],2),oldest_due_days=round(metrics.get('retention_oldest_days',0),3))
+            self._last_performance_note=time.monotonic()
+            samples={'batches':0,'npc_decisions':0,'events':0,'elapsed':0,'maximum':0}
+        self._performance_samples=samples
         return result
 
     def close(self):
-        with world_transaction() as db:
+        with world_transaction(self._cache) as db:
             db.execute('DELETE FROM simulation_lease WHERE id=1 AND owner=?',(self.owner,))
+        if self._tick_db is not None:
+            with _world_lock:
+                self._close_writer()
+                self._tick_db=None
+        if self._journal_keeper is not None:
+            self._close_journal()
+            self._journal_keeper=None
+        self._close_paths()
 
 # ============================================================================
 # Region and social framework (schema 3). Identity is always a profile/sect ID.
@@ -1358,7 +1661,7 @@ def actor_disposition(actor):
 
 def relationship_list(player, page=0):
     validate_page('',page,50)
-    with world_transaction() as db:
+    with world_snapshot() as db:
         # The pair index lists only this player's conversations. Rumors can
         # change opinions before a first meeting and keep their own records.
         contacts=""" FROM (SELECT DISTINCT npc FROM conversations WHERE player=?) c
@@ -1376,13 +1679,13 @@ def relationship_list(player, page=0):
         return result,total
 
 
-def sect_roster(sect_id, page=0):
+def sect_roster(sect_id, page=0, viewer=None):
     validate_page('',page,50)
-    with world_transaction() as db:
+    with world_snapshot() as db:
         sql = '''SELECT a.*,p.name,p.data,m.name mentor_name FROM affiliations a JOIN profiles p ON p.id=a.actor
                  LEFT JOIN profiles m ON m.id=a.mentor WHERE a.sect_id=?'''
         leaders = db.execute(sql+" AND a.office<>'Member' ORDER BY CASE a.office WHEN 'Sect Master' THEN 0 WHEN 'Acting Master' THEN 0 ELSE 1 END,p.name",(sect_id,)).fetchall()
-        members = db.execute(sql+' ORDER BY p.name LIMIT 50 OFFSET ?',(sect_id,page*50)).fetchall()
+        members = db.execute(sql+' ORDER BY CASE WHEN a.actor=? THEN 0 ELSE 1 END,p.name,p.id LIMIT 50 OFFSET ?',(sect_id,viewer,page*50)).fetchall()
         count = db.execute('SELECT count(*) FROM affiliations WHERE sect_id=?',(sect_id,)).fetchone()[0]
         disciples=db.execute(sql+' AND a.mentor IS NOT NULL ORDER BY p.name,p.id',(sect_id,)).fetchall()
         def present(row):
@@ -1390,6 +1693,9 @@ def sect_roster(sect_id, page=0):
             life=pc.get('life',{})
             result['gender']=(life.get('incarnation') or {}).get('gender') or pc.get('offline',{}).get('character',{}).get('gender')
 
+            realm=pc.get('realm_state',{}).get('realm_index') or 0
+            points=pc.get('sect_memberships',{}).get(sect_id,{}).get('points',gamedata.SECT_INITIAL_REPUTATION[realm])
+            result['rank']=next(label for threshold,label in reversed(gamedata.SECT_RANKS) if points>=threshold)
             result['dead']=bool(pc.get('life',{}).get('dead'))
             return result
         return dict(leaders=[present(r) for r in leaders],members=[present(r) for r in members],total=count,disciples=[present(r) for r in disciples])
@@ -1428,18 +1734,20 @@ def region_ready(db):
     return bool(db.execute('SELECT initialized FROM region_meta').fetchone()[0])
 
 
-def presence(actor):
+def presence(actor, *, initialize=True):
     """A journey supersedes the saved departure location. No consumer may count both."""
     with world_transaction() as db:
         if not region_ready(db):return dict(state='unmapped',location=None,name='Region not initialized')
         if not db.execute('SELECT 1 FROM profiles WHERE id=?',(actor,)).fetchone():
             raise logs.SteamError('Unknown cultivator.')
-        db.execute('INSERT OR IGNORE INTO positions(actor,location) VALUES(?,?)',(actor,'r0_4'))
+        if initialize:db.execute('INSERT OR IGNORE INTO positions(actor,location) VALUES(?,?)',(actor,'r0_4'))
         pending=db.execute('SELECT id FROM encounters WHERE actor=?',(actor,)).fetchone()
         journey=db.execute('SELECT * FROM journeys WHERE actor=?',(actor,)).fetchone()
         if journey:
             return dict(state='encounter' if pending else 'travelling',location=None,name='On the road',journey=dict(journey))
         row=db.execute('SELECT l.* FROM positions p JOIN locations l ON l.id=p.location WHERE p.actor=?',(actor,)).fetchone()
+        if not row and not initialize and not db.execute('SELECT 1 FROM positions WHERE actor=?',(actor,)).fetchone():
+            row=db.execute("SELECT id,name FROM locations WHERE id='r0_4'").fetchone()
         if not row:raise logs.SteamError('Invalid saved location. Restore a database backup.')
         return dict(state='present',location=row['id'],name=row['name'])
 
@@ -1456,6 +1764,8 @@ def injury_state(actor):
 def require_physical(actor, *, dangerous=False, others=()):
     """Called inside action transactions, including CLI and NPC actions."""
     with world_transaction() as db:
+        if db.execute('SELECT 1 FROM ascensions WHERE actor=?',(actor,)).fetchone():
+            raise logs.SteamError('This cultivator is maintaining an ascension ritual.')
         if db.execute('SELECT 1 FROM encounters LIMIT 1').fetchone():
             raise logs.SteamError('The world is paused for a travel encounter. Resolve it before physical actions.')
         here=presence(actor)
@@ -1468,20 +1778,29 @@ def require_physical(actor, *, dangerous=False, others=()):
         return here
 
 
-def people_here(actor,query='',page=0):
+def people_here(actor,query='',page=0,detailed=False):
     validate_page(query,page,50)
-    with world_transaction() as db:
-        if load_profile_cache(actor).get('life',{}).get('dead'):
+    with world_snapshot() as db:
+        if profile_field(actor,'life',{}).get('dead'):
             return dict(people=[],total=0,where='Deceased — seek rebirth through Adventure',state='deceased')
-        here=presence(actor)
+        here=presence(actor,initialize=False)
         if here['state']!='present':return dict(people=[],total=0,where=here['name'],state=here['state'])
         # Dead profiles remain browsable globally but never appear as available people.
         where="pos.location=? AND p.id<>? AND j.actor IS NULL AND json_extract(p.data,'$.life.dead') IS NULL AND instr(lower(p.name),lower(?))>0"
         args=(here['location'],actor,query)
         join=' FROM positions pos JOIN profiles p ON p.id=pos.actor JOIN npcs n ON n.id=p.id LEFT JOIN journeys j ON j.actor=p.id '
         count=db.execute('SELECT count(*)'+join+'WHERE '+where,args).fetchone()[0]
-        rows=db.execute('SELECT p.id,p.name,n.activity,a.office,a.mentor,a.sect_id,s.name sect'+join+'LEFT JOIN affiliations a ON a.actor=p.id LEFT JOIN sects s ON s.id=a.sect_id WHERE '+where+' ORDER BY p.name LIMIT 50 OFFSET ?',args+(page*50,)).fetchall()
-        return dict(people=[dict(r,role=member_role(r)) for r in rows],total=count,where=here['name'],state='present')
+        fields=',p.data,i.factor' if detailed else ''
+        injury=' LEFT JOIN injuries i ON i.actor=p.id AND i.until_day>(SELECT day FROM world)' if detailed else ''
+        rows=db.execute('SELECT p.id,p.name,n.activity,a.office,a.mentor,a.sect_id,s.name sect'+fields+join+'LEFT JOIN affiliations a ON a.actor=p.id LEFT JOIN sects s ON s.id=a.sect_id'+injury+' WHERE '+where+' ORDER BY p.name,p.id LIMIT 50 OFFSET ?',args+(page*50,)).fetchall()
+        people=[]
+        for row in rows:
+            person=dict(row,role=member_role(row))
+            if detailed:
+                person.update(npc_card_fields(row,decode_profile_json(person.pop('data'))))
+                person['location']=here['name']
+            people.append(person)
+        return dict(people=people,total=count,where=here['name'],state='present')
 
 
 def pending_encounter():
@@ -1500,17 +1819,42 @@ def pending_encounter():
         return result
 
 
-def mark_dead(actor,c,cause):
+def death_account(actor, circumstances):
+    """Snapshot the place before retirement clears the last journey."""
+    with world_transaction() as db:
+        place = None
+        if region_ready(db):
+            road = db.execute("SELECT a.name,b.name FROM journeys j JOIN locations a ON a.id=json_extract(j.path,'$[0]') JOIN locations b ON b.id=json_extract(j.path,'$[#-1]') WHERE actor=?", (actor,)).fetchone()
+            if road:
+                place = f"on the road from {road[0]} to {road[1]}"
+            else:
+                site = db.execute('SELECT l.name FROM positions p JOIN locations l ON l.id=p.location WHERE p.actor=?', (actor,)).fetchone()
+                if site:
+                    place = 'at ' + site[0]
+        return dict(circumstances=circumstances, place=place)
+
+
+def mark_dead(actor,c,cause,*,circumstances=None):
     """A death removes travel and availability in the same gameplay transaction."""
     day=world_state()['day']
-    write_life(actor,dead=dict(killer=cause,friend_id=None,scene=0,age=c['age'],year=int(day)//DAYS_PER_YEAR,world_day=day))
+    write_life(actor,dead=dict(killer=cause,friend_id=None,scene=0,age=c['age'],year=int(day)//DAYS_PER_YEAR,world_day=day, account=death_account(actor,circumstances)))
     retire_dead(actor)
 
 
 def retire_dead(actor):
     with world_transaction() as db:
+        if db.execute('PRAGMA user_version').fetchone()[0]>=9:
+            r=db.execute('SELECT site FROM ascensions WHERE actor=?',(actor,)).fetchone()
+            if r:
+                import warfare
+                warfare.ritual_event(db,actor,r[0],'Ascension ended','The ascender died before completion.')
+                db.execute('DELETE FROM ascensions WHERE actor=?',(actor,))
+            db.execute('DELETE FROM ritual_party WHERE actor=? OR leader=?',(actor,actor))
         db.execute('DELETE FROM journeys WHERE actor=?',(actor,))
         db.execute('DELETE FROM encounters WHERE actor=?',(actor,))
+        db.execute('DELETE FROM campaign_forces WHERE actor=?',(actor,))
+        db.execute('DELETE FROM garrison_orders WHERE actor=?',(actor,))
+        db.execute('DELETE FROM mine_wardens WHERE actor=?',(actor,))
         db.execute('DELETE FROM injuries WHERE actor=?',(actor,))
         db.execute("UPDATE npcs SET next_day=1e30,activity='Deceased' WHERE id=?",(actor,))
 
@@ -1553,6 +1897,16 @@ def _migrate_sect_politics(db,path):
     db.commit()
 
 
+def seat_location(db,sect):
+    """Return the council's current seat, including a refuge after occupation."""
+    original=db.execute('SELECT id FROM locations WHERE sect_id=?',(sect,)).fetchone()
+    if not original:return None
+    rule=db.execute('SELECT owner FROM campaign_sites WHERE site=?',(original[0],)).fetchone()
+    if not rule or rule[0]==sect:return original
+    refuge=db.execute('SELECT site FROM campaign_sites WHERE owner=? ORDER BY site LIMIT 1',(sect,)).fetchone()
+    return refuge or ('r0_4',)
+
+
 def sect_catalog(cache=None):
     """Exactly twenty chartered sects. No population generation or clock advancement."""
     import random,hashlib,unicodedata
@@ -1572,7 +1926,7 @@ def sect_catalog(cache=None):
         for sect in db.execute('SELECT s.* FROM sects s JOIN sect_charters c ON c.sect_id=s.id ORDER BY s.name').fetchall():
             members=db.execute("SELECT a.*,p.name,p.data FROM affiliations a JOIN profiles p ON p.id=a.actor WHERE a.sect_id=? AND json_extract(p.data,'$.life.dead') IS NULL",(sect['id'],)).fetchall()
             master=next((r for r in members if r['office'] in ('Sect Master','Acting Master')),None)
-            home=db.execute('SELECT id FROM locations WHERE sect_id=?',(sect['id'],)).fetchone()
+            home=seat_location(db,sect['id'])
             rows.append(dict(id=sect['id'],name=sect['name'],members=len(members),elders=sum(r['office']=='Elder' for r in members),master=master['name'] if master else 'Vacant',master_id=master['actor'] if master else None,acting=bool(master and master['office']=='Acting Master'),location=home[0] if home else None))
         return rows
 
@@ -1591,9 +1945,35 @@ def sect_names(cache=None):
 # ============================================================================
 # Storage retention (schema 6). All gameplay cleanup is bounded and transactional.
 # ============================================================================
-NPC_RECENT_ACTIVITY = 50
-NPC_HEARD_REPORTS = 200
+NPC_RECENT_ACTIVITY = 25
+NPC_HEARD_REPORTS = 170
 NEWS_ARCHIVE_DAYS = 6
+
+
+def _apply_retention_policy(db,path):
+    """One-time policy backfill; no trimming or world advancement at startup."""
+    if db.execute('PRAGMA user_version').fetchone()[0]<6:return
+    if db.execute("SELECT 1 FROM sqlite_schema WHERE name='retention_policy'").fetchone():
+        row=db.execute('SELECT routine,reports FROM retention_policy WHERE id=1').fetchone()
+        if row and tuple(row)==(NPC_RECENT_ACTIVITY,NPC_HEARD_REPORTS):return
+    if db.execute('SELECT 1 FROM npcs LIMIT 1').fetchone():
+        lease=db.execute('SELECT expires FROM simulation_lease WHERE id=1').fetchone()
+        if lease and lease[0]>time.time():
+            raise logs.SteamError('Close the other game before updating retention; a crashed session expires after 30 seconds.')
+        folder=path.parent/'migration_backups';folder.mkdir(exist_ok=True)
+        with contextlib.closing(sqlite3.connect(folder/('before_retention_25_170_'+uuid.uuid4().hex+'.db'))) as backup:
+            db.backup(backup)
+    db.execute('BEGIN IMMEDIATE')
+    try:
+        db.execute('CREATE TABLE IF NOT EXISTS retention_policy(id INTEGER PRIMARY KEY CHECK(id=1),routine INTEGER NOT NULL,reports INTEGER NOT NULL)')
+        row=db.execute('SELECT routine,reports FROM retention_policy WHERE id=1').fetchone()
+        if not row or tuple(row)!=(NPC_RECENT_ACTIVITY,NPC_HEARD_REPORTS):
+            # The bounded profile pass also queues each NPC for the lower news cap.
+            db.execute("UPDATE storage_maintenance SET profile_cursor='',profiles_done=NOT EXISTS(SELECT 1 FROM npcs)")
+            db.execute('INSERT OR REPLACE INTO retention_policy VALUES(1,?,?)',(NPC_RECENT_ACTIVITY,NPC_HEARD_REPORTS))
+        db.commit()
+    except BaseException:
+        db.rollback();raise
 
 
 def _migrate_storage_retention(db,path):
@@ -1670,39 +2050,50 @@ def queue_memory_cleanup(db,actor,day):
         db.execute('INSERT OR IGNORE INTO memory_queue VALUES(?,?)',(actor,day))
 
 
-def trim_heard_reports(db,actor,day):
+def trim_heard_reports(db,actor,day,*,limit=256):
+    """Bounded indexed retention; archive guards commit before memory deletion."""
     boundary=db.execute("SELECT learned_day,event FROM event_knowledge WHERE actor=? AND source='Local report' ORDER BY learned_day DESC,event DESC LIMIT 1 OFFSET ?",(actor,NPC_HEARD_REPORTS-1)).fetchone()
     if not boundary:
         db.execute('DELETE FROM memory_queue WHERE actor=?',(actor,));return 0
-    candidates=db.execute("SELECT k.event,e.day FROM event_knowledge k JOIN world_events e ON e.id=k.event WHERE k.actor=? AND k.source='Local report' AND (k.learned_day,k.event)<(?,?) ORDER BY k.learned_day,k.event LIMIT 64",(actor,*boundary)).fetchall()
-    removed=0
-    for row in candidates:
-        if row['day']>day-NEWS_ARCHIVE_DAYS or db.execute('SELECT 1 FROM news_queue WHERE event=? LIMIT 1',(row['event'],)).fetchone():continue
-        # This marker is written before memory deletion, in the same transaction.
-        # Rehearing an archived event can never apply its effects a second time.
-        db.execute('INSERT OR IGNORE INTO event_archives VALUES(?)',(row['event'],))
-        db.execute('DELETE FROM event_effects WHERE event=? AND actor=?',(row['event'],actor))
-        db.execute('DELETE FROM event_knowledge WHERE actor=? AND event=?',(actor,row['event']))
-        removed+=1
-    if candidates:
-        db.execute('UPDATE memory_queue SET due=? WHERE actor=?',(day if removed else day+.2,actor))
-    else:db.execute('DELETE FROM memory_queue WHERE actor=?',(actor,))
-    return removed
+    candidates=db.execute("""SELECT k.event,e.day,
+        EXISTS(SELECT 1 FROM news_queue q WHERE q.event=k.event) propagating
+        FROM event_knowledge k JOIN world_events e ON e.id=k.event
+        WHERE k.actor=? AND k.source='Local report' AND (k.learned_day,k.event)<(?,?)
+        ORDER BY k.learned_day,k.event LIMIT ?""",(actor,*boundary,limit)).fetchall()
+    eligible=[row['event'] for row in candidates if row['day']<=day-NEWS_ARCHIVE_DAYS and not row['propagating']]
+    if eligible:
+        marks=','.join('?' for _ in eligible)
+        # One set operation per table instead of three statements per report.
+        db.execute('INSERT OR IGNORE INTO event_archives(event) VALUES '+','.join('(?)' for _ in eligible),eligible)
+        db.execute('DELETE FROM event_effects WHERE actor=? AND event IN ('+marks+')',[actor,*eligible])
+        db.execute('DELETE FROM event_knowledge WHERE actor=? AND event IN ('+marks+')',[actor,*eligible])
+    if len(candidates)<limit and len(eligible)==len(candidates):
+        db.execute('DELETE FROM memory_queue WHERE actor=?',(actor,))
+    else:
+        db.execute('UPDATE memory_queue SET due=? WHERE actor=?',(day if eligible else day+.2,actor))
+    return len(eligible)
 
 
-def maintain_storage(db,day,*,budget=.008):
+def maintain_storage(db,day,*,budget=.008,max_jobs=8):
     """Small round-robin jobs; cursors and deletions commit with the world tick."""
-    deadline=time.perf_counter()+budget;completed=0
+    began=time.perf_counter();deadline=began+budget;completed=0;removed=0
     initial=db.execute('SELECT * FROM storage_maintenance WHERE id=1').fetchone()
     if initial['profiles_done'] and initial['effects_done'] and not db.execute('SELECT 1 FROM memory_queue WHERE due<=? LIMIT 1',(day,)).fetchone() and not db.execute('SELECT 1 FROM duel_cooldowns WHERE ready_day<=? LIMIT 1',(day,)).fetchone():return 0
-    while completed<8 and (not completed or time.perf_counter()<deadline):
+    while completed<max_jobs and (not completed or time.perf_counter()<deadline):
         state=db.execute('SELECT * FROM storage_maintenance WHERE id=1').fetchone();turn=(initial['turn']+completed)%4
-        if turn==0 and not state['profiles_done']:
+        memory=db.execute('SELECT actor FROM memory_queue WHERE due<=? ORDER BY due,actor LIMIT 1',(day,)).fetchone()
+        expired=db.execute('SELECT 1 FROM duel_cooldowns WHERE ready_day<=? LIMIT 1',(day,)).fetchone()
+        available={0:not state['profiles_done'],1:not state['effects_done'],2:bool(memory),3:bool(expired)}
+        # Preserve round-robin fairness for live jobs; completed backfills no
+        # longer consume a scarce catch-up slot. Prefer news for spare slots.
+        job=next((j for j in (turn,2,0,1,3) if available[j]),None)
+        if job is None:break
+        if job==0:
             rows=db.execute('SELECT p.id,p.data FROM npcs n JOIN profiles p ON p.id=n.id WHERE n.id>? ORDER BY n.id LIMIT 2',(state['profile_cursor'],)).fetchall()
             for row in rows:
                 _write_profile(db,decode_profile_json(row['data']));queue_memory_cleanup(db,row['id'],day)
             db.execute('UPDATE storage_maintenance SET profile_cursor=?,profiles_done=? WHERE id=1',(rows[-1]['id'] if rows else state['profile_cursor'],int(len(rows)<2)))
-        elif turn==1 and not state['effects_done']:
+        elif job==1:
             # Stable logical keys survive offline VACUUM and database copying.
             rows=db.execute('SELECT event,actor,effect FROM event_effects WHERE (event,actor,effect)>(?,?,?) ORDER BY event,actor,effect LIMIT 128',(state['effect_cursor'],state['effect_actor'],state['effect_kind'])).fetchall()
             for row in rows:
@@ -1712,13 +2103,19 @@ def maintain_storage(db,day,*,budget=.008):
                 last=rows[-1]
                 db.execute('UPDATE storage_maintenance SET effect_cursor=?,effect_actor=?,effect_kind=?,effects_done=? WHERE id=1',(last['event'],last['actor'],last['effect'],int(len(rows)<128)))
             else:db.execute('UPDATE storage_maintenance SET effects_done=1 WHERE id=1')
-        elif turn==2:
-            row=db.execute('SELECT actor FROM memory_queue WHERE due<=? ORDER BY due,actor LIMIT 1',(day,)).fetchone()
-            if row:trim_heard_reports(db,row['actor'],day)
-        elif turn==3:
+        elif job==2:
+            removed+=trim_heard_reports(db,memory['actor'],day)
+        elif job==3:
             db.execute('DELETE FROM duel_cooldowns WHERE rowid IN (SELECT rowid FROM duel_cooldowns WHERE ready_day<=? ORDER BY ready_day LIMIT 64)',(day,))
         completed+=1
-    db.execute('UPDATE storage_maintenance SET turn=? WHERE id=1',((initial['turn']+completed)%4,))
+    if completed:db.execute('UPDATE storage_maintenance SET turn=? WHERE id=1',((initial['turn']+completed)%4,))
+    metrics=getattr(_world_local,'batch_metrics',None)
+    if metrics is not None:
+        metrics['retention_jobs']=metrics.get('retention_jobs',0)+completed
+        metrics['retention_removed']=metrics.get('retention_removed',0)+removed
+        metrics['retention_ms']=metrics.get('retention_ms',0)+(time.perf_counter()-began)*1000
+        oldest=db.execute('SELECT due FROM memory_queue ORDER BY due,actor LIMIT 1').fetchone()
+        metrics['retention_oldest_days']=max(0,day-oldest[0]) if oldest else 0
     return completed
 
 
@@ -1771,6 +2168,60 @@ def optimize_world_copy(destination,cache=None):
         result=compact_world_copy(destination,folder)
         result.update(original_bytes=source.stat().st_size,retention_transactions=transactions)
         return result
+
+
+def _migrate_territory(db,path):
+    lease=db.execute('SELECT expires FROM simulation_lease WHERE id=1').fetchone()
+    if lease and lease[0]>time.time():
+        raise logs.SteamError('Close the other game before upgrading the economy. A crashed session expires after 30 seconds.')
+    folder=path.parent/'migration_backups'
+    folder.mkdir(exist_ok=True)
+    backup=sqlite3.connect(folder/('before_territory_'+datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')+'.db'))
+    try:
+        db.backup(backup)
+    finally:
+        backup.close()
+    db.execute('BEGIN IMMEDIATE')
+    if db.execute('PRAGMA user_version').fetchone()[0]==6:
+        db.execute("""CREATE TABLE spirit_mines(location TEXT PRIMARY KEY REFERENCES locations(id),
+                   kind TEXT NOT NULL CHECK(kind IN ('Small','Large')),owner TEXT REFERENCES sect_charters(sect_id),
+                   yield_stones INTEGER NOT NULL CHECK(yield_stones>0))""")
+        db.execute("""CREATE TABLE sect_payroll(sect_id TEXT PRIMARY KEY REFERENCES sect_charters(sect_id),
+                   due REAL NOT NULL,cycles INTEGER NOT NULL DEFAULT 0,last_due INTEGER NOT NULL DEFAULT 0,
+                   last_paid INTEGER NOT NULL DEFAULT 0,confidence INTEGER NOT NULL DEFAULT 100,
+                   incumbent TEXT REFERENCES profiles(id))""")
+        db.execute("""CREATE TABLE wage_debts(sect_id TEXT REFERENCES sect_charters(sect_id),actor TEXT REFERENCES profiles(id),
+                   amount INTEGER NOT NULL CHECK(amount>0),misses INTEGER NOT NULL,PRIMARY KEY(sect_id,actor))""")
+        db.execute("""CREATE TABLE salary_credits(actor TEXT PRIMARY KEY REFERENCES profiles(id),
+            amount INTEGER NOT NULL CHECK(amount>0))""")
+        db.execute("""CREATE VIEW paid_profiles AS SELECT p.id,p.kind,p.revision,coalesce(s.amount,0) AS credit,
+            CASE WHEN s.actor IS NULL THEN p.data ELSE json_set(p.data,'$.wallet.spirit_stones',
+            coalesce(json_extract(p.data,'$.wallet.spirit_stones'),0)+s.amount) END AS data
+            FROM profiles p LEFT JOIN salary_credits s ON s.actor=p.id""")
+        db.execute('CREATE TABLE mine_wardens(actor TEXT PRIMARY KEY REFERENCES profiles(id),location TEXT NOT NULL REFERENCES spirit_mines(location))')
+        db.execute("""CREATE TRIGGER enroll_salary AFTER INSERT ON affiliations
+            BEGIN INSERT OR IGNORE INTO membership_terms(actor,next_salary,npc_review)
+            SELECT NEW.actor,day+1800.0/seconds_per_day,day+14400.0/seconds_per_day FROM world;
+            END""")
+        db.execute('CREATE INDEX sect_payroll_due ON sect_payroll(due,sect_id)')
+        db.execute('PRAGMA user_version=7')
+    db.commit()
+
+
+def paid_profile_row(db,steamid):
+    """Wallet snapshot for gameplay, editor and restore from pre-economy backups."""
+    try:
+        return db.execute('SELECT data,revision,credit FROM paid_profiles WHERE id=?',(str(steamid),)).fetchone()
+    except sqlite3.OperationalError as exc:
+        if str(exc)!='no such table: paid_profiles':
+            raise
+        return db.execute('SELECT data,revision,0 AS credit FROM profiles WHERE id=?',(str(steamid),)).fetchone()
+
+
+def fold_salary_credit(db,steamid):
+    """The caller is writing a wallet snapshot that already includes these wages."""
+    if db.execute('PRAGMA user_version').fetchone()[0]>=7:
+        db.execute('DELETE FROM salary_credits WHERE actor=?',(str(steamid),))
 
 
 if __name__=='__main__':

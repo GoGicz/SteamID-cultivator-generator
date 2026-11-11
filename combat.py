@@ -95,9 +95,9 @@ def reputation_change(w, l):
 def with_duel_points(rep, duel_points):
     """A reputation dict with the duel points changed: new points, rank and Duels entry."""
     base = rep.get("base_points", rep["points"] - rep.get("duel_points", 0))
-    bonuses = [(n, amount) for n, amount in rep["bonuses"] if n != "Duels"]
+    bonuses = [(n, amount) for n, amount in rep["bonuses"] if n not in ("Duels","Reputation adjustment")]
     if duel_points:
-        bonuses.append(("Duels", duel_points))
+        bonuses.append(("Reputation adjustment", duel_points))
     points = max(0, base + duel_points)
     idx = generator.reputation_rank(points)
     return dict(rep, points=points, base_points=base, duel_points=duel_points, bonuses=bonuses,
@@ -346,6 +346,22 @@ def duel_ready(a,b):
         return not row or row[0]<=storage.world_state()['day']
 
 
+def duel_practice(actor, opponent, fighter, rival, day, rng):
+    """Only challenging opponents teach the fighter; keep one day's partner cooldowns."""
+    import progress
+    if rival.get('healthy_score',rival['score']) < fighter.get('healthy_score',fighter['score']):
+        return ''
+    pc=storage.load_profile_cache(actor)
+    recent={sid:until for sid,until in pc.get('practice_partners',{}).items() if until>day}
+    if opponent in recent:return ''
+    gain=rng.randint(1,3)
+    recent[opponent]=day+1
+    pc['practice_partners']=recent
+    progress.add_training_power(pc,gain)
+    storage.save_profile_cache(pc,durable=True)
+    return f" {fighter['name']} learned from the duel (+{gain} power)."
+
+
 @storage.atomic
 def perform_battle(ids,key,profiles,rng=random,mode='Competitive'):
     import progress
@@ -367,12 +383,17 @@ def perform_battle(ids,key,profiles,rng=random,mode='Competitive'):
         storage.injure(li,'Competitive duel');consequence=l['name']+' suffered a temporary injury. Both cultivators survived.'
     elif mode=='Lethal':
         if rng.random()<gamedata.LETHAL_DEATH_CHANCE:
-            killed=True;storage.mark_dead(li,l,'lethal_duel');l['death']=storage.read_life(li)['dead'];consequence=l['name']+' was killed in the lethal duel.'
+            killed=True;storage.mark_dead(li,l,'lethal_duel',circumstances=f"was slain by {w['name']} in a lethal duel");l['death']=storage.read_life(li)['dead'];consequence=l['name']+' was killed in the lethal duel.'
         else:storage.injure(li,'Lethal duel');consequence=l['name']+' survived with an injury.'
     story=f"{mode}: {w['name']} defeated {l['name']}. {consequence}"
     if change['gain']:story+=f" The victory earned {change['gain']} general reputation."
     if loot['stolen']:story+=' A treasure was seized: '+loot['stolen']+'.'
     if loot['found']:story+=' A treasure was found: '+loot['found']+'.'
+    if mode!='Sparring':
+        day=storage.world_state()['day']
+        story+=duel_practice(wi,li,w,l,day,rng)
+        if not killed and abs(result['p_a']-.5)<=.15 and not storage.injury_state(li):
+            story+=duel_practice(li,wi,l,w,day,rng)
     upset=change['kind']=='upset' and change['gap']>=2
     event=progress.record_world_action('duel',w['name']+' defeated '+l['name'],story,list(zip(ids,(a,b))),subject=wi,outcome='killed' if killed else 'upset' if upset else 'victory' if mode!='Sparring' else 'sparring',importance=3 if upset else 2 if killed else 1)
     with storage.world_transaction() as db:
