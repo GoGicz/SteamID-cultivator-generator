@@ -6,7 +6,7 @@ Turn your Steam profile into a cultivator from a xianxia novel.
 
 Originally created as a fun SteamID generator, the project has grown into a persistent cultivation world where thousands of NPC cultivators live their own lives, develop relationships, and shape the world independently of the player.
 
-**Current Public version: v0.6.5 Alpha — The Living World Update**
+**Current Public version: v0.9.14 Late Alpha — The Living World Update**
 
 ## Features
 
@@ -22,8 +22,10 @@ Originally created as a fun SteamID generator, the project has grown into a pers
 - **World History and personal stories** — Significant events, notable victories, deaths, breakthroughs, and political changes become part of the world's persistent history.
 - **Steam friends and achievements** — Generate encounters involving Steam friends and use Steam-related data to influence your cultivator's story and abilities.
 - **GUI and Terminal modes** — Play through the graphical interface or the terminal, with SQLite-based saving and caching.
+- **Inter-Sect Warfare And Diplomacy**
+- **Territorial conquest.**
 
-The Living World is still being expanded. Future updates are planned to introduce inter-sect warfare, territorial conquest, and additional cultivation systems.
+The Living World is still being expanded. Future updates are planned to introduce additional cultivation systems.
 
 ## Examples
 
